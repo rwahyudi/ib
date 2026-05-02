@@ -1,5 +1,32 @@
 #!/usr/bin/env python3
-"""Small Infoblox CLI."""
+"""Infoblox DNS command line workflow.
+
+Script logic:
+1. Load local configuration from ~/.ib, decrypt stored credentials, and create
+   an Infoblox WAPI client for the configured DNS view.
+2. Resolve DNS context before touching records. Commands prefer explicit
+   options, then the current shell/session zone, then IB_ZONE, then the
+   configured default zone so unattended commands behave predictably.
+3. Convert CLI input into WAPI payloads or query parameters. Validation stays
+   local where possible so operators get actionable errors before WAPI calls.
+4. Use WAPI paging for list/search operations and cache allrecords data in
+   SQLite. SOA serial checks decide whether cached data is still valid; writes
+   clear and prewarm the cache so later search/completion calls stay fast.
+5. Render output according to the active mode. The default is Rich table output;
+   -o jq and -o csv use structured emitters, while help always remains normal
+   operator-facing help.
+6. Keep shell completion quiet and best-effort. Completion helpers use cached
+   DNS data where possible and return no candidates instead of surfacing
+   network/configuration failures to the shell.
+7. Convert expected Click, configuration, and WAPI failures into concise
+   messages. Tracebacks are reserved for unexpected programming errors.
+
+Comment maintenance:
+- When behavior changes, update this outline and the affected function
+  docstrings in the same patch.
+- Comments should explain the reason for a branch or helper boundary, not
+  repeat the Python syntax.
+"""
 
 from __future__ import annotations
 
@@ -91,6 +118,7 @@ class WapiError(CliError):
     """Infoblox WAPI request failure."""
 
     def __init__(self, message: str, status: int | None = None) -> None:
+        """Initialize the instance with state used by the surrounding class methods."""
         super().__init__(message)
         self.status = status
 
@@ -99,11 +127,13 @@ class DnsCreateError(CliError):
     """DNS create failure with command context attached."""
 
     def __init__(self, message: str, context: dict[str, Any]) -> None:
+        """Initialize the instance with state used by the surrounding class methods."""
         super().__init__(message)
         self.context = context
 
 
 def current_output_format() -> str:
+    """Return the selected output mode from the root Click context so nested commands honor -o anywhere."""
     ctx = click.get_current_context(silent=True)
     if ctx is None:
         return TABLE_OUTPUT
@@ -113,18 +143,22 @@ def current_output_format() -> str:
 
 
 def output_is_table() -> bool:
+    """Return whether output should use the default Rich table mode so callers can branch once."""
     return current_output_format() == TABLE_OUTPUT
 
 
 def json_default(value: Any) -> str:
+    """Convert non-JSON-native values to strings so structured output does not crash on Path-like data."""
     return str(value)
 
 
 def emit_json(data: Any) -> None:
+    """Print JSON output through Click so stdout handling stays consistent with the CLI framework."""
     click.echo(json.dumps(data, indent=2, default=json_default))
 
 
 def csv_value(value: Any) -> Any:
+    """Normalize one CSV cell so nested values remain readable and missing values become empty cells."""
     if value is None:
         return ""
     if isinstance(value, (dict, list, tuple)):
@@ -133,6 +167,7 @@ def csv_value(value: Any) -> Any:
 
 
 def emit_csv(rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    """Write CSV rows with a stable header order so automation receives predictable columns."""
     writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for row in rows:
@@ -140,6 +175,7 @@ def emit_csv(rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
 
 
 def structured_output_data(data: Any) -> Any:
+    """Remove top-level structured-output-only fields so JSON and CSV avoid exposing Infoblox refs."""
     if isinstance(data, list):
         return [structured_output_data(item) for item in data]
     if isinstance(data, dict):
@@ -152,10 +188,12 @@ def structured_output_data(data: Any) -> Any:
 
 
 def structured_output_fields(fieldnames: list[str]) -> list[str]:
+    """Filter CSV fieldnames with the same rules as JSON data so output modes stay aligned."""
     return [field for field in fieldnames if field not in STRUCTURED_EXCLUDED_FIELDS]
 
 
 def emit_structured(data: Any, fieldnames: list[str] | None = None) -> None:
+    """Route data to JSON or CSV after shared filtering so command handlers do not duplicate output logic."""
     data = structured_output_data(data)
     if current_output_format() == "jq":
         emit_json(data)
@@ -173,6 +211,7 @@ def emit_structured(data: Any, fieldnames: list[str] | None = None) -> None:
 
 
 def emit_action_result(**fields: Any) -> None:
+    """Emit a normalized success payload for mutating commands so automation receives one schema."""
     emit_structured(
         fields,
         [
@@ -197,6 +236,7 @@ def remember_output_format(
     param: click.Parameter,
     value: str | None,
 ) -> None:
+    """Copy command-local -o values to the root context so any placement affects the final output."""
     if not value:
         return None
     root = ctx.find_root()
@@ -207,6 +247,7 @@ def remember_output_format(
 
 
 def output_option_is_registered(command: click.Command) -> bool:
+    """Check whether a Click command already has --output so recursive registration stays idempotent."""
     for param in command.params:
         if isinstance(param, click.Option) and "--output" in param.opts:
             return True
@@ -214,6 +255,7 @@ def output_option_is_registered(command: click.Command) -> bool:
 
 
 def command_output_option() -> click.Option:
+    """Create the shared output option used on every command to preserve one global contract."""
     return click.Option(
         ["-o", "--output", "output_format"],
         type=click.Choice(STRUCTURED_OUTPUTS, case_sensitive=False),
@@ -224,6 +266,7 @@ def command_output_option() -> click.Option:
 
 
 def register_output_option_everywhere(command: click.Command) -> None:
+    """Attach -o/--output recursively so users can place the global option at any command level."""
     if not output_option_is_registered(command):
         command.params.append(command_output_option())
     if isinstance(command, click.Group):
@@ -232,22 +275,27 @@ def register_output_option_everywhere(command: click.Command) -> None:
 
 
 def print_success(message: str) -> None:
+    """Print success text with shared styling so command output remains visually consistent."""
     console.print(Text(message, style="bold green"))
 
 
 def print_warning(message: str) -> None:
+    """Print warnings to stderr with shared styling so scripts can still consume stdout."""
     err_console.print(Text(message, style="bold yellow"))
 
 
 def print_error(message: str) -> None:
+    """Print errors to stderr with shared styling so failures stay readable without tracebacks."""
     err_console.print(Text(str(message), style="bold red"))
 
 
 def print_note(message: str) -> None:
+    """Print secondary operator notes with a subdued style so important results stay prominent."""
     console.print(Text(message, style="cyan"))
 
 
 def print_command_block(commands: list[str]) -> None:
+    """Render shell snippets as a syntax-highlighted block so setup instructions are copy-ready."""
     for command in commands:
         console.print(Text(f"  {command}", style="green"))
     console.print()
@@ -299,6 +347,7 @@ DNS_DELETE_COMPLETION_RECORD_TYPES = frozenset(FORWARD_RECORD_TYPES)
 
 
 def normalize_server(value: str) -> str:
+    """Normalize server input into an HTTPS base URL so WAPI requests have one expected shape."""
     server = value.strip().rstrip("/")
     if not server:
         raise CliError("ERROR: Infoblox server is required.")
@@ -309,6 +358,7 @@ def normalize_server(value: str) -> str:
 
 
 def parse_bool(value: str, default: bool = True) -> bool:
+    """Parse config booleans from text so saved values can remain INI-compatible."""
     if not value:
         return default
     normalized = value.strip().lower()
@@ -320,17 +370,20 @@ def parse_bool(value: str, default: bool = True) -> bool:
 
 
 def prompt_text(label: str, default: str | None = None) -> str:
+    """Read a Rich prompt and trim whitespace so interactive config stores clean values."""
     if default is None:
         return Prompt.ask(label)
     return Prompt.ask(label, default=default)
 
 
 def ensure_config_dir() -> None:
+    """Create the private config directory with strict permissions before secrets are written."""
     CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(CONFIG_DIR, 0o700)
 
 
 def read_config_key() -> bytes:
+    """Read the Fernet key from disk so encrypted config passwords can be decrypted."""
     if not CONFIG_KEY_FILE.exists():
         raise CliError(f"ERROR: missing encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
     try:
@@ -343,6 +396,7 @@ def read_config_key() -> bytes:
 
 
 def get_or_create_config_key() -> bytes:
+    """Return the existing encryption key or create one with private permissions for first-time setup."""
     ensure_config_dir()
     if CONFIG_KEY_FILE.exists():
         return read_config_key()
@@ -361,11 +415,13 @@ def get_or_create_config_key() -> bytes:
 
 
 def encrypt_password(password: str) -> str:
+    """Encrypt a password before writing config so credentials are not stored as plaintext."""
     token = Fernet(get_or_create_config_key()).encrypt(password.encode("utf-8")).decode("ascii")
     return f"{ENCRYPTED_PASSWORD_PREFIX}{token}"
 
 
 def decrypt_password(password: str) -> str:
+    """Decrypt an encrypted config password and surface config problems as CLI errors."""
     if not password.startswith(ENCRYPTED_PASSWORD_PREFIX):
         return password
 
@@ -377,10 +433,12 @@ def decrypt_password(password: str) -> str:
 
 
 def is_encrypted_password(password: str) -> bool:
+    """Detect encrypted password values so legacy plaintext configs can be migrated safely."""
     return password.startswith(ENCRYPTED_PASSWORD_PREFIX)
 
 
 def write_config_values(config_values: dict[str, str]) -> None:
+    """Persist config through one path so file permissions and password encryption stay consistent."""
     ensure_config_dir()
     config = configparser.ConfigParser()
     config["default"] = {
@@ -393,6 +451,7 @@ def write_config_values(config_values: dict[str, str]) -> None:
 
 
 def load_config_for_prompt() -> dict[str, str]:
+    """Load existing config values for interactive defaults without requiring a complete config."""
     if not CONFIG_FILE.exists():
         return {}
 
@@ -414,6 +473,7 @@ def load_config_for_prompt() -> dict[str, str]:
 
 
 def save_config_interactive() -> None:
+    """Collect and save configuration interactively so first-run setup is guided and repeatable."""
     current = load_config_for_prompt()
     console.print(
         Panel.fit(
@@ -470,6 +530,7 @@ def save_config_interactive() -> None:
 
 
 def maybe_prompt_configure() -> None:
+    """Offer configuration setup when required config is missing so users get a clear next step."""
     if not sys.stdin.isatty():
         raise CliError("ERROR: no configuration file found. Run: ib configure")
     print_warning(f"No configuration file found at {CONFIG_FILE}.")
@@ -479,6 +540,7 @@ def maybe_prompt_configure() -> None:
 
 
 def load_config(required: bool = True) -> dict[str, str] | None:
+    """Load validated config and decrypt credentials so command workflows start with usable settings."""
     if not CONFIG_FILE.exists():
         if required:
             maybe_prompt_configure()
@@ -509,7 +571,9 @@ def load_config(required: bool = True) -> dict[str, str] | None:
 
 
 class InfobloxClient:
+    """Wrap Infoblox WAPI HTTPS calls so command logic stays focused on DNS behavior."""
     def __init__(self, config: dict[str, str]) -> None:
+        """Initialize the instance with state used by the surrounding class methods."""
         self.server = normalize_server(config["server"])
         self.wapi_version = config.get("wapi_version", DEFAULT_WAPI_VERSION).strip().lstrip("/")
         self.username = config["username"]
@@ -528,6 +592,7 @@ class InfobloxClient:
         self._connection: http.client.HTTPConnection | None = None
 
     def close(self) -> None:
+        """Close the cached HTTPS connection so callers can release network resources explicitly."""
         if self._connection is None:
             return
         try:
@@ -536,6 +601,7 @@ class InfobloxClient:
             self._connection = None
 
     def connection(self) -> http.client.HTTPConnection:
+        """Return an HTTPS connection, reusing it so repeated WAPI requests avoid reconnect overhead."""
         if self._connection is not None:
             return self._connection
         if self._server_url.scheme == "https":
@@ -555,11 +621,13 @@ class InfobloxClient:
         return self._connection
 
     def request_path(self, path: str, params: dict[str, Any] | None = None) -> str:
+        """Build the WAPI request path with query parameters encoded once for consistent requests."""
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         quoted_path = urllib.parse.quote(path.lstrip("/"), safe="/:")
         return f"{self._server_path}/wapi/{self.wapi_version}/{quoted_path}{query}"
 
     def connection_error(self, exc: BaseException) -> WapiError:
+        """Convert low-level connection failures into CLI errors with operator-facing context."""
         reason = getattr(exc, "reason", None) or getattr(exc, "strerror", None) or str(exc)
         return WapiError(f"ERROR: cannot reach Infoblox: {reason or exc.__class__.__name__}")
 
@@ -570,6 +638,7 @@ class InfobloxClient:
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Any:
+        """Execute one WAPI request and retry once after connection resets to handle stale keep-alive sockets."""
         had_connection = self._connection is not None
         try:
             return self.request_once(method, path, params, payload)
@@ -590,6 +659,7 @@ class InfobloxClient:
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Any:
+        """Perform a single WAPI HTTP exchange and translate the response into Python data or WAPI errors."""
         body = None
         headers = {
             "Accept": "application/json",
@@ -618,6 +688,7 @@ class InfobloxClient:
 
 
 def format_wapi_error(raw: str) -> str:
+    """Extract useful WAPI error text so operators see the Infoblox reason instead of raw JSON."""
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError:
@@ -626,6 +697,7 @@ def format_wapi_error(raw: str) -> str:
 
 
 def fqdn(record_name: str, zone: str) -> str:
+    """Combine a record name and zone into a fully qualified name while preserving already-qualified names."""
     name = record_name.strip().rstrip(".")
     zone_name = zone.strip().rstrip(".")
     if not name:
@@ -640,6 +712,7 @@ def fqdn(record_name: str, zone: str) -> str:
 
 
 def normalize_zone_name(zone_name: str) -> str:
+    """Normalize zone names for comparison and WAPI payloads so trailing dots/case do not diverge."""
     normalized = zone_name.strip().rstrip(".")
     if not normalized:
         raise CliError("ERROR: zone is required.")
@@ -647,11 +720,13 @@ def normalize_zone_name(zone_name: str) -> str:
 
 
 def default_zone_from_env() -> str | None:
+    """Read IB_ZONE as a normalized zone so shell-scoped overrides use the same validation as config."""
     zone_name = os.environ.get(DEFAULT_ZONE_ENV, "").strip()
     return normalize_zone_name(zone_name) if zone_name else None
 
 
 def default_config_values() -> dict[str, str]:
+    """Read non-secret config values for help/completion without forcing a full command setup path."""
     parser = configparser.ConfigParser()
     try:
         parser.read(CONFIG_FILE)
@@ -663,6 +738,7 @@ def default_config_values() -> dict[str, str]:
 
 
 def session_zone_dir() -> Path:
+    """Return the session-zone directory path so transient zone state stays outside persistent config."""
     runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
     if runtime_dir and os.access(runtime_dir, os.W_OK):
         return Path(runtime_dir) / "ib" / "active-zones"
@@ -671,10 +747,12 @@ def session_zone_dir() -> Path:
 
 
 def session_zone_file() -> Path:
+    """Return the session-zone file for this shell so ib dns zone use remains session scoped."""
     return session_zone_dir() / f"{SESSION_ZONE_FILE_PREFIX}-{os.getppid()}.json"
 
 
 def read_session_zone() -> str | None:
+    """Read the active session zone when present so commands can honor ib dns zone use."""
     try:
         with session_zone_file().open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -693,6 +771,7 @@ def read_session_zone() -> str | None:
 
 
 def write_session_zone(zone_name: str) -> None:
+    """Write the active zone to session state instead of config so zone use remains transient."""
     path = session_zone_file()
     payload = {
         "zone": normalize_zone_name(zone_name),
@@ -710,6 +789,7 @@ def write_session_zone(zone_name: str) -> None:
 
 
 def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> str:
+    """Resolve the target zone through CLI, session, environment, then config to keep precedence explicit."""
     if zone_name:
         return normalize_zone_name(zone_name)
 
@@ -731,6 +811,7 @@ def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> st
 
 
 def forward_zone_candidates_from_record_name(record_name: str) -> list[str]:
+    """Build candidate parent zones from an FQDN so create can infer the most specific zone."""
     normalized = record_name.strip().rstrip(".")
     if not normalized or normalized == "@" or "." not in normalized:
         return []
@@ -741,6 +822,7 @@ def forward_zone_candidates_from_record_name(record_name: str) -> list[str]:
 
 
 def matching_forward_zone_for_record_name(client: InfobloxClient, record_name: str) -> str | None:
+    """Find an existing forward zone for an FQDN so create can avoid requiring --zone."""
     for candidate in forward_zone_candidates_from_record_name(record_name):
         matches = safe_query(
             client,
@@ -762,6 +844,7 @@ def resolve_dns_create_zone(
     record_name: str,
     zone_name: str | None = None,
 ) -> str:
+    """Resolve create target zones with FQDN inference before falling back to the active/default zone."""
     if zone_name:
         return resolve_dns_zone(config, zone_name)
 
@@ -774,6 +857,7 @@ def resolve_dns_create_zone(
 
 
 def default_zone_from_config_file() -> str | None:
+    """Read the configured default zone for context display while ignoring invalid stale values."""
     zone_name = default_config_values().get("default_zone", "").strip()
     if not zone_name:
         return None
@@ -784,6 +868,7 @@ def default_zone_from_config_file() -> str | None:
 
 
 def current_view_status() -> tuple[str, str]:
+    """Return display text for the active DNS view so help can show useful context without full config loading."""
     config_values = default_config_values()
     if not config_values:
         return "not configured", "run ib configure"
@@ -795,6 +880,7 @@ def current_view_status() -> tuple[str, str]:
 
 
 def active_zone_status() -> tuple[str | None, str]:
+    """Return the active zone and source so help and completion can explain command targeting."""
     session_zone = read_session_zone()
     if session_zone:
         return session_zone, "shell session"
@@ -814,6 +900,7 @@ def active_zone_status() -> tuple[str | None, str]:
 
 
 def active_zone_completion_help() -> str:
+    """Build completion help text that shows which zone a command would target."""
     zone_name, source = active_zone_status()
     if zone_name:
         return f"Active zone: {zone_name} ({source})"
@@ -821,6 +908,7 @@ def active_zone_completion_help() -> str:
 
 
 def active_zone_completion_value() -> str:
+    """Build the bash completion marker used to expose active-zone context without changing commands."""
     zone_name, _source = active_zone_status()
     return f"active-zone={zone_name or 'not-set'}"
 
@@ -831,6 +919,7 @@ DNS_CONTEXT_SOURCE_STYLE = "dim"
 
 
 def dns_context_status() -> dict[str, Any]:
+    """Collect view and zone display state once so help renderers stay consistent."""
     view_name, view_source = current_view_status()
     zone_name, zone_source = active_zone_status()
     return {
@@ -848,6 +937,7 @@ def dns_context_value_text(
     value_style: str,
     include_source: bool = True,
 ) -> Text:
+    """Format one context value with optional source text so view and zone rendering share styling."""
     display_value = value or "not set"
     text = Text()
     text.append(display_value, style=value_style)
@@ -860,6 +950,7 @@ def current_view_context_text(
     status: dict[str, Any] | None = None,
     include_source: bool = True,
 ) -> Text:
+    """Format the DNS view context and highlight missing configuration clearly."""
     context = status or dns_context_status()
     view_name = context["view"]
     view_style = "bold magenta" if view_name != "not configured" else "bold yellow"
@@ -870,6 +961,7 @@ def active_zone_context_text(
     status: dict[str, Any] | None = None,
     include_source: bool = True,
 ) -> Text:
+    """Format the active zone context and highlight whether a target zone is available."""
     context = status or dns_context_status()
     zone_style = "bold green" if context["has_active_zone"] else "bold yellow"
     return dns_context_value_text(
@@ -881,6 +973,7 @@ def active_zone_context_text(
 
 
 def dns_context_line_text(status: dict[str, Any] | None = None) -> Text:
+    """Build the compact one-line DNS context used in help and table output."""
     context = status or dns_context_status()
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append("Current DNS Context: ", style=DNS_CONTEXT_TITLE_STYLE)
@@ -896,11 +989,13 @@ def add_dns_context_row(
     table: Table,
     status: dict[str, Any] | None = None,
 ) -> None:
+    """Insert DNS context into Rich tables so usage panels show the same target information."""
     context = status or dns_context_status()
     table.add_row("Context", dns_context_line_text(context))
 
 
 def dns_create_example_text() -> Text:
+    """Build the create example text once so help and tests share a stable operator example."""
     return Text.assemble(
         ("Setup: ", "bold yellow"),
         ("ib dns zone use ", "bold white"),
@@ -926,6 +1021,7 @@ def dns_create_example_text() -> Text:
 
 
 def dns_create_zone_rule_text() -> Text:
+    """Explain zone precedence in create help so operators understand how relative names resolve."""
     return Text.assemble(
         ("--zone", "bold magenta"),
         (" overrides the target. Without it, relative names use ", "white"),
@@ -939,6 +1035,7 @@ def dns_create_zone_rule_text() -> Text:
 
 
 def dns_create_target_text(zone_name: str | None) -> Text:
+    """Show the current create target so help output reflects the actual active zone."""
     if zone_name:
         return Text.assemble(
             ("Current target: without ", "white"),
@@ -964,6 +1061,7 @@ def dns_create_target_text(zone_name: str | None) -> Text:
 
 
 def dns_create_option_note_text() -> Text:
+    """Summarize create option expectations so common TTL/comment mistakes are visible in help."""
     return Text.assemble(
         ("-t/--ttl", "bold cyan"),
         (" expects an integer; ", "white"),
@@ -975,10 +1073,12 @@ def dns_create_option_note_text() -> Text:
 
 
 def dns_context_panel(title: str = "Current DNS Context") -> Text:
+    """Return the compact DNS context renderable used by commands and errors."""
     return dns_context_line_text()
 
 
 def dns_create_usage_panel() -> Panel:
+    """Build the rich create usage panel because positional DNS creation benefits from examples."""
     context = dns_context_status()
     zone_name = context["active_zone"] if context["has_active_zone"] else None
 
@@ -1028,6 +1128,7 @@ def dns_create_usage_panel() -> Panel:
 
 
 def dns_delete_usage_panel() -> Panel:
+    """Build the rich delete usage panel because forward and PTR deletion have different forms."""
     context = dns_context_status()
     zone_name = context["active_zone"] if context["has_active_zone"] else None
     forward_example = f"app.{zone_name}" if zone_name else "app.<active-zone>"
@@ -1094,6 +1195,7 @@ def dns_delete_usage_panel() -> Panel:
 
 
 def render_help_text(ctx: click.Context, renderable: Any, force_color: bool = False) -> str:
+    """Render Rich help panels into Click help text so colors and wrapping remain controlled."""
     width = min(ctx.terminal_width or console.width or 80, 100)
     force_terminal = ctx.color if ctx.color is not None else console.is_terminal
     help_console = Console(
@@ -1108,11 +1210,14 @@ def render_help_text(ctx: click.Context, renderable: Any, force_color: bool = Fa
 
 
 def usage_context_panel_text(ctx: click.Context) -> str:
+    """Render the shared DNS context panel for generic command help."""
     return render_help_text(ctx, dns_context_panel())
 
 
 class UsageContextHelpMixin:
+    """Share custom help rendering so groups and commands show the same DNS context style."""
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Render custom help so Click usage, DNS context, and command help stay in one layout."""
         self.format_usage(ctx, formatter)
         formatter.write("\n")
         formatter.write(usage_context_panel_text(ctx))
@@ -1123,11 +1228,14 @@ class UsageContextHelpMixin:
 
 
 class UsageContextCommand(UsageContextHelpMixin, click.Command):
+    """Click command base class that includes DNS context in help output."""
     pass
 
 
 class DnsCreateCommand(UsageContextCommand):
+    """Specialize create help because create has positional usage and examples worth surfacing."""
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Render custom help so Click usage, DNS context, and command help stay in one layout."""
         self.format_usage(ctx, formatter)
         formatter.write("\n")
         formatter.write(render_help_text(ctx, dns_create_usage_panel(), force_color=True))
@@ -1138,11 +1246,14 @@ class DnsCreateCommand(UsageContextCommand):
 
 
 class DnsDeleteCommand(UsageContextCommand):
+    """Specialize delete help because PTR deletion has a separate operator-facing command form."""
     def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Render delete usage with both forward and PTR forms so syntax errors point to the right shape."""
         formatter.write(f"Usage: {ctx.command_path} [OPTIONS] RECORD_NAME [ZONE]\n")
         formatter.write(f"       {ctx.command_path} ptr IP_ADDRESS\n")
 
     def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        """Render custom help so Click usage, DNS context, and command help stay in one layout."""
         self.format_usage(ctx, formatter)
         formatter.write("\n")
         formatter.write(render_help_text(ctx, dns_delete_usage_panel(), force_color=True))
@@ -1153,6 +1264,7 @@ class DnsDeleteCommand(UsageContextCommand):
 
 
 def dns_create_click_error_help(exc: click.ClickException) -> str | None:
+    """Return create-specific help for Click parsing errors so positional mistakes are easier to fix."""
     ctx = getattr(exc, "ctx", None)
     if not ctx or not isinstance(ctx.command, DnsCreateCommand):
         return None
@@ -1160,6 +1272,7 @@ def dns_create_click_error_help(exc: click.ClickException) -> str | None:
 
 
 def print_dns_create_click_error_help(exc: click.ClickException) -> None:
+    """Print create help after parse errors so users see the corrected command shape immediately."""
     help_text = dns_create_click_error_help(exc)
     if not help_text:
         return
@@ -1169,6 +1282,7 @@ def print_dns_create_click_error_help(exc: click.ClickException) -> None:
 
 
 def click_error_usage_text(exc: click.ClickException) -> str:
+    """Extract Click usage lines so error output can highlight only the usage prefix."""
     if not isinstance(exc, click.UsageError) or exc.ctx is None:
         return ""
 
@@ -1179,6 +1293,7 @@ def click_error_usage_text(exc: click.ClickException) -> str:
 
 
 def styled_click_usage_text(usage_text: str) -> Text:
+    """Style Click usage text while keeping the command syntax itself unmodified."""
     text = Text()
     if usage_text.startswith("Usage: "):
         text.append("Usage: ", style="cyan")
@@ -1189,6 +1304,7 @@ def styled_click_usage_text(usage_text: str) -> Text:
 
 
 def styled_error_keyword_text(message: str) -> Text:
+    """Highlight the ERROR prefix consistently without rewriting the actual error message."""
     keyword = "Error:"
     text = Text()
     start = 0
@@ -1205,6 +1321,7 @@ def styled_error_keyword_text(message: str) -> Text:
 
 
 def print_click_exception(exc: click.ClickException) -> None:
+    """Render Click exceptions with context and hints so expected failures stay traceback-free."""
     usage_text = click_error_usage_text(exc)
     if usage_text:
         err_console.print(styled_click_usage_text(usage_text))
@@ -1213,11 +1330,13 @@ def print_click_exception(exc: click.ClickException) -> None:
 
 
 def is_dns_delete_click_error(exc: click.ClickException) -> bool:
+    """Detect delete parse errors where the reverse-PTR hint is useful."""
     ctx = getattr(exc, "ctx", None)
     return bool(ctx and getattr(ctx, "command_path", "").endswith("dns delete"))
 
 
 def print_dns_delete_click_error_hint(exc: click.ClickException) -> None:
+    """Print the PTR deletion hint only for delete syntax errors that need it."""
     if not is_dns_delete_click_error(exc):
         return
     err_console.print(
@@ -1229,11 +1348,13 @@ def print_dns_delete_click_error_hint(exc: click.ClickException) -> None:
 
 
 class UsageContextGroup(UsageContextHelpMixin, click.Group):
+    """Click group base class that gives subcommands the shared contextual help behavior."""
     command_class = UsageContextCommand
     group_class = type
 
 
 def print_click_error_dns_context(exc: click.ClickException) -> None:
+    """Add DNS context to command errors so operators can see the target view and zone."""
     ctx = getattr(exc, "ctx", None)
     if not ctx or isinstance(ctx.command, DnsCreateCommand):
         return
@@ -1243,17 +1364,21 @@ def print_click_error_dns_context(exc: click.ClickException) -> None:
 
 
 def is_bash_completion() -> bool:
+    """Detect bash completion mode so completion output can use bash-friendly context markers."""
     return os.environ.get("_IB_COMPLETE", "").startswith("bash_")
 
 
 def append_active_zone_help(item_help: str | None, active_zone_help: str) -> str:
+    """Append active-zone context to completion help while preserving existing item descriptions."""
     if not item_help:
         return active_zone_help
     return f"{item_help} {active_zone_help}."
 
 
 class DnsGroup(UsageContextGroup):
+    """DNS command group that augments shell completion with active-zone context."""
     def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        """Customize shell completion while preserving Click default command suggestions."""
         items = super().shell_complete(ctx, incomplete)
 
         zone_help = active_zone_completion_help()
@@ -1269,7 +1394,9 @@ class DnsGroup(UsageContextGroup):
 
 
 class RootGroup(UsageContextGroup):
+    """Root command group that opportunistically warms completion/search cache during completion."""
     def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        """Customize shell completion while preserving Click default command suggestions."""
         items = super().shell_complete(ctx, incomplete)
         if not incomplete:
             start_search_cache_prewarm()
@@ -1277,6 +1404,7 @@ class RootGroup(UsageContextGroup):
 
 
 def normalize_ttl(ttl: int | None) -> int | None:
+    """Validate TTL values locally so WAPI payloads only receive non-negative integers."""
     if ttl is None:
         return None
     if isinstance(ttl, bool) or not isinstance(ttl, int):
@@ -1287,6 +1415,7 @@ def normalize_ttl(ttl: int | None) -> int | None:
 
 
 def ttl_payload(ttl: int | None) -> dict[str, Any]:
+    """Build the WAPI TTL fragment and use_ttl flag together so TTL updates are explicit."""
     normalized = normalize_ttl(ttl)
     if normalized is None:
         return {}
@@ -1294,6 +1423,7 @@ def ttl_payload(ttl: int | None) -> dict[str, Any]:
 
 
 def normalize_record_comment(comment: str | None) -> str | None:
+    """Validate comments before WAPI calls so invalid characters fail with local guidance."""
     if comment is None:
         return None
     normalized = comment.strip()
@@ -1308,6 +1438,7 @@ def normalize_record_comment(comment: str | None) -> str | None:
 
 
 def click_error_text(error: CliError) -> str:
+    """Strip the local ERROR prefix when converting CLI errors into Click exceptions."""
     message = str(error)
     return message[7:] if message.startswith("ERROR: ") else message
 
@@ -1317,6 +1448,7 @@ def validate_ttl_option(
     param: click.Parameter,
     value: int | None,
 ) -> int | None:
+    """Validate Click TTL options through the shared TTL rules so create and edit behave the same."""
     try:
         return normalize_ttl(value)
     except CliError as exc:
@@ -1328,6 +1460,7 @@ def validate_record_comment_option(
     param: click.Parameter,
     value: str | None,
 ) -> str | None:
+    """Validate Click comment options through the shared comment rules so commands stay consistent."""
     try:
         return normalize_record_comment(value)
     except CliError as exc:
@@ -1335,6 +1468,7 @@ def validate_record_comment_option(
 
 
 def mx_payload(value: str) -> dict[str, Any]:
+    """Parse MX value syntax into preference and exchanger fields required by Infoblox."""
     parts = value.split()
     if len(parts) != 2 or not parts[0].isdigit():
         raise CliError("ERROR: MX value must be quoted as '<preference> <mail_exchanger>'.")
@@ -1342,11 +1476,13 @@ def mx_payload(value: str) -> dict[str, Any]:
 
 
 def ptr_payload(name: str, value: str) -> dict[str, Any]:
+    """Build a PTR WAPI payload from address and target host so reverse records use the right field names."""
     field = "ipv6addr" if ":" in name else "ipv4addr"
     return {field: name, "ptrdname": value.rstrip(".")}
 
 
 def host_payload(value: str) -> dict[str, Any]:
+    """Build a HOST address payload and choose IPv4 or IPv6 fields from the supplied address."""
     try:
         address = ipaddress.ip_address(value)
     except ValueError:
@@ -1366,6 +1502,7 @@ def create_payload(
     comment: str | None,
     client: InfobloxClient,
 ) -> tuple[str, dict[str, Any]]:
+    """Build the WAPI create payload for each supported record type so command parsing stays type-neutral."""
     record_type = record_type.lower()
     spec = RECORD_TYPES.get(record_type)
     if not spec:
@@ -1403,10 +1540,12 @@ def create_payload(
 
 
 def cname_target_for_resolution(value: str) -> str:
+    """Normalize CNAME targets before DNS lookup so warning checks query the intended hostname."""
     return value.strip().rstrip(".")
 
 
 def warn_if_cname_target_unresolved(record_type: str, value: str) -> None:
+    """Warn on unresolved CNAME targets without blocking create/edit because DNS may be staged."""
     if record_type.lower() != "cname":
         return
 
@@ -1430,6 +1569,7 @@ def warn_if_cname_target_unresolved(record_type: str, value: str) -> None:
 
 
 def dns_create_target_name(name: str, resolved_zone: str | None) -> str | None:
+    """Return the display name create attempted so error context can show the target record."""
     if not resolved_zone:
         return None
     try:
@@ -1439,6 +1579,7 @@ def dns_create_target_name(name: str, resolved_zone: str | None) -> str | None:
 
 
 def dns_create_error_hints(error_message: str | None, context: dict[str, Any]) -> list[str]:
+    """Choose local hints for common Infoblox create failures so errors include a next action."""
     if not error_message:
         return []
 
@@ -1466,6 +1607,7 @@ def dns_create_error_hints(error_message: str | None, context: dict[str, Any]) -
 
 
 def dns_create_error_hint(error_message: str | None, context: dict[str, Any]) -> str | None:
+    """Join create hints into a single message for compact error panels."""
     hints = dns_create_error_hints(error_message, context)
     if not hints:
         return None
@@ -1485,6 +1627,7 @@ def dns_create_error_context(
     object_type: str | None = None,
     error_message: str | None = None,
 ) -> dict[str, Any]:
+    """Collect create failure context so the error renderer can explain the attempted WAPI action."""
     context_status = dns_context_status()
     if view:
         context_status["view"] = view
@@ -1514,6 +1657,7 @@ def dns_create_error_context(
 
 
 def dns_create_error_value(value: Any) -> Text:
+    """Format one create error context value for a Rich table without losing structured details."""
     if value is None or value == "":
         return Text("not set", style="yellow")
     if isinstance(value, bool):
@@ -1522,6 +1666,7 @@ def dns_create_error_value(value: Any) -> Text:
 
 
 def dns_create_error_hint_lines(value: Any) -> list[str]:
+    """Expand create hints into bullet lines so multi-step guidance is readable."""
     if not value:
         return []
     if isinstance(value, (list, tuple)):
@@ -1541,6 +1686,7 @@ def dns_create_error_hint_lines(value: Any) -> list[str]:
 
 
 def dns_create_error_hint_value(value: Any) -> Text:
+    """Format hint text for the create error panel with nested hint lines preserved."""
     text = Text()
     for index, hint in enumerate(dns_create_error_hint_lines(value)):
         if index:
@@ -1551,6 +1697,7 @@ def dns_create_error_hint_value(value: Any) -> Text:
 
 
 def dns_create_error_context_panel(context: dict[str, Any]) -> Panel:
+    """Build the Rich panel that explains a failed create request and likely fixes."""
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Field", style="bold cyan", no_wrap=True)
     table.add_column("Value", overflow="fold")
@@ -1587,6 +1734,7 @@ def dns_create_error_context_panel(context: dict[str, Any]) -> Panel:
 
 
 def print_dns_create_error_context(context: dict[str, Any]) -> None:
+    """Print create failure context to stderr so stdout remains usable for structured output."""
     err_console.print(dns_create_error_context_panel(context))
 
 
@@ -1599,6 +1747,7 @@ def run_dns_create(
     noptr: bool,
     comment: str | None,
 ) -> None:
+    """Run the DNS create workflow, centralizing validation, WAPI POST, cache refresh, and output."""
     resolved_zone = None
     view = None
     object_type = None
@@ -1646,6 +1795,7 @@ def run_dns_create(
 
 
 def update_value_payload(record_type: str, value: str) -> dict[str, Any]:
+    """Build the value-changing part of an edit payload according to the selected record type."""
     record_type = record_type.lower()
     spec = RECORD_TYPES.get(record_type)
     if not spec:
@@ -1669,6 +1819,7 @@ def update_payload(
     ttl: int | None,
     comment: str | None,
 ) -> dict[str, Any]:
+    """Combine value, TTL, and comment updates so edit sends only requested WAPI fields."""
     payload = {
         **ttl_payload(ttl),
     }
@@ -1687,6 +1838,7 @@ def object_query_params(
     client: InfobloxClient,
     extra: dict[str, Any],
 ) -> dict[str, Any]:
+    """Build record query parameters with view and return fields consistently for all record types."""
     return {
         "_return_fields": spec["return_fields"],
         "view": client.view,
@@ -1699,6 +1851,7 @@ def zone_query_params(
     extra: dict[str, Any] | None = None,
     return_fields: str = ZONE_RETURN_FIELDS,
 ) -> dict[str, Any]:
+    """Build zone query parameters with view and return fields consistently for zone workflows."""
     return {
         "_return_fields": return_fields,
         "view": client.view,
@@ -1707,6 +1860,7 @@ def zone_query_params(
 
 
 def allrecords_query_params(client: InfobloxClient, zone_name: str) -> dict[str, Any]:
+    """Build allrecords query parameters for a zone so list/search use the same WAPI fields."""
     return {
         "_return_fields": ALLRECORDS_RETURN_FIELDS,
         "view": client.view,
@@ -1719,6 +1873,7 @@ def zone_search_params(
     field: str,
     search: str | None = None,
 ) -> dict[str, Any]:
+    """Build zone search parameters for name or comment lookup while preserving view scoping."""
     extra = {}
     if search:
         extra[f"{field}~"] = search_pattern(search, case_sensitive=False)
@@ -1726,6 +1881,7 @@ def zone_search_params(
 
 
 def zone_result_key(zone: dict[str, Any]) -> str:
+    """Return a stable key for zone deduplication because WAPI searches can return overlaps."""
     if zone.get("_ref"):
         return str(zone["_ref"])
     return json.dumps(
@@ -1739,6 +1895,7 @@ def zone_result_key(zone: dict[str, Any]) -> str:
 
 
 def query_zones(client: InfobloxClient, search: str | None = None) -> list[dict[str, Any]]:
+    """Query zones by name and comment separately, then merge results because WAPI filters are conjunctive."""
     if not search:
         return paged_query(client, ZONE_OBJECT, zone_query_params(client))
 
@@ -1755,6 +1912,7 @@ def query_zones(client: InfobloxClient, search: str | None = None) -> list[dict[
 
 
 def safe_query(client: InfobloxClient, object_type: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    """Wrap list-returning WAPI queries so unexpected response shapes become controlled CLI errors."""
     try:
         result = client.request("GET", object_type, params=params)
     except WapiError as exc:
@@ -1771,6 +1929,7 @@ def paged_query(
     params: dict[str, Any],
     warn_on_skip: bool = True,
 ) -> list[dict[str, Any]]:
+    """Retrieve all WAPI pages so list/search commands are complete without using a terminal pager."""
     page_params: dict[str, Any] = {
         **params,
         "_paging": 1,
@@ -1811,10 +1970,12 @@ def paged_query(
 
 
 def search_fields(spec: dict[str, Any]) -> tuple[str, ...]:
+    """Return searchable fields for a record type so search behavior stays data-driven."""
     return ("name", *spec.get("search_value_fields", ()), "comment")
 
 
 def case_insensitive_literal_pattern(keyword: str) -> str:
+    """Build a case-insensitive literal regex without inline flags because WAPI rejects (?i)."""
     parts = []
     for char in keyword:
         if char.isascii() and char.isalpha():
@@ -1825,26 +1986,31 @@ def case_insensitive_literal_pattern(keyword: str) -> str:
 
 
 def search_pattern(keyword: str, case_sensitive: bool) -> str:
+    """Choose the WAPI search pattern according to the case-sensitivity option."""
     return re.escape(keyword) if case_sensitive else case_insensitive_literal_pattern(keyword)
 
 
 def is_zone_or_child(zone_name: str, parent_zone: str) -> bool:
+    """Return whether a zone belongs under a parent so scoped searches include child zones."""
     zone = normalize_zone_name(zone_name)
     parent = normalize_zone_name(parent_zone)
     return zone == parent or zone.endswith(f".{parent}")
 
 
 def zone_serial(zone_info: dict[str, Any]) -> str | None:
+    """Extract a zone serial as text so cache validation can compare values safely."""
     serial = zone_info.get("soa_serial_number")
     return str(serial) if serial is not None else None
 
 
 def is_secondary_zone(zone_info: dict[str, Any]) -> bool:
+    """Detect secondary zones so refresh logic can avoid relying on unavailable primary data."""
     primary_type = str(zone_info.get("primary_type", "")).strip().lower()
     return primary_type in {"external", "microsoft", "secondary"}
 
 
 def is_reverse_zone_name(zone_name: str) -> bool:
+    """Detect reverse zones so forward-record commands can exclude PTR-oriented data."""
     try:
         normalized = normalize_zone_name(zone_name)
     except CliError:
@@ -1853,6 +2019,7 @@ def is_reverse_zone_name(zone_name: str) -> bool:
 
 
 def is_forward_zone(zone_info: dict[str, Any]) -> bool:
+    """Return whether a zone is forward-looking so completions avoid reverse DNS targets."""
     zone_format = str(zone_info.get("zone_format", "")).strip().upper()
     if zone_format in {"IPV4", "IPV6"}:
         return False
@@ -1862,6 +2029,7 @@ def is_forward_zone(zone_info: dict[str, Any]) -> bool:
 
 
 def search_root_zone(config: dict[str, str]) -> str | None:
+    """Resolve the default search root so normal search stays scoped unless -g is used."""
     try:
         return resolve_dns_zone(config)
     except CliError:
@@ -1869,10 +2037,12 @@ def search_root_zone(config: dict[str, str]) -> str | None:
 
 
 def record_result_key(item: dict[str, Any]) -> str:
+    """Return a stable record key for deduplication because allrecords and typed records can overlap."""
     return str(item.get("_ref") or json.dumps(item, sort_keys=True))
 
 
 def allrecords_cache_key(client: InfobloxClient, zone_name: str) -> str:
+    """Build a per-server/view/zone cache key so cached DNS data does not cross contexts."""
     cache_key = json.dumps(
         {
             "server": client.server,
@@ -1886,18 +2056,22 @@ def allrecords_cache_key(client: InfobloxClient, zone_name: str) -> str:
 
 
 def allrecords_cache_file(client: InfobloxClient, zone_name: str) -> Path:
+    """Return the legacy JSON cache path for compatibility with older cache files."""
     return ALLRECORDS_CACHE_DIR / f"{allrecords_cache_key(client, zone_name)}.json"
 
 
 def allrecords_cache_db_file() -> Path:
+    """Return the SQLite cache path used by current allrecords search caching."""
     return ALLRECORDS_CACHE_DIR / "cache.sqlite3"
 
 
 def search_cache_prewarm_lock_file() -> Path:
+    """Return the lock path that prevents duplicate background cache warmers."""
     return ALLRECORDS_CACHE_DIR / "prewarm.lock"
 
 
 def clear_dns_cache() -> None:
+    """Remove DNS cache files after writes so search and completion do not return stale data."""
     try:
         if ALLRECORDS_CACHE_DIR.is_dir():
             shutil.rmtree(ALLRECORDS_CACHE_DIR)
@@ -1915,6 +2089,7 @@ def clear_dns_cache() -> None:
 
 
 def zone_serial_cache_key(client: InfobloxClient) -> str:
+    """Build the zone-serial cache key so serial state is scoped to server and view."""
     cache_key = json.dumps(
         {
             "server": client.server,
@@ -1927,6 +2102,7 @@ def zone_serial_cache_key(client: InfobloxClient) -> str:
 
 
 def ensure_allrecords_cache_dir() -> None:
+    """Create the cache directory before cache reads or writes so callers stay simple."""
     ALLRECORDS_CACHE_DIR.parent.mkdir(mode=0o700, exist_ok=True)
     ALLRECORDS_CACHE_DIR.mkdir(mode=0o700, exist_ok=True)
     try:
@@ -1937,6 +2113,7 @@ def ensure_allrecords_cache_dir() -> None:
 
 
 def initialize_search_cache_db(conn: sqlite3.Connection) -> None:
+    """Create or migrate SQLite cache tables so current and older cache layouts both work."""
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS zone_serial_cache (
@@ -1979,6 +2156,7 @@ def initialize_search_cache_db(conn: sqlite3.Connection) -> None:
 
 
 def connect_search_cache_db() -> sqlite3.Connection:
+    """Open the SQLite cache with row access and initialized schema for callers."""
     ensure_allrecords_cache_dir()
     db_file = allrecords_cache_db_file()
     conn = sqlite3.connect(db_file, timeout=30)
@@ -1998,12 +2176,14 @@ def connect_search_cache_db() -> sqlite3.Connection:
 
 
 def normalize_zone_serial_cache(zones: Any) -> list[dict[str, Any]] | None:
+    """Validate zone serial cache payloads so corrupt JSON can be ignored safely."""
     if not isinstance(zones, list) or not all(isinstance(zone, dict) for zone in zones):
         return None
     return zones
 
 
 def read_zone_serial_cache(client: InfobloxClient) -> list[dict[str, Any]] | None:
+    """Read cached zone serials so search can skip expensive zone queries when still fresh."""
     try:
         with connect_search_cache_db() as conn:
             row = conn.execute(
@@ -2024,6 +2204,7 @@ def read_zone_serial_cache(client: InfobloxClient) -> list[dict[str, Any]] | Non
 
 
 def write_zone_serial_cache(client: InfobloxClient, zones: list[dict[str, Any]]) -> None:
+    """Persist zone serials for later cache validation and tolerate cache write failures."""
     try:
         with connect_search_cache_db() as conn:
             conn.execute(
@@ -2050,6 +2231,7 @@ def sqlite_zone_record_cache_is_valid(
     cache_key: str,
     serial_number: str,
 ) -> bool:
+    """Check whether cached entries match the current zone serial before using them."""
     row = conn.execute(
         "SELECT serial_number FROM zone_record_cache WHERE cache_key = ?",
         (cache_key,),
@@ -2058,6 +2240,7 @@ def sqlite_zone_record_cache_is_valid(
 
 
 def sqlite_search_entry_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    """Convert one SQLite row into a cached search entry while dropping corrupt JSON rows."""
     try:
         record = json.loads(str(row["record_json"]))
     except json.JSONDecodeError:
@@ -2080,6 +2263,7 @@ def read_sqlite_allrecords_search_entries(
     zone_name: str,
     serial_number: str | None,
 ) -> list[dict[str, Any]] | None:
+    """Read cached allrecords entries for one zone when the serial proves them current."""
     if serial_number is None:
         return None
     cache_key = allrecords_cache_key(client, zone_name)
@@ -2115,6 +2299,7 @@ def search_sqlite_allrecords_cache(
     keyword: str,
     case_sensitive: bool,
 ) -> list[dict[str, Any]] | None:
+    """Search cached allrecords entries locally so repeated DNS searches avoid WAPI calls."""
     if serial_number is None:
         return None
     cache_key = allrecords_cache_key(client, zone_name)
@@ -2163,6 +2348,7 @@ def read_legacy_allrecords_cache_payload(
     zone_name: str,
     serial_number: str | None,
 ) -> dict[str, Any] | None:
+    """Read the older JSON cache format so users are not forced to rebuild immediately."""
     if serial_number is None:
         return None
     try:
@@ -2187,6 +2373,7 @@ def read_allrecords_cache_payload(
     zone_name: str,
     serial_number: str | None,
 ) -> dict[str, Any] | None:
+    """Read either current or legacy cache payloads so cache migration is transparent."""
     entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
     if entries is not None:
         return {
@@ -2203,6 +2390,7 @@ def read_allrecords_cache_payload(
 
 
 def cached_records(cache: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Extract records from a cache payload only when the payload shape is usable."""
     records = cache.get("records")
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
         return None
@@ -2214,11 +2402,13 @@ def read_allrecords_cache(
     zone_name: str,
     serial_number: str | None,
 ) -> list[dict[str, Any]] | None:
+    """Read legacy allrecords cache data when still valid for compatibility paths."""
     cache = read_allrecords_cache_payload(client, zone_name, serial_number)
     return cached_records(cache) if cache else None
 
 
 def allrecord_search_entry(item: dict[str, Any], zone_name: str | None = None) -> dict[str, Any]:
+    """Normalize one allrecords item into the cache/search entry shape."""
     record_type = allrecord_type(item)
     return {
         "type": record_type,
@@ -2234,10 +2424,12 @@ def allrecord_search_entries(
     records: list[dict[str, Any]],
     zone_name: str | None = None,
 ) -> list[dict[str, Any]]:
+    """Normalize all allrecords items for one zone so search and list consume the same shape."""
     return [allrecord_search_entry(item, zone_name) for item in records]
 
 
 def normalize_cached_search_entry(entry: Any) -> dict[str, Any] | None:
+    """Validate one cached search entry so corrupt cache rows are skipped safely."""
     if not isinstance(entry, dict):
         return None
     record = entry.get("record")
@@ -2255,6 +2447,7 @@ def normalize_cached_search_entry(entry: Any) -> dict[str, Any] | None:
 
 
 def normalize_cached_search_entries(entries: Any) -> list[dict[str, Any]] | None:
+    """Validate cached search entries as a list so callers get clean record data."""
     if not isinstance(entries, list):
         return None
 
@@ -2272,6 +2465,7 @@ def read_allrecords_search_cache(
     zone_name: str,
     serial_number: str | None,
 ) -> list[dict[str, Any]] | None:
+    """Read all cached search entries for a zone, preferring SQLite and falling back to legacy cache."""
     cached_entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
     if cached_entries is not None:
         return cached_entries
@@ -2303,6 +2497,7 @@ def write_allrecords_cache(
     records: list[dict[str, Any]],
     search_entries: list[dict[str, Any]] | None = None,
 ) -> None:
+    """Persist allrecords entries to SQLite so search and completion can reuse them quickly."""
     if serial_number is None:
         return
     if search_entries is None:
@@ -2364,6 +2559,7 @@ def write_allrecords_cache(
 
 
 def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
+    """Query zone serials with paging so cache validation sees every authoritative zone."""
     cached_zones = read_zone_serial_cache(client)
     if cached_zones is not None:
         return cached_zones
@@ -2378,6 +2574,7 @@ def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
 
 
 def search_zones(client: InfobloxClient, root_zone: str | None) -> list[dict[str, Any]]:
+    """Select zones within the requested search scope so normal search stays zone-limited."""
     zones = query_zone_serials(client)
     if not root_zone:
         return sorted(
@@ -2408,6 +2605,7 @@ def search_zones(client: InfobloxClient, root_zone: str | None) -> list[dict[str
 
 
 def allrecords_for_zone(client: InfobloxClient, zone_info: dict[str, Any]) -> list[dict[str, Any]]:
+    """Fetch allrecords for one zone while skipping zones that cannot provide reliable records."""
     zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
     serial_number = zone_serial(zone_info)
     cached_records = read_allrecords_cache(client, zone_name, serial_number)
@@ -2423,6 +2621,7 @@ def allrecords_search_entries_for_zone(
     client: InfobloxClient,
     zone_info: dict[str, Any],
 ) -> list[dict[str, Any]]:
+    """Return cached or freshly queried search entries for a zone based on SOA serial checks."""
     zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
     serial_number = zone_serial(zone_info)
     cached_entries = read_allrecords_search_cache(client, zone_name, serial_number)
@@ -2436,6 +2635,7 @@ def allrecords_search_entries_for_zone(
 
 
 def record_in_zone_scope(item: dict[str, Any], root_zone: str) -> bool:
+    """Return whether a record belongs to a search root so cached global data can be filtered locally."""
     zone_name = str(item.get("zone", "")).strip()
     if zone_name:
         return is_zone_or_child(zone_name, root_zone)
@@ -2445,6 +2645,7 @@ def record_in_zone_scope(item: dict[str, Any], root_zone: str) -> bool:
 
 
 def decoded_allrecords_ref(item: dict[str, Any]) -> str:
+    """Decode allrecords references so unsupported synthetic record types can be identified."""
     ref = str(item.get("_ref", ""))
     prefix = f"{ALLRECORDS_OBJECT}/"
     if not ref.startswith(prefix):
@@ -2465,6 +2666,7 @@ def decoded_allrecords_ref(item: dict[str, Any]) -> str:
 
 
 def unsupported_allrecord_type(item: dict[str, Any]) -> str:
+    """Infer display labels for known unsupported allrecords records so search output is clearer."""
     decoded_ref = decoded_allrecords_ref(item)
     if "fake_bind_ns" in decoded_ref:
         return "ns"
@@ -2474,6 +2676,7 @@ def unsupported_allrecord_type(item: dict[str, Any]) -> str:
 
 
 def allrecord_type(item: dict[str, Any]) -> str:
+    """Return the normalized record type from allrecords data, including unsupported inferred types."""
     raw_type = str(item.get("type", "")).lower()
     if raw_type == "unsupported":
         return unsupported_allrecord_type(item)
@@ -2488,11 +2691,13 @@ def allrecord_type(item: dict[str, Any]) -> str:
 
 
 def nested_record(item: dict[str, Any]) -> dict[str, Any]:
+    """Return the nested concrete record payload when allrecords wraps typed record details."""
     record = item.get("record")
     return record if isinstance(record, dict) else {}
 
 
 def first_record_value(item: dict[str, Any], keys: tuple[str, ...]) -> str:
+    """Return the first populated value field from a record so display logic can stay generic."""
     record = nested_record(item)
     for key in keys:
         value = record.get(key, item.get(key))
@@ -2502,10 +2707,12 @@ def first_record_value(item: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 
 def allrecord_display_name(item: dict[str, Any]) -> str:
+    """Return the best record name from allrecords data, including nested record payloads."""
     return first_record_value(item, ("name",)) or str(item.get("name", ""))
 
 
 def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
+    """Return the best display value for an allrecords entry based on its record type."""
     if record_type in {"cname", "shared-cname"}:
         return first_record_value(item, ("canonical",))
     if record_type in {"txt", "shared-txt"}:
@@ -2538,6 +2745,7 @@ def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
 
 
 def allrecord_search_values(record_type: str, item: dict[str, Any]) -> list[str]:
+    """Collect searchable text for one allrecords entry so search covers name, value, and comment."""
     return [
         allrecord_display_name(item),
         allrecord_display_value(record_type, item),
@@ -2550,6 +2758,7 @@ def allrecord_matches_keyword(
     keyword: str,
     case_sensitive: bool,
 ) -> bool:
+    """Return whether one allrecords entry matches the keyword using local case handling."""
     needle = keyword if case_sensitive else keyword.lower()
     record_type = allrecord_type(item)
     for value in allrecord_search_values(record_type, item):
@@ -2564,6 +2773,7 @@ def allrecord_search_entry_matches_keyword(
     keyword: str,
     case_sensitive: bool,
 ) -> bool:
+    """Apply keyword matching to cached search entries so SQLite and live paths agree."""
     needle = keyword if case_sensitive else keyword.lower()
     for key in ("name", "value", "comment"):
         value = str(entry.get(key, ""))
@@ -2574,11 +2784,13 @@ def allrecord_search_entry_matches_keyword(
 
 
 def allrecord_search_entry_record(entry: dict[str, Any]) -> dict[str, Any]:
+    """Return the record payload from a cached search entry for table/output rendering."""
     record = entry.get("record")
     return record if isinstance(record, dict) else {}
 
 
 def allrecord_search_entry_type(entry: dict[str, Any]) -> str:
+    """Return the cached record type in normalized form for display and sorting."""
     record = allrecord_search_entry_record(entry)
     entry_type = str(entry.get("type") or "")
     if entry_type.lower() == "unsupported":
@@ -2587,6 +2799,7 @@ def allrecord_search_entry_type(entry: dict[str, Any]) -> str:
 
 
 def allrecord_search_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    """Build a stable sort key so DNS search and list output are predictable."""
     record = allrecord_search_entry_record(entry)
     record_type = allrecord_search_entry_type(entry)
     zone_name = str(entry.get("zone") or record.get("zone", ""))
@@ -2602,6 +2815,7 @@ def allrecord_search_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, st
 
 
 def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
+    """Create a per-thread client so concurrent zone queries do not share HTTPS connections."""
     attrs = ("server", "wapi_version", "username", "password", "view", "timeout", "verify_ssl")
     if not all(hasattr(client, attr) for attr in attrs):
         return client
@@ -2626,6 +2840,7 @@ def matching_search_entries_for_zone(
     case_sensitive: bool,
     root_zone: str | None,
 ) -> list[dict[str, Any]]:
+    """Return matching entries for one zone using cache first, then local keyword filtering."""
     zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
     serial_number = zone_serial(zone_info)
     entries = search_sqlite_allrecords_cache(
@@ -2661,6 +2876,7 @@ def collect_dns_search_results(
     *,
     zone_filter: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
+    """Collect search results across scoped zones concurrently while deduplicating records."""
     seen: set[str] = set()
     records: list[tuple[str, dict[str, Any]]] = []
     zones = search_zones(client, root_zone)
@@ -2668,6 +2884,7 @@ def collect_dns_search_results(
         zones = [zone for zone in zones if zone_filter(zone)]
 
     def collect_zone_entries(zone_info: dict[str, Any]) -> list[dict[str, Any]]:
+        """Collect search entries for one zone inside the worker pool so failures stay local to that zone."""
         worker_client = clone_infoblox_client(client)
         return matching_search_entries_for_zone(
             worker_client,
@@ -2699,6 +2916,7 @@ def collect_dns_search_results(
 
 
 def search_cache_prewarm_lock_is_stale(lock_file: Path) -> bool:
+    """Detect stale prewarm locks so abandoned background jobs do not block future warming."""
     try:
         return time.time() - lock_file.stat().st_mtime > PREWARM_LOCK_STALE_SECONDS
     except OSError:
@@ -2706,6 +2924,7 @@ def search_cache_prewarm_lock_is_stale(lock_file: Path) -> bool:
 
 
 def write_search_cache_prewarm_lock(lock_file: Path) -> tuple[int, str]:
+    """Write a lock file with process identity so cache warmers coordinate without a daemon."""
     token = f"{os.getpid()}:{time.time()}"
     fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     try:
@@ -2717,6 +2936,7 @@ def write_search_cache_prewarm_lock(lock_file: Path) -> tuple[int, str]:
 
 
 def acquire_search_cache_prewarm_lock() -> tuple[int, str] | None:
+    """Acquire the background prewarm lock, removing stale locks when safe."""
     try:
         ensure_allrecords_cache_dir()
         lock_file = search_cache_prewarm_lock_file()
@@ -2740,6 +2960,7 @@ def acquire_search_cache_prewarm_lock() -> tuple[int, str] | None:
 
 
 def release_search_cache_prewarm_lock(lock: tuple[int, str]) -> None:
+    """Release the prewarm lock only when this process still owns it."""
     lock_fd, token = lock
     try:
         os.close(lock_fd)
@@ -2755,9 +2976,11 @@ def release_search_cache_prewarm_lock(lock: tuple[int, str]) -> None:
 
 
 def warm_global_search_cache(client: InfobloxClient) -> None:
+    """Warm search cache for all zones so later search and completion are responsive."""
     zones = search_zones(client, None)
 
     def warm_zone(zone_info: dict[str, Any]) -> None:
+        """Warm cache for one zone in the background prewarm pool so later completions/searches are faster."""
         try:
             allrecords_search_entries_for_zone(clone_infoblox_client(client), zone_info)
         except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
@@ -2772,6 +2995,7 @@ def warm_global_search_cache(client: InfobloxClient) -> None:
 
 
 def run_search_cache_prewarm() -> None:
+    """Run the background prewarm entrypoint with lock handling and best-effort config loading."""
     lock: tuple[int, str] | None = None
     try:
         config = load_config(required=False)
@@ -2790,6 +3014,7 @@ def run_search_cache_prewarm() -> None:
 
 
 def start_search_cache_prewarm() -> None:
+    """Start a detached cache warmer so foreground DNS writes are not delayed."""
     env = os.environ.copy()
     env.pop("_IB_COMPLETE", None)
     try:
@@ -2806,6 +3031,7 @@ def start_search_cache_prewarm() -> None:
 
 
 def refresh_dns_cache_after_update() -> None:
+    """Clear and prewarm DNS caches after mutations so subsequent reads see fresh data."""
     clear_dns_cache()
     start_search_cache_prewarm()
 
@@ -2815,6 +3041,7 @@ def run_dns_search(
     case_sensitive: bool = False,
     global_search: bool = False,
 ) -> None:
+    """Run DNS search from config loading through scoped collection and selected output rendering."""
     config = load_config()
     client = InfobloxClient(config)
     root_zone = None if global_search else search_root_zone(config)
@@ -2833,6 +3060,7 @@ def run_dns_search(
 
 
 def dns_list_zone_info(client: InfobloxClient, zone_name: str) -> dict[str, Any]:
+    """Load the target zone metadata needed to validate list scope and cache records correctly."""
     target = normalize_zone_name(zone_name)
     matches = safe_query(
         client,
@@ -2853,6 +3081,7 @@ def dns_list_records_for_zone(
     client: InfobloxClient,
     zone_info: dict[str, Any],
 ) -> list[tuple[str, dict[str, Any]]]:
+    """Build displayable records for a zone from cached/search entries while deduplicating."""
     records: list[tuple[str, dict[str, Any]]] = []
     seen: set[str] = set()
     entries = allrecords_search_entries_for_zone(client, zone_info)
@@ -2870,6 +3099,7 @@ def dns_list_records_for_zone(
 
 
 def run_dns_list(zone_name: str | None = None) -> None:
+    """Run DNS list for the active or explicit zone and emit table, JSON, or CSV output."""
     config = load_config()
     client = InfobloxClient(config)
     target = resolve_dns_zone(config, zone_name)
@@ -2890,6 +3120,7 @@ def run_dns_list(zone_name: str | None = None) -> None:
 
 
 def dns_edit_forward_targets(config: dict[str, str], record_name: str, zone: str | None) -> list[str]:
+    """Build possible forward-record names so edit can accept relative or fully-qualified input."""
     stripped_name = record_name.strip().rstrip(".")
     if not stripped_name:
         raise CliError("ERROR: record name is required.")
@@ -2916,6 +3147,7 @@ def dns_edit_forward_records(
     record_name: str,
     zone: str | None,
 ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+    """Find forward records matching an edit target across supported editable record types."""
     targets = dns_edit_forward_targets(config, record_name, zone)
     target = targets[0]
 
@@ -2936,6 +3168,7 @@ def dns_edit_ptr_matches(
     client: InfobloxClient,
     record_name: str,
 ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+    """Find PTR records for an IP edit target using the matching reverse zone."""
     address = ptr_delete_ip_address(record_name)
     reverse_zone = reverse_zone_for_ip(client, address)
     spec = RECORD_TYPES["ptr"]
@@ -2949,6 +3182,7 @@ def dns_edit_ptr_matches(
 
 
 def record_name_is_ip_address(record_name: str) -> bool:
+    """Return whether a record name is an IP address so edit/delete can route PTR workflows."""
     try:
         ipaddress.ip_address(record_name.strip())
     except ValueError:
@@ -2967,6 +3201,7 @@ def dns_edit_matches(
     list[tuple[str, dict[str, Any]]],
     list[tuple[str, dict[str, Any]]],
 ]:
+    """Find edit candidates and preserve all matches so type mismatch errors can explain reality."""
     if record_type == "ptr":
         if not record_name_is_ip_address(record_name):
             target, forward_matches = dns_edit_forward_records(config, client, record_name, zone)
@@ -3005,6 +3240,7 @@ def dns_edit_matches(
 
 
 def normalize_optional_record_type(record_type: str | None) -> str | None:
+    """Validate an optional edit record type while allowing TTL/comment-only edits."""
     if record_type is None:
         return None
     normalized = record_type.lower()
@@ -3015,6 +3251,7 @@ def normalize_optional_record_type(record_type: str | None) -> str | None:
 
 
 def dns_edit_record_types(matches: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    """Return the existing record types found for a target so mismatch messages are specific."""
     return sorted({record_type.upper() for record_type, _item in matches})
 
 
@@ -3023,6 +3260,7 @@ def raise_dns_edit_type_mismatch(
     requested_type: str,
     matches: list[tuple[str, dict[str, Any]]],
 ) -> None:
+    """Raise a type mismatch error that explains Infoblox cannot change record object types."""
     if len(matches) == 1:
         actual_type = matches[0][0].upper()
         raise CliError(
@@ -3047,6 +3285,7 @@ def run_dns_edit(
     noptr: bool,
     comment: str | None,
 ) -> None:
+    """Run DNS edit by finding exactly one existing object, building a PUT payload, and refreshing cache."""
     requested_type = normalize_optional_record_type(record_type)
     if value is not None and requested_type is None:
         raise CliError("ERROR: record type is required when updating the record value.")
@@ -3094,6 +3333,7 @@ def run_dns_edit(
 
 
 def ptr_delete_ip_address(ip_value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Parse the PTR delete IP argument so reverse-delete errors are clear and early."""
     if not ip_value:
         raise CliError("ERROR: full IP address is required. Use: ib dns delete ptr <ip-address>")
     try:
@@ -3103,6 +3343,7 @@ def ptr_delete_ip_address(ip_value: str | None) -> ipaddress.IPv4Address | ipadd
 
 
 def reverse_zone_format_for_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    """Return the reverse-zone format that corresponds to an IPv4 or IPv6 address."""
     return "IPV4" if address.version == 4 else "IPV6"
 
 
@@ -3110,6 +3351,7 @@ def reverse_zone_for_ip(
     client: InfobloxClient,
     address: ipaddress.IPv4Address | ipaddress.IPv6Address,
 ) -> str:
+    """Find the most specific reverse zone for an IP so PTR deletes target the right object."""
     reverse_pointer = address.reverse_pointer.rstrip(".")
     expected_format = reverse_zone_format_for_ip(address)
     matches: set[str] = set()
@@ -3136,10 +3378,12 @@ def reverse_zone_for_ip(
 
 
 def ptr_address_query_field(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    """Choose the WAPI address field for IPv4 or IPv6 PTR lookups."""
     return "ipv4addr" if address.version == 4 else "ipv6addr"
 
 
 def ptr_record_matches_reverse_zone(item: dict[str, Any], reverse_zone: str) -> bool:
+    """Confirm a PTR record belongs to the selected reverse zone before deleting it."""
     item_zone = str(item.get("zone", "")).strip()
     if not item_zone:
         return True
@@ -3150,6 +3394,7 @@ def ptr_record_matches_reverse_zone(item: dict[str, Any], reverse_zone: str) -> 
 
 
 def run_dns_delete_ptr(ip_value: str | None) -> None:
+    """Run PTR delete by resolving reverse zone, finding one PTR record, deleting it, and refreshing cache."""
     address = ptr_delete_ip_address(ip_value)
     config = load_config()
     client = InfobloxClient(config)
@@ -3198,6 +3443,7 @@ def run_dns_delete_ptr(ip_value: str | None) -> None:
 
 
 def dns_delete_reverse_entry_hint(record_name: str) -> str:
+    """Build a PTR hint for failed forward deletes so users know the reverse command form."""
     try:
         address = ipaddress.ip_address(record_name.strip().rstrip("."))
     except ValueError:
@@ -3206,6 +3452,7 @@ def dns_delete_reverse_entry_hint(record_name: str) -> str:
 
 
 def run_dns_delete(record_name: str, zone: str | None) -> None:
+    """Run forward DNS delete by finding exactly one record and deleting its Infoblox object."""
     if record_name.strip().lower() == "ptr":
         run_dns_delete_ptr(zone)
         return
@@ -3282,6 +3529,7 @@ def run_dns_zone_create(
     comment: str | None,
     ns_group: str | None,
 ) -> None:
+    """Run zone creation through WAPI, then refresh caches and render the selected output format."""
     client = InfobloxClient(load_config())
     payload: dict[str, Any] = {
         "fqdn": normalize_zone_name(zone_name),
@@ -3312,6 +3560,7 @@ def run_dns_zone_create(
 
 
 def run_dns_zone_list(search: str | None = None) -> None:
+    """Run zone listing with optional search and selected table, JSON, or CSV output."""
     client = InfobloxClient(load_config())
     if output_is_table():
         console.print(dns_context_panel("Current DNS Context"))
@@ -3326,6 +3575,7 @@ def run_dns_zone_list(search: str | None = None) -> None:
 
 
 def zone_network_association_unavailable(exc: WapiError) -> str:
+    """Format a non-fatal network-association lookup failure for zone view output."""
     status = f" {exc.status}" if exc.status else ""
     return f"Unavailable: Infoblox WAPI{status} failed while reading network associations."
 
@@ -3335,6 +3585,7 @@ def add_zone_network_association_details(
     target: str,
     zone_info: dict[str, Any],
 ) -> None:
+    """Augment zone detail with network associations when WAPI supports the extra lookup."""
     params = zone_query_params(
         client,
         {"fqdn": target},
@@ -3357,6 +3608,7 @@ def add_zone_network_association_details(
 
 
 def run_dns_zone_view(zone_name: str) -> None:
+    """Run zone detail lookup and render table or structured zone information."""
     client = InfobloxClient(load_config())
     target = normalize_zone_name(zone_name)
     matches = safe_query(
@@ -3381,6 +3633,7 @@ def run_dns_zone_view(zone_name: str) -> None:
 
 
 def run_dns_zone_delete(zone_name: str) -> None:
+    """Run zone deletion only after resolving an unambiguous zone reference."""
     client = InfobloxClient(load_config())
     target = normalize_zone_name(zone_name)
     matches = safe_query(client, ZONE_OBJECT, zone_query_params(client, {"fqdn": target}))
@@ -3413,6 +3666,7 @@ def run_dns_zone_delete(zone_name: str) -> None:
 
 
 def run_dns_zone_use(zone_name: str) -> None:
+    """Record the active zone for this shell session and print export guidance for persistence."""
     default_zone = normalize_zone_name(zone_name)
     write_session_zone(default_zone)
     if not output_is_table():
@@ -3435,6 +3689,7 @@ def parse_dns_create_name_value(
     args: tuple[str, ...],
     name_option: str | None,
 ) -> tuple[str, str]:
+    """Parse create positional and legacy -n forms into one name/value pair."""
     ctx = click.get_current_context(silent=True)
     usage_hint = "Use: ib dns create <type> <name> <value>"
 
@@ -3455,10 +3710,12 @@ def parse_dns_create_name_value(
 
 
 def zone_names_from_results(zones: list[dict[str, Any]]) -> list[str]:
+    """Extract sorted unique zone names from WAPI zone results for completion output."""
     return sorted({str(zone.get("fqdn", "")) for zone in zones if zone.get("fqdn")}, key=str.lower)
 
 
 def filter_zone_names(names: list[str], incomplete: str) -> list[str]:
+    """Filter completion zone names by prefix so shell suggestions stay relevant."""
     normalized_incomplete = incomplete.lower()
     if not normalized_incomplete:
         return names
@@ -3466,6 +3723,7 @@ def filter_zone_names(names: list[str], incomplete: str) -> list[str]:
 
 
 def read_zone_completion_cache(view: str) -> list[str] | None:
+    """Read short-lived zone completion cache so tab completion avoids frequent WAPI calls."""
     try:
         with ZONE_COMPLETION_CACHE_FILE.open("r", encoding="utf-8") as handle:
             cache = json.load(handle)
@@ -3488,6 +3746,7 @@ def read_zone_completion_cache(view: str) -> list[str] | None:
 
 
 def write_zone_completion_cache(view: str, names: list[str]) -> None:
+    """Write zone completion cache best-effort so completion remains non-blocking on failures."""
     try:
         CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
         os.chmod(CONFIG_DIR, 0o700)
@@ -3510,6 +3769,7 @@ def complete_zone_names(
     param: click.Parameter,
     incomplete: str,
 ) -> list[str]:
+    """Return zone name completion candidates, using cache first and failing quietly."""
     try:
         config = load_config(required=False)
         if not config:
@@ -3536,6 +3796,7 @@ def complete_forward_zone_names(
     param: click.Parameter,
     incomplete: str,
 ) -> list[str]:
+    """Return only forward-zone completion candidates so record commands avoid reverse zones."""
     try:
         config = load_config(required=False)
         if not config:
@@ -3552,6 +3813,7 @@ def complete_forward_zone_names(
 
 
 def format_record(record_type: str, item: dict[str, Any]) -> str:
+    """Format one DNS record for completion help so candidates carry type, value, zone, and comment context."""
     value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
     value = next((str(item[key]) for key in value_keys if key in item), "")
     if record_type == "mx" and "preference" in item and value:
@@ -3573,6 +3835,7 @@ def format_record(record_type: str, item: dict[str, Any]) -> str:
 
 
 def record_value(record_type: str, item: dict[str, Any]) -> str:
+    """Return the display value for a record across direct and allrecords response shapes."""
     if item.get("type"):
         return allrecord_display_value(record_type, item)
 
@@ -3599,12 +3862,14 @@ def record_value(record_type: str, item: dict[str, Any]) -> str:
 
 
 def record_name(item: dict[str, Any]) -> str:
+    """Return the display name for a record across direct and allrecords response shapes."""
     if item.get("type"):
         return allrecord_display_name(item)
     return str(item.get("name", ""))
 
 
 def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = False) -> Table:
+    """Build the Rich DNS record table, showing refs only for ambiguity workflows that need them."""
     table = Table(title=f"DNS Records ({len(records)})", header_style="bold cyan")
     table.add_column("Type", style="bold", no_wrap=True)
     table.add_column("Name", overflow="fold")
@@ -3651,6 +3916,7 @@ ZONE_DETAIL_OUTPUT_FIELDS = [
 
 
 def record_output_row(record_type: str, item: dict[str, Any]) -> dict[str, Any]:
+    """Convert one record into the structured output schema used by JSON and CSV modes."""
     return {
         "type": record_type.upper(),
         "name": record_name(item),
@@ -3662,6 +3928,7 @@ def record_output_row(record_type: str, item: dict[str, Any]) -> dict[str, Any]:
 
 
 def emit_records(records: list[tuple[str, dict[str, Any]]]) -> None:
+    """Emit records through table or structured output so command workflows share one rendering path."""
     if output_is_table():
         console.print(record_table(records))
         return
@@ -3672,6 +3939,7 @@ def emit_records(records: list[tuple[str, dict[str, Any]]]) -> None:
 
 
 def zone_output_row(item: dict[str, Any]) -> dict[str, Any]:
+    """Convert one zone into the structured output schema used by JSON and CSV modes."""
     return {
         "zone": str(item.get("fqdn", "")),
         "view": str(item.get("view", "")),
@@ -3682,6 +3950,7 @@ def zone_output_row(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def emit_zones(zones: list[dict[str, Any]]) -> None:
+    """Emit zones through table or structured output so zone commands share one rendering path."""
     if output_is_table():
         console.print(zone_table(zones))
         return
@@ -3689,6 +3958,7 @@ def emit_zones(zones: list[dict[str, Any]]) -> None:
 
 
 def dns_delete_completion_help(record_type: str, item: dict[str, Any]) -> str:
+    """Build delete completion help text that explains what each candidate would remove."""
     parts = [record_type.upper()]
     value = record_value(record_type, item)
     zone = str(item.get("zone", ""))
@@ -3703,17 +3973,20 @@ def dns_delete_completion_help(record_type: str, item: dict[str, Any]) -> str:
 
 
 def dns_delete_ptr_completion(incomplete: str) -> list[CompletionItem]:
+    """Return the PTR delete keyword completion so reverse deletion is discoverable."""
     if "ptr".startswith(incomplete.lower()):
         return [CompletionItem("ptr", help="Delete PTR record by full IP address")]
     return []
 
 
 def dns_delete_completion_supported_record_type(record_type: str, item: dict[str, Any]) -> bool:
+    """Return whether a cached record type is safe for forward delete completion."""
     candidates = {record_type.lower(), allrecord_type(item).lower()}
     return bool(candidates & DNS_DELETE_COMPLETION_RECORD_TYPES)
 
 
 def dns_delete_completion_excluded_record(record_type: str, item: dict[str, Any]) -> bool:
+    """Exclude reverse or unsupported records from forward delete completions."""
     if not dns_delete_completion_supported_record_type(record_type, item):
         return True
     return is_reverse_zone_name(str(item.get("zone", ""))) or is_reverse_zone_name(
@@ -3726,6 +3999,7 @@ def complete_dns_delete_records(
     param: click.Parameter,
     incomplete: str,
 ) -> list[CompletionItem]:
+    """Return delete record completions from cached DNS search data while failing quietly."""
     items = dns_delete_ptr_completion(incomplete)
     try:
         config = load_config(required=False)
@@ -3761,6 +4035,7 @@ def complete_dns_delete_zone_or_ip(
     param: click.Parameter,
     incomplete: str,
 ) -> list[str]:
+    """Complete the optional delete zone unless the command is in PTR form."""
     if str(ctx.params.get("record_name", "")).strip().lower() == "ptr":
         return []
     return complete_forward_zone_names(ctx, param, incomplete)
@@ -3771,6 +4046,7 @@ def complete_dns_edit_records(
     param: click.Parameter,
     incomplete: str,
 ) -> list[CompletionItem]:
+    """Return edit record completions from cached forward DNS data while failing quietly."""
     items: list[CompletionItem] = []
     try:
         config = load_config(required=False)
@@ -3806,6 +4082,7 @@ def complete_dns_edit_record_types(
     param: click.Parameter,
     incomplete: str,
 ) -> list[CompletionItem]:
+    """Complete only existing record types for the selected name because Infoblox cannot change type."""
     record_name_value = str(ctx.params.get("record_name", "")).strip()
     if not record_name_value:
         return []
@@ -3842,6 +4119,7 @@ def complete_dns_edit_record_types(
 
 
 def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
+    """Build the Rich zone table, showing refs only when ambiguity resolution requires them."""
     table = Table(title=f"DNS Zones ({len(zones)})", header_style="bold cyan")
     table.add_column("Zone", overflow="fold")
     table.add_column("View", overflow="fold")
@@ -3866,6 +4144,7 @@ def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
 
 
 def format_zone_detail_value(value: Any) -> str:
+    """Format nested zone detail values into readable table text."""
     if value is None:
         return ""
     if isinstance(value, list):
@@ -3888,6 +4167,7 @@ def format_zone_detail_value(value: Any) -> str:
 
 
 def format_network_association(value: Any) -> str:
+    """Format network association details with useful fallbacks for incomplete WAPI data."""
     if value is None:
         return ""
     if isinstance(value, list):
@@ -3911,6 +4191,7 @@ def format_network_association(value: Any) -> str:
 
 
 def zone_detail_output_row(zone_info: dict[str, Any]) -> dict[str, Any]:
+    """Convert zone detail into the structured output schema used by JSON and CSV modes."""
     return {
         "zone": zone_info.get("fqdn", ""),
         "view": zone_info.get("view", ""),
@@ -3930,10 +4211,12 @@ def zone_detail_output_row(zone_info: dict[str, Any]) -> dict[str, Any]:
 
 
 def emit_zone_detail(zone_info: dict[str, Any]) -> None:
+    """Emit zone detail through the structured output helper so filtering and field order stay shared."""
     emit_structured(zone_detail_output_row(zone_info), ZONE_DETAIL_OUTPUT_FIELDS)
 
 
 def zone_detail_table(zone_info: dict[str, Any]) -> Table:
+    """Build the Rich zone-detail table with SOA, association, comment, and reference data."""
     zone_name = str(zone_info.get("fqdn", ""))
     table = Table(title=f"DNS Zone: {zone_name}", header_style="bold cyan")
     table.add_column("Field", style="bold cyan", no_wrap=True)
@@ -4326,6 +4609,7 @@ register_output_option_everywhere(cli)
 
 
 def main() -> int:
+    """Run the Click application and translate expected interruptions into stable exit codes."""
     try:
         cli.main(prog_name="ib", standalone_mode=False)
         return 0
