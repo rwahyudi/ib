@@ -1,0 +1,1082 @@
+#!/usr/bin/env python3
+"""Small Infoblox CLI."""
+
+from __future__ import annotations
+
+import base64
+import configparser
+import json
+import os
+import re
+import shlex
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+try:
+    import click
+    from cryptography.fernet import Fernet, InvalidToken
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Confirm, Prompt
+    from rich.table import Table
+    from rich.text import Text
+except ModuleNotFoundError as exc:
+    missing = exc.name or "required module"
+    print(
+        f"ERROR: missing dependency '{missing}'. Install with: python3 -m pip install -r requirements.txt",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+CONFIG_DIR = Path.home() / ".ib"
+CONFIG_FILE = CONFIG_DIR / "config"
+CONFIG_KEY_FILE = CONFIG_DIR / "key"
+DEFAULT_WAPI_VERSION = "v2.12.3"
+DEFAULT_TIMEOUT = 30
+DEFAULT_ZONE_ENV = "IB_ZONE"
+ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
+WAPI_PAGE_SIZE = 1000
+ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
+ZONE_COMPLETION_CACHE_TTL = 300
+COMPLETION_SHELLS = ("bash", "zsh", "fish")
+ZONE_OBJECT = "zone_auth"
+ZONE_RETURN_FIELDS = "fqdn,view,zone_format,comment,ns_group"
+ZONE_FORMATS = ("FORWARD", "IPV4", "IPV6")
+console = Console()
+err_console = Console(stderr=True)
+
+
+class CliError(Exception):
+    """Expected CLI failure with a user-facing message."""
+
+
+class WapiError(CliError):
+    """Infoblox WAPI request failure."""
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def print_success(message: str) -> None:
+    console.print(Text(message, style="bold green"))
+
+
+def print_warning(message: str) -> None:
+    err_console.print(Text(message, style="bold yellow"))
+
+
+def print_error(message: str) -> None:
+    err_console.print(Text(str(message), style="bold red"))
+
+
+def print_note(message: str) -> None:
+    console.print(Text(message, style="cyan"))
+
+
+def print_command_block(commands: list[str]) -> None:
+    for command in commands:
+        console.print(Text(f"  {command}", style="green"))
+    console.print()
+
+
+RECORD_TYPES: dict[str, dict[str, Any]] = {
+    "a": {
+        "object": "record:a",
+        "value_field": "ipv4addr",
+        "search_value_fields": ("ipv4addr",),
+        "return_fields": "name,ipv4addr,ttl,use_ttl,view,zone,comment",
+    },
+    "aaaa": {
+        "object": "record:aaaa",
+        "value_field": "ipv6addr",
+        "search_value_fields": ("ipv6addr",),
+        "return_fields": "name,ipv6addr,ttl,use_ttl,view,zone,comment",
+    },
+    "cname": {
+        "object": "record:cname",
+        "value_field": "canonical",
+        "search_value_fields": ("canonical",),
+        "return_fields": "name,canonical,ttl,use_ttl,view,zone,comment",
+    },
+    "txt": {
+        "object": "record:txt",
+        "value_field": "text",
+        "search_value_fields": ("text",),
+        "return_fields": "name,text,ttl,use_ttl,view,zone,comment",
+    },
+    "mx": {
+        "object": "record:mx",
+        "search_value_fields": ("mail_exchanger",),
+        "return_fields": "name,mail_exchanger,preference,ttl,use_ttl,view,zone,comment",
+    },
+    "ptr": {
+        "object": "record:ptr",
+        "search_value_fields": ("ptrdname", "ipv4addr", "ipv6addr"),
+        "return_fields": "name,ptrdname,ipv4addr,ipv6addr,ttl,use_ttl,view,zone,comment",
+    },
+}
+
+
+def normalize_server(value: str) -> str:
+    server = value.strip().rstrip("/")
+    if not server:
+        raise CliError("ERROR: Infoblox server is required.")
+    if "://" not in server:
+        server = f"https://{server}"
+    server = re.sub(r"/wapi/v[0-9][^/]*$", "", server)
+    return server.rstrip("/")
+
+
+def parse_bool(value: str, default: bool = True) -> bool:
+    if not value:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise CliError(f"ERROR: invalid boolean value: {value}")
+
+
+def prompt_text(label: str, default: str | None = None) -> str:
+    if default is None:
+        return Prompt.ask(label)
+    return Prompt.ask(label, default=default)
+
+
+def ensure_config_dir() -> None:
+    CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(CONFIG_DIR, 0o700)
+
+
+def read_config_key() -> bytes:
+    if not CONFIG_KEY_FILE.exists():
+        raise CliError(f"ERROR: missing encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+    try:
+        key = CONFIG_KEY_FILE.read_bytes().strip()
+        Fernet(key)
+        os.chmod(CONFIG_KEY_FILE, 0o600)
+        return key
+    except (OSError, ValueError):
+        raise CliError(f"ERROR: invalid encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+
+
+def get_or_create_config_key() -> bytes:
+    ensure_config_dir()
+    if CONFIG_KEY_FILE.exists():
+        return read_config_key()
+
+    key = Fernet.generate_key()
+    try:
+        with CONFIG_KEY_FILE.open("xb") as handle:
+            handle.write(key)
+            handle.write(b"\n")
+        os.chmod(CONFIG_KEY_FILE, 0o600)
+    except FileExistsError:
+        return read_config_key()
+    except OSError:
+        raise CliError(f"ERROR: cannot write encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+    return key
+
+
+def encrypt_password(password: str) -> str:
+    token = Fernet(get_or_create_config_key()).encrypt(password.encode("utf-8")).decode("ascii")
+    return f"{ENCRYPTED_PASSWORD_PREFIX}{token}"
+
+
+def decrypt_password(password: str) -> str:
+    if not password.startswith(ENCRYPTED_PASSWORD_PREFIX):
+        return password
+
+    token = password[len(ENCRYPTED_PASSWORD_PREFIX) :].encode("ascii")
+    try:
+        return Fernet(read_config_key()).decrypt(token).decode("utf-8")
+    except (InvalidToken, OSError, UnicodeEncodeError, UnicodeDecodeError, ValueError):
+        raise CliError(f"ERROR: cannot decrypt password in {CONFIG_FILE}. Run: ib configure")
+
+
+def is_encrypted_password(password: str) -> bool:
+    return password.startswith(ENCRYPTED_PASSWORD_PREFIX)
+
+
+def write_config_values(config_values: dict[str, str]) -> None:
+    ensure_config_dir()
+    config = configparser.ConfigParser()
+    config["default"] = {
+        **config_values,
+        "password": encrypt_password(config_values["password"]),
+    }
+    with CONFIG_FILE.open("w", encoding="utf-8") as handle:
+        config.write(handle)
+    os.chmod(CONFIG_FILE, 0o600)
+
+
+def load_config_for_prompt() -> dict[str, str]:
+    if not CONFIG_FILE.exists():
+        return {}
+
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG_FILE)
+    if "default" not in parser:
+        raise CliError(f"ERROR: missing [default] section in {CONFIG_FILE}")
+
+    cfg = dict(parser["default"])
+    if cfg.get("server"):
+        cfg["server"] = normalize_server(cfg["server"])
+    if cfg.get("password"):
+        try:
+            cfg["password"] = decrypt_password(cfg["password"])
+        except CliError as exc:
+            print_warning(str(exc))
+            cfg.pop("password", None)
+    return cfg
+
+
+def save_config_interactive() -> None:
+    current = load_config_for_prompt()
+    console.print(
+        Panel.fit(
+            f"Configuration will be saved to [bold]{CONFIG_FILE}[/bold].",
+            title="Infoblox Configuration",
+            border_style="cyan",
+        )
+    )
+
+    server = normalize_server(prompt_text("Infoblox server", current.get("server")))
+    username = prompt_text("Username", current.get("username"))
+    if current.get("password"):
+        password = Prompt.ask(
+            "Password (leave blank to keep current)",
+            default="",
+            password=True,
+            show_default=False,
+        ) or current["password"]
+    else:
+        password = Prompt.ask("Password", password=True)
+    if not username or not password:
+        raise CliError("ERROR: username and password are required.")
+
+    wapi_version = Prompt.ask(
+        "WAPI version", default=current.get("wapi_version", DEFAULT_WAPI_VERSION)
+    )
+    dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
+    verify_ssl = Confirm.ask(
+        "Verify SSL certificates",
+        default=parse_bool(current.get("verify_ssl", "true")),
+    )
+
+    default_config = {
+        "server": server,
+        "username": username,
+        "password": password,
+        "wapi_version": wapi_version,
+        "dns_view": dns_view,
+        "verify_ssl": "true" if verify_ssl else "false",
+        "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
+    }
+    write_config_values(default_config)
+
+    print_success("SUCCESS: configuration saved.")
+
+
+def maybe_prompt_configure() -> None:
+    if not sys.stdin.isatty():
+        raise CliError("ERROR: no configuration file found. Run: ib configure")
+    print_warning(f"No configuration file found at {CONFIG_FILE}.")
+    if not Confirm.ask("Run 'ib configure' now?", default=False):
+        raise CliError("ERROR: no configuration file found. Run: ib configure")
+    save_config_interactive()
+
+
+def load_config(required: bool = True) -> dict[str, str] | None:
+    if not CONFIG_FILE.exists():
+        if required:
+            maybe_prompt_configure()
+        else:
+            return None
+
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG_FILE)
+    if "default" not in parser:
+        raise CliError(f"ERROR: missing [default] section in {CONFIG_FILE}")
+
+    raw_cfg = dict(parser["default"])
+    cfg = dict(raw_cfg)
+    for key in ("server", "username", "password"):
+        if not cfg.get(key):
+            raise CliError(f"ERROR: missing '{key}' in {CONFIG_FILE}")
+
+    raw_password = cfg["password"]
+    cfg["password"] = decrypt_password(raw_password)
+    cfg["server"] = normalize_server(cfg["server"])
+    cfg.setdefault("wapi_version", DEFAULT_WAPI_VERSION)
+    cfg.setdefault("dns_view", "default")
+    cfg.setdefault("verify_ssl", "true")
+    cfg.setdefault("timeout", str(DEFAULT_TIMEOUT))
+    if not is_encrypted_password(raw_password):
+        write_config_values(cfg)
+    return cfg
+
+
+class InfobloxClient:
+    def __init__(self, config: dict[str, str]) -> None:
+        self.server = normalize_server(config["server"])
+        self.wapi_version = config.get("wapi_version", DEFAULT_WAPI_VERSION).strip().lstrip("/")
+        self.username = config["username"]
+        self.password = config["password"]
+        self.view = config.get("dns_view", "default")
+        self.timeout = int(config.get("timeout", DEFAULT_TIMEOUT))
+        self.verify_ssl = parse_bool(config.get("verify_ssl", "true"))
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> Any:
+        query = f"?{urllib.parse.urlencode(params)}" if params else ""
+        quoted_path = urllib.parse.quote(path.lstrip("/"), safe="/:")
+        url = f"{self.server}/wapi/{self.wapi_version}/{quoted_path}{query}"
+        body = None
+        headers = {
+            "Accept": "application/json",
+            "Authorization": "Basic "
+            + base64.b64encode(f"{self.username}:{self.password}".encode()).decode(),
+        }
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        context = None if self.verify_ssl else ssl._create_unverified_context()
+        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=context) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            raw_error = exc.read().decode("utf-8", errors="replace")
+            raise WapiError(
+                f"ERROR: Infoblox WAPI {exc.code}: {format_wapi_error(raw_error)}",
+                status=exc.code,
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise WapiError(f"ERROR: cannot reach Infoblox: {exc.reason}") from exc
+
+        if not raw:
+            return None
+        return json.loads(raw)
+
+
+def format_wapi_error(raw: str) -> str:
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw.strip() or "empty error response"
+    return parsed.get("text") or parsed.get("Error") or json.dumps(parsed)
+
+
+def fqdn(record_name: str, zone: str) -> str:
+    name = record_name.strip().rstrip(".")
+    zone_name = zone.strip().rstrip(".")
+    if not name:
+        raise CliError("ERROR: record name is required.")
+    if not zone_name:
+        raise CliError("ERROR: zone is required.")
+    if name == "@":
+        return zone_name
+    if name == zone_name or name.endswith(f".{zone_name}"):
+        return name
+    return f"{name}.{zone_name}"
+
+
+def normalize_zone_name(zone_name: str) -> str:
+    normalized = zone_name.strip().rstrip(".")
+    if not normalized:
+        raise CliError("ERROR: zone is required.")
+    return normalized
+
+
+def default_zone_from_env() -> str | None:
+    zone_name = os.environ.get(DEFAULT_ZONE_ENV, "").strip()
+    return normalize_zone_name(zone_name) if zone_name else None
+
+
+def resolve_dns_zone(zone_name: str | None = None) -> str:
+    if zone_name:
+        return normalize_zone_name(zone_name)
+
+    env_zone = default_zone_from_env()
+    if env_zone:
+        return env_zone
+
+    raise CliError(
+        f"ERROR: DNS zone is required. Use --zone or export {DEFAULT_ZONE_ENV}."
+    )
+
+
+def ttl_payload(ttl: int | None) -> dict[str, Any]:
+    if ttl is None:
+        return {}
+    if ttl < 0:
+        raise CliError("ERROR: ttl must be 0 or greater.")
+    return {"ttl": ttl, "use_ttl": True}
+
+
+def mx_payload(value: str) -> dict[str, Any]:
+    parts = value.split()
+    if len(parts) != 2 or not parts[0].isdigit():
+        raise CliError("ERROR: MX value must be quoted as '<preference> <mail_exchanger>'.")
+    return {"preference": int(parts[0]), "mail_exchanger": parts[1].rstrip(".")}
+
+
+def ptr_payload(name: str, value: str) -> dict[str, Any]:
+    field = "ipv6addr" if ":" in name else "ipv4addr"
+    return {field: name, "ptrdname": value.rstrip(".")}
+
+
+def create_payload(
+    record_type: str,
+    value: str,
+    name: str,
+    zone: str,
+    ttl: int | None,
+    comment: str | None,
+    client: InfobloxClient,
+) -> tuple[str, dict[str, Any]]:
+    record_type = record_type.lower()
+    spec = RECORD_TYPES.get(record_type)
+    if not spec:
+        supported = ", ".join(sorted(RECORD_TYPES))
+        raise CliError(f"ERROR: unsupported record type '{record_type}'. Supported: {supported}")
+
+    object_type = spec["object"]
+    fqdn_name = fqdn(name, zone)
+    payload: dict[str, Any] = {
+        "name": fqdn_name,
+        "view": client.view,
+        **ttl_payload(ttl),
+    }
+    if comment:
+        payload["comment"] = comment
+
+    if record_type == "mx":
+        payload.update(mx_payload(value))
+    elif record_type == "ptr":
+        payload = {
+            **ptr_payload(name, value),
+            "view": client.view,
+            **ttl_payload(ttl),
+        }
+        if comment:
+            payload["comment"] = comment
+    else:
+        value_field = spec["value_field"]
+        payload[value_field] = value.rstrip(".") if record_type == "cname" else value
+
+    return object_type, payload
+
+
+def run_dns_create(
+    record_type: str,
+    value: str,
+    name: str,
+    zone: str | None,
+    ttl: int | None,
+    noptr: bool,
+    comment: str | None,
+) -> None:
+    config = load_config()
+    client = InfobloxClient(config)
+    resolved_zone = resolve_dns_zone(zone)
+    object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
+    ref = client.request("POST", object_type, payload=payload)
+    if noptr and record_type.lower() not in {"a", "aaaa"}:
+        print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
+    print_success(f"SUCCESS: created {record_type.upper()} record")
+    print_note(f"Reference: {ref}")
+
+
+def object_query_params(
+    spec: dict[str, Any],
+    client: InfobloxClient,
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "_return_fields": spec["return_fields"],
+        "view": client.view,
+        **extra,
+    }
+
+
+def zone_query_params(client: InfobloxClient, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "_return_fields": ZONE_RETURN_FIELDS,
+        "view": client.view,
+        **(extra or {}),
+    }
+
+
+def zone_search_params(
+    client: InfobloxClient,
+    field: str,
+    search: str | None = None,
+) -> dict[str, Any]:
+    extra = {}
+    if search:
+        extra[f"{field}~"] = search_pattern(search, case_sensitive=False)
+    return zone_query_params(client, extra)
+
+
+def zone_result_key(zone: dict[str, Any]) -> str:
+    if zone.get("_ref"):
+        return str(zone["_ref"])
+    return json.dumps(
+        {
+            "fqdn": zone.get("fqdn", ""),
+            "view": zone.get("view", ""),
+            "zone_format": zone.get("zone_format", ""),
+        },
+        sort_keys=True,
+    )
+
+
+def query_zones(client: InfobloxClient, search: str | None = None) -> list[dict[str, Any]]:
+    if not search:
+        return paged_query(client, ZONE_OBJECT, zone_query_params(client))
+
+    zones: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for field in ("fqdn", "comment"):
+        for zone in paged_query(client, ZONE_OBJECT, zone_search_params(client, field, search)):
+            key = zone_result_key(zone)
+            if key in seen:
+                continue
+            seen.add(key)
+            zones.append(zone)
+    return zones
+
+
+def safe_query(client: InfobloxClient, object_type: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+    try:
+        result = client.request("GET", object_type, params=params)
+    except WapiError as exc:
+        if exc.status in {400, 404} and "field" in str(exc).lower():
+            print_warning(f"WARNING: skipping {object_type}: {exc}")
+            return []
+        raise
+    return result if isinstance(result, list) else []
+
+
+def paged_query(
+    client: InfobloxClient,
+    object_type: str,
+    params: dict[str, Any],
+    warn_on_skip: bool = True,
+) -> list[dict[str, Any]]:
+    page_params: dict[str, Any] = {
+        **params,
+        "_paging": 1,
+        "_return_as_object": 1,
+        "_max_results": WAPI_PAGE_SIZE,
+    }
+    results: list[dict[str, Any]] = []
+    page_id = ""
+
+    while True:
+        request_params = dict(page_params)
+        if page_id:
+            request_params["_page_id"] = page_id
+
+        try:
+            response = client.request("GET", object_type, params=request_params)
+        except WapiError as exc:
+            if exc.status in {400, 404} and "field" in str(exc).lower():
+                if warn_on_skip:
+                    print_warning(f"WARNING: skipping {object_type}: {exc}")
+                return []
+            raise
+
+        if isinstance(response, list):
+            results.extend(response)
+            return results
+        if not isinstance(response, dict):
+            return results
+
+        page_result = response.get("result", [])
+        if not isinstance(page_result, list):
+            raise CliError(f"ERROR: unexpected WAPI result shape for {object_type}.")
+        results.extend(page_result)
+
+        page_id = str(response.get("next_page_id", "") or "")
+        if not page_id:
+            return results
+
+
+def search_fields(spec: dict[str, Any]) -> tuple[str, ...]:
+    return ("name", *spec.get("search_value_fields", ()), "comment")
+
+
+def case_insensitive_literal_pattern(keyword: str) -> str:
+    parts = []
+    for char in keyword:
+        if char.isascii() and char.isalpha():
+            parts.append(f"[{char.lower()}{char.upper()}]")
+        else:
+            parts.append(re.escape(char))
+    return "".join(parts)
+
+
+def search_pattern(keyword: str, case_sensitive: bool) -> str:
+    return re.escape(keyword) if case_sensitive else case_insensitive_literal_pattern(keyword)
+
+
+def run_dns_search(keyword: str, case_sensitive: bool = False) -> None:
+    client = InfobloxClient(load_config())
+    seen: set[str] = set()
+    records: list[tuple[str, dict[str, Any]]] = []
+    pattern = search_pattern(keyword, case_sensitive)
+    for record_type, spec in RECORD_TYPES.items():
+        object_type = spec["object"]
+        for field in search_fields(spec):
+            params = object_query_params(spec, client, {f"{field}~": pattern})
+            for item in safe_query(client, object_type, params):
+                ref = item.get("_ref", json.dumps(item, sort_keys=True))
+                if ref in seen:
+                    continue
+                seen.add(ref)
+                records.append((record_type, item))
+
+    if not records:
+        print_warning("No records found.")
+        return
+
+    console.print(record_table(records))
+
+
+def run_dns_delete(record_name: str, zone: str | None) -> None:
+    config = load_config()
+    client = InfobloxClient(config)
+    target = fqdn(record_name, resolve_dns_zone(zone))
+    matches: list[tuple[str, dict[str, Any]]] = []
+
+    for record_type, spec in RECORD_TYPES.items():
+        params = object_query_params(spec, client, {"name": target})
+        matches.extend((record_type, item) for item in safe_query(client, spec["object"], params))
+
+    if not matches:
+        raise CliError(f"ERROR: no DNS record found for {target} in view {client.view}")
+    if len(matches) > 1:
+        print_error(f"ERROR: multiple records found for {target}. Delete one of these _ref values manually:")
+        err_console.print(record_table(matches, include_ref=True))
+        raise CliError("ERROR: delete target is ambiguous.")
+
+    record_type, item = matches[0]
+    ref = item.get("_ref")
+    if not ref:
+        raise CliError("ERROR: matched record does not include an _ref.")
+    client.request("DELETE", ref)
+    print_success(f"SUCCESS: deleted {record_type.upper()} record {target}")
+
+
+def run_dns_zone_create(
+    zone_name: str,
+    zone_format: str,
+    comment: str | None,
+    ns_group: str | None,
+) -> None:
+    client = InfobloxClient(load_config())
+    payload: dict[str, Any] = {
+        "fqdn": normalize_zone_name(zone_name),
+        "view": client.view,
+        "zone_format": zone_format.upper(),
+    }
+    if comment:
+        payload["comment"] = comment
+    if ns_group:
+        payload["ns_group"] = ns_group
+
+    ref = client.request("POST", ZONE_OBJECT, payload=payload)
+    print_success(f"SUCCESS: created DNS zone {payload['fqdn']}")
+    print_note(f"Reference: {ref}")
+
+
+def run_dns_zone_list(search: str | None = None) -> None:
+    client = InfobloxClient(load_config())
+    zones = query_zones(client, search)
+    if not zones:
+        print_warning("No zones found.")
+        return
+    console.print(zone_table(zones))
+
+
+def run_dns_zone_delete(zone_name: str) -> None:
+    client = InfobloxClient(load_config())
+    target = normalize_zone_name(zone_name)
+    matches = safe_query(client, ZONE_OBJECT, zone_query_params(client, {"fqdn": target}))
+
+    if not matches:
+        raise CliError(f"ERROR: no DNS zone found for {target} in view {client.view}")
+    if len(matches) > 1:
+        print_error(f"ERROR: multiple zones found for {target}. Delete one of these _ref values manually:")
+        err_console.print(zone_table(matches, include_ref=True))
+        raise CliError("ERROR: delete target is ambiguous.")
+
+    ref = matches[0].get("_ref")
+    if not ref:
+        raise CliError("ERROR: matched zone does not include an _ref.")
+    client.request("DELETE", ref)
+    print_success(f"SUCCESS: deleted DNS zone {target}")
+
+
+def run_dns_zone_use(zone_name: str) -> None:
+    default_zone = normalize_zone_name(zone_name)
+    os.environ[DEFAULT_ZONE_ENV] = default_zone
+    click.echo(f"export {DEFAULT_ZONE_ENV}={shlex.quote(default_zone)}")
+
+
+def zone_names_from_results(zones: list[dict[str, Any]]) -> list[str]:
+    return sorted({str(zone.get("fqdn", "")) for zone in zones if zone.get("fqdn")}, key=str.lower)
+
+
+def filter_zone_names(names: list[str], incomplete: str) -> list[str]:
+    normalized_incomplete = incomplete.lower()
+    if not normalized_incomplete:
+        return names
+    return [name for name in names if name.lower().startswith(normalized_incomplete)]
+
+
+def read_zone_completion_cache(view: str) -> list[str] | None:
+    try:
+        with ZONE_COMPLETION_CACHE_FILE.open("r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(cache, dict) or cache.get("view") != view:
+        return None
+
+    created_at = cache.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        return None
+    if time.time() - created_at > ZONE_COMPLETION_CACHE_TTL:
+        return None
+
+    zones = cache.get("zones")
+    if not isinstance(zones, list):
+        return None
+    return sorted({zone for zone in zones if isinstance(zone, str) and zone}, key=str.lower)
+
+
+def write_zone_completion_cache(view: str, names: list[str]) -> None:
+    try:
+        CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
+        os.chmod(CONFIG_DIR, 0o700)
+        with ZONE_COMPLETION_CACHE_FILE.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "created_at": time.time(),
+                    "view": view,
+                    "zones": names,
+                },
+                handle,
+            )
+        os.chmod(ZONE_COMPLETION_CACHE_FILE, 0o600)
+    except OSError:
+        return
+
+
+def complete_zone_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    try:
+        config = load_config(required=False)
+        if not config:
+            return []
+        client = InfobloxClient(config)
+        names = read_zone_completion_cache(client.view)
+        if names is None:
+            zones = paged_query(
+                client,
+                ZONE_OBJECT,
+                zone_query_params(client),
+                warn_on_skip=False,
+            )
+            names = zone_names_from_results(zones)
+            write_zone_completion_cache(client.view, names)
+    except (CliError, OSError, ValueError):
+        return []
+
+    return filter_zone_names(names, incomplete)
+
+
+def format_record(record_type: str, item: dict[str, Any]) -> str:
+    value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
+    value = next((str(item[key]) for key in value_keys if key in item), "")
+    if record_type == "mx" and "preference" in item and value:
+        value = f"{item['preference']} {value}"
+
+    ttl = item.get("ttl", "")
+    comment = item.get("comment", "")
+    zone = item.get("zone", "")
+    parts = [
+        record_type.upper().ljust(5),
+        str(item.get("name", "")).ljust(40),
+        value.ljust(30),
+        f"zone={zone}" if zone else "",
+        f"ttl={ttl}" if ttl != "" else "",
+        f"comment={comment}" if comment else "",
+        f"ref={item.get('_ref')}" if item.get("_ref") else "",
+    ]
+    return "  ".join(part for part in parts if part)
+
+
+def record_value(record_type: str, item: dict[str, Any]) -> str:
+    value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
+    value = next((str(item[key]) for key in value_keys if key in item), "")
+    if record_type == "mx" and "preference" in item and value:
+        return f"{item['preference']} {value}"
+    return value
+
+
+def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = False) -> Table:
+    table = Table(title=f"DNS Records ({len(records)})", header_style="bold cyan")
+    table.add_column("Type", style="bold", no_wrap=True)
+    table.add_column("Name", overflow="fold")
+    table.add_column("Value", overflow="fold")
+    table.add_column("Zone", overflow="fold")
+    table.add_column("TTL", justify="right", no_wrap=True)
+    table.add_column("Comment", overflow="fold")
+    if include_ref:
+        table.add_column("Ref", overflow="fold")
+
+    for record_type, item in records:
+        row = [
+            record_type.upper(),
+            str(item.get("name", "")),
+            record_value(record_type, item),
+            str(item.get("zone", "")),
+            str(item.get("ttl", "")),
+            str(item.get("comment", "")),
+        ]
+        if include_ref:
+            row.append(str(item.get("_ref", "")))
+        table.add_row(*row)
+    return table
+
+
+def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
+    table = Table(title=f"DNS Zones ({len(zones)})", header_style="bold cyan")
+    table.add_column("Zone", overflow="fold")
+    table.add_column("View", overflow="fold")
+    table.add_column("Format", no_wrap=True)
+    table.add_column("NS Group", overflow="fold")
+    table.add_column("Comment", overflow="fold")
+    if include_ref:
+        table.add_column("Ref", overflow="fold")
+
+    for item in zones:
+        row = [
+            str(item.get("fqdn", "")),
+            str(item.get("view", "")),
+            str(item.get("zone_format", "")),
+            str(item.get("ns_group", "")),
+            str(item.get("comment", "")),
+        ]
+        if include_ref:
+            row.append(str(item.get("_ref", "")))
+        table.add_row(*row)
+    return table
+
+
+@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+def cli() -> None:
+    """Infoblox command line client."""
+
+
+@cli.command()
+def configure() -> None:
+    """Create or update ~/.ib/config."""
+    save_config_interactive()
+
+
+@cli.command()
+@click.argument("shell", required=False, type=click.Choice(COMPLETION_SHELLS))
+def completion(shell: str | None) -> None:
+    """Print shell completion setup instructions."""
+    shells = (shell,) if shell else COMPLETION_SHELLS
+    console.print(
+        Panel.fit(
+            "Enable tab completion for ib commands, options, and DNS record types.",
+            title="ib shell completion setup",
+            border_style="cyan",
+        )
+    )
+    console.print("[bold]Prerequisite[/bold]")
+    console.print("Make sure the ib executable is on your PATH.")
+    print_command_block(
+        [
+            "mkdir -p ~/.local/bin",
+            "install -m 755 ./ib ~/.local/bin/ib",
+            "export PATH=\"$HOME/.local/bin:$PATH\"",
+        ]
+    )
+    for item in shells:
+        if item == "bash":
+            console.rule("[bold cyan]Bash[/bold cyan]")
+            console.print("[bold]Current shell only[/bold]")
+            print_command_block(['eval "$(_IB_COMPLETE=bash_source ib)"'])
+            console.print("[bold]Persistent setup[/bold]")
+            print_command_block(
+                [
+                    "_IB_COMPLETE=bash_source ib > ~/.ib-complete.bash",
+                    "printf '\\n# ib completion\\n. ~/.ib-complete.bash\\n' >> ~/.bashrc",
+                    "exec bash",
+                ]
+            )
+        elif item == "zsh":
+            console.rule("[bold cyan]Zsh[/bold cyan]")
+            console.print("[bold]Current shell only[/bold]")
+            print_command_block(['eval "$(_IB_COMPLETE=zsh_source ib)"'])
+            console.print("[bold]Persistent setup[/bold]")
+            print_command_block(
+                [
+                    "_IB_COMPLETE=zsh_source ib > ~/.ib-complete.zsh",
+                    "printf '\\n# ib completion\\n. ~/.ib-complete.zsh\\n' >> ~/.zshrc",
+                    "exec zsh",
+                ]
+            )
+        elif item == "fish":
+            console.rule("[bold cyan]Fish[/bold cyan]")
+            console.print("[bold]Current shell only[/bold]")
+            print_command_block(["_IB_COMPLETE=fish_source ib | source"])
+            console.print("[bold]Persistent setup[/bold]")
+            print_command_block(
+                [
+                    "mkdir -p ~/.config/fish/completions",
+                    "_IB_COMPLETE=fish_source ib > ~/.config/fish/completions/ib.fish",
+                    "exec fish",
+                ]
+            )
+    console.rule("[bold cyan]Verify[/bold cyan]")
+    print_command_block(["ib <TAB><TAB>", "ib dns create <TAB><TAB>"])
+
+
+@cli.group()
+def dns() -> None:
+    """Manage Infoblox DNS records."""
+
+
+@dns.group()
+def zone() -> None:
+    """Manage authoritative DNS zones."""
+
+
+@zone.command("create")
+@click.argument("zone_name")
+@click.option(
+    "--format",
+    "zone_format",
+    type=click.Choice(ZONE_FORMATS, case_sensitive=False),
+    default="FORWARD",
+    show_default=True,
+    help="Zone format.",
+)
+@click.option("--comment", help="Zone comment.")
+@click.option("--ns-group", help="Name server group for the zone.")
+def zone_create(
+    zone_name: str,
+    zone_format: str,
+    comment: str | None,
+    ns_group: str | None,
+) -> None:
+    """Create a DNS zone."""
+    run_dns_zone_create(zone_name, zone_format, comment, ns_group)
+
+
+@zone.command("list")
+@click.argument("search", required=False)
+def zone_list(search: str | None) -> None:
+    """List DNS zones in the configured view."""
+    run_dns_zone_list(search)
+
+
+@zone.command("delete")
+@click.argument("zone_name")
+def zone_delete(zone_name: str) -> None:
+    """Delete a DNS zone."""
+    run_dns_zone_delete(zone_name)
+
+
+@zone.command("use")
+@click.argument("zone_name", shell_complete=complete_zone_names)
+def zone_use(zone_name: str) -> None:
+    """Print an IB_ZONE export command."""
+    run_dns_zone_use(zone_name)
+
+
+@dns.command()
+@click.argument("record_type", type=click.Choice(sorted(RECORD_TYPES), case_sensitive=False))
+@click.option("--name", required=True, help="Record name, relative to --zone unless already FQDN.")
+@click.argument("value")
+@click.option(
+    "--zone",
+    help=f"DNS zone. Defaults to ${DEFAULT_ZONE_ENV}.",
+)
+@click.option("--ttl", type=int, help="Record TTL in seconds.")
+@click.option("--noptr", is_flag=True, help="Do not manage PTR records for A/AAAA workflows.")
+@click.option("--comment", help="Record comment.")
+def create(
+    record_type: str,
+    value: str,
+    name: str,
+    zone: str | None,
+    ttl: int | None,
+    noptr: bool,
+    comment: str | None,
+) -> None:
+    """Create a DNS record."""
+    run_dns_create(record_type, value, name, zone, ttl, noptr, comment)
+
+
+@dns.command()
+@click.argument("keyword")
+@click.option("-i", "case_sensitive", is_flag=True, help="Use case-sensitive matching.")
+def search(keyword: str, case_sensitive: bool) -> None:
+    """Search DNS records by name, value, or comment."""
+    run_dns_search(keyword, case_sensitive)
+
+
+@dns.command()
+@click.argument("record_name")
+@click.argument("zone", required=False)
+def delete(record_name: str, zone: str | None) -> None:
+    """Delete a DNS record by name."""
+    run_dns_delete(record_name, zone)
+
+
+def main() -> int:
+    try:
+        cli.main(prog_name="ib", standalone_mode=False)
+        return 0
+    except (KeyboardInterrupt, EOFError, click.Abort):
+        return 130
+    except click.ClickException as exc:
+        exc.show()
+        return exc.exit_code
+    except CliError as exc:
+        print_error(str(exc))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
