@@ -78,19 +78,25 @@ Command overview:
 
 - `ib configure` creates or updates Infoblox connection settings.
 - `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
-- `ib dns create <type> <name> <value>` creates DNS records.
-- `ib dns search [-g] [-i] <keyword>` searches records by name, value, or comment.
-- `ib dns delete <record-name> [zone]` deletes a single matching forward DNS record.
+- `ib dns create <a|aaaa|cname|host|mx|ptr|txt> <name> <value>` creates DNS
+  records.
+- `ib dns search [-i] [-g] <keyword>` searches records by name, value, or comment.
+- `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
+  CNAME, TXT, MX, or HOST record.
 - `ib dns delete ptr <ip-address>` deletes a reverse DNS PTR record by full IP address.
-- `ib dns zone list [keyword]` lists authoritative zones in the configured view.
+- `ib dns zone list [search]` lists authoritative zones in the configured view.
 - `ib dns zone view <zone>` shows zone details, network associations, and SOA settings.
-- `ib dns zone create <zone> [--format FORWARD|IPV4|IPV6]` creates a zone.
+- `ib dns zone create <zone> [--format forward|ipv4|ipv6] [--comment TEXT]
+  [--ns-group TEXT]` creates a zone.
 - `ib dns zone delete <zone>` deletes a zone.
 - `ib dns zone use <zone>` sets the active zone for the current shell session.
 
-Most commands use the configured DNS view. Record commands resolve the target
+Most commands use the configured DNS view. Create commands resolve the target
 zone from `--zone`, then the current shell session, then `IB_ZONE`, then the
-default zone saved by `ib configure`.
+default zone saved by `ib configure`. Delete commands accept an optional
+positional zone, such as `ib dns delete app example.com`; when that is omitted,
+they try a fully qualified record name first, then the same active/default zone
+fallback.
 
 ## DNS Context
 
@@ -99,7 +105,8 @@ scoped search output show a compact `Current DNS Context` line.
 
 Active zone precedence is:
 
-1. Explicit command option, such as `--zone example.com`
+1. Explicit command target, such as `--zone example.com` for create or
+   `ib dns delete app example.com` for delete
 2. Current shell session from `ib dns zone use <zone>`
 3. Environment variable `IB_ZONE`
 4. Configured default zone from `ib configure`
@@ -120,9 +127,10 @@ export IB_ZONE=test.local
 
 ## Create Records
 
+The command shape is `ib dns create {a|aaaa|cname|host|mx|ptr|txt} NAME VALUE`.
 Record names are relative to the active zone unless already fully qualified.
-Use `-t` or `--ttl` for record TTL, and `-c` or `--comment` for a plain ASCII
-comment.
+Use `@` as the name for the zone apex. Use `-t` or `--ttl` for record TTL,
+and `-c` or `--comment` for a plain ASCII comment.
 
 For forward records, a fully qualified name can select its zone
 automatically. For example, if `example-dns.com` exists as a forward zone,
@@ -204,11 +212,13 @@ Search performance notes:
 
 ## Delete Records
 
-Delete forward records by record name. The optional zone argument uses the same
-active-zone fallback rules as create. Tab completion for the record name uses
+Delete A, AAAA, CNAME, TXT, MX, and HOST records by record name. When the zone
+argument is omitted, a fully qualified record name is tried first, then the
+active/default zone fallback is used. Tab completion for the record name uses
 the global DNS search cache, so `ib dns delete <TAB>` can suggest records
-outside the active zone. Reverse PTR records are excluded from normal delete
-completion.
+outside the active zone. PTR records use the dedicated reverse form; NS, SOA,
+PTR, reverse-zone, and unsupported `allrecords` entries are excluded from normal
+delete completion. The optional zone completion only suggests forward zones.
 
 ```bash
 ib dns delete app
@@ -242,10 +252,12 @@ View one zone, including SOA settings:
 ib dns zone view example.com
 ```
 
-Create and delete authoritative zones:
+Create and delete authoritative zones. `--format` accepts `forward`, `ipv4`, or
+`ipv6` case-insensitively and defaults to `FORWARD`; `--comment` and
+`--ns-group` are optional.
 
 ```bash
-ib dns zone create test.local --comment "Lab zone"
+ib dns zone create test.local --comment "Lab zone" --ns-group default
 ib dns zone create 2.0.192.in-addr.arpa --format IPV4
 ib dns zone delete test.local
 ```
@@ -256,7 +268,8 @@ Set the active zone for the current shell:
 ib dns zone use test.local
 ```
 
-Zone names support shell completion when completion is enabled.
+Existing zone names support shell completion for `ib dns zone view` and
+`ib dns zone use` when completion is enabled.
 
 ## Completion
 
@@ -288,6 +301,7 @@ Verify:
 ```bash
 ib <TAB><TAB>
 ib dns create <TAB><TAB>
+ib dns delete <TAB><TAB>
 ib dns zone view <TAB><TAB>
 ```
 
@@ -302,7 +316,8 @@ ib --help
 ib dns --help
 ```
 
-Use `--zone` for one-off commands when the active zone is not the target zone.
+Use `--zone` with `ib dns create`, or pass the optional positional zone to
+`ib dns delete`, when the active zone is not the target zone.
 
 Use `ib dns search -g <keyword>` when you need to search outside the active zone
 and its child zones.

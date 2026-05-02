@@ -482,7 +482,41 @@ class DefaultZoneTests(unittest.TestCase):
             if isinstance(item, ib.Text) and "Error:" in item.plain
         ]
         self.assertTrue(error_lines)
-        self.assertEqual(str(error_lines[0].style), "white")
+        self.assertEqual(error_lines[0].spans[0].start, 0)
+        self.assertEqual(error_lines[0].spans[0].end, len("Error:"))
+        self.assertEqual(str(error_lines[0].spans[0].style), "bold red")
+        err_print.assert_any_call("context")
+
+    def test_dns_delete_missing_record_name_error_prints_ptr_hint(self):
+        with patch.object(ib.sys, "argv", ["ib", "dns", "delete"]):
+            with patch.object(ib, "dns_context_panel", return_value="context") as dns_context_panel:
+                with patch.object(ib.err_console, "print") as err_print:
+                    exit_code = ib.main()
+
+        self.assertEqual(exit_code, 2)
+        dns_context_panel.assert_called_once_with()
+        printed_texts = [call.args[0] for call in err_print.call_args_list if call.args]
+        self.assertTrue(
+            any(
+                isinstance(item, ib.Text)
+                and "Missing argument 'RECORD_NAME'" in item.plain
+                for item in printed_texts
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(item, ib.Text)
+                and "ib dns delete ptr IP_ADDRESS" in item.plain
+                for item in printed_texts
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(item, ib.Text)
+                and "ib dns delete ptr <ip-address>" in item.plain
+                for item in printed_texts
+            )
+        )
         err_print.assert_any_call("context")
 
     def test_click_error_only_usage_prefix_is_cyan(self):
@@ -504,7 +538,21 @@ class DefaultZoneTests(unittest.TestCase):
             all("cyan" not in str(span.style) for span in usage_line.spans[1:]),
             usage_line.spans,
         )
-        self.assertEqual(str(error_line.style), "white")
+        self.assertEqual(error_line.spans[0].start, 0)
+        self.assertEqual(error_line.spans[0].end, len("Error:"))
+        self.assertEqual(str(error_line.spans[0].style), "bold red")
+        self.assertTrue(
+            all("red" not in str(span.style) for span in error_line.spans[1:]),
+            error_line.spans,
+        )
+
+    def test_error_keyword_formatter_styles_every_error_keyword(self):
+        text = ib.styled_error_keyword_text("Error: outer Error: inner")
+        self.assertEqual(text.plain, "Error: outer Error: inner")
+        red_spans = [span for span in text.spans if str(span.style) == "bold red"]
+        self.assertEqual(len(red_spans), 2)
+        self.assertEqual(text.plain[red_spans[0].start:red_spans[0].end], "Error:")
+        self.assertEqual(text.plain[red_spans[1].start:red_spans[1].end], "Error:")
 
     def test_dns_create_runtime_error_context_includes_all_options(self):
         class FakeClient:
@@ -900,6 +948,33 @@ class DefaultZoneTests(unittest.TestCase):
                     "ptrdname": "app.example.com",
                 },
             ),
+            (
+                "record",
+                {
+                    "type": "record:ns",
+                    "name": "example.com",
+                    "zone": "example.com",
+                    "record": {"nameserver": "ns1.example.com"},
+                },
+            ),
+            (
+                "record",
+                {
+                    "type": "sharedrecord:ns",
+                    "name": "shared.example.com",
+                    "zone": "example.com",
+                    "record": {"nameserver": "ns2.example.com"},
+                },
+            ),
+            (
+                "unsupported",
+                {
+                    "type": "UNSUPPORTED",
+                    "name": "ns1.example.com",
+                    "zone": "example.com",
+                    "record": None,
+                },
+            ),
         ]
 
         with patch.object(ib, "load_config", return_value={"server": "ignored"}):
@@ -907,9 +982,12 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "collect_dns_search_results", return_value=records) as collect:
                     items = ib.complete_dns_delete_records(None, None, "app")
 
-        collect.assert_called_once_with(client, "app", False, None)
+        collect.assert_called_once_with(client, "app", False, None, zone_filter=ib.is_forward_zone)
         self.assertEqual([item.value for item in items], ["app.example.com", "www.other.example.net"])
         self.assertNotIn("10.2.0.192.in-addr.arpa", [item.value for item in items])
+        self.assertNotIn("example.com", [item.value for item in items])
+        self.assertNotIn("shared.example.com", [item.value for item in items])
+        self.assertNotIn("ns1.example.com", [item.value for item in items])
         self.assertIn("A", items[0].help)
         self.assertIn("192.0.2.10", items[0].help)
         self.assertIn("zone=example.com", items[0].help)
@@ -937,15 +1015,108 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual([item.value for item in items], ["ptr"])
         self.assertIn("full IP address", items[0].help)
 
+    def test_dns_delete_completion_searches_forward_zones_only(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        queried_zones = []
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            if object_type == ib.ZONE_OBJECT:
+                return [
+                    {
+                        "fqdn": "example.com",
+                        "zone_format": "FORWARD",
+                        "primary_type": "Grid",
+                        "soa_serial_number": 1,
+                    },
+                    {
+                        "fqdn": "2.0.192.in-addr.arpa",
+                        "zone_format": "IPV4",
+                        "primary_type": "Grid",
+                        "soa_serial_number": 2,
+                    },
+                    {
+                        "fqdn": "8.b.d.0.1.0.0.2.ip6.arpa",
+                        "zone_format": "IPV6",
+                        "primary_type": "Grid",
+                        "soa_serial_number": 3,
+                    },
+                ]
+            if object_type == ib.ALLRECORDS_OBJECT:
+                queried_zones.append(params["zone"])
+                self.assertEqual(params["zone"], "example.com")
+                return [
+                    {
+                        "_ref": "allrecords/app",
+                        "type": "record:a",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "address": "192.0.2.10",
+                    }
+                ]
+            raise AssertionError(f"unexpected object type: {object_type}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                            items = ib.complete_dns_delete_records(None, None, "app")
+
+        self.assertEqual(queried_zones, ["example.com"])
+        self.assertEqual([item.value for item in items], ["app.example.com"])
+
     def test_dns_delete_second_argument_does_not_complete_zones_for_ptr_mode(self):
         class FakeContext:
             params = {"record_name": "ptr"}
 
-        with patch.object(ib, "complete_zone_names") as complete_zone_names:
+        with patch.object(ib, "complete_forward_zone_names") as complete_forward_zone_names:
             items = ib.complete_dns_delete_zone_or_ip(FakeContext(), None, "")
 
         self.assertEqual(items, [])
-        complete_zone_names.assert_not_called()
+        complete_forward_zone_names.assert_not_called()
+
+    def test_dns_delete_second_argument_completes_forward_zones_only(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        class FakeContext:
+            params = {"record_name": "app"}
+
+        zones = [
+            {
+                "fqdn": "example.com",
+                "zone_format": "FORWARD",
+                "primary_type": "Grid",
+                "soa_serial_number": 1,
+            },
+            {
+                "fqdn": "2.0.192.in-addr.arpa",
+                "zone_format": "IPV4",
+                "primary_type": "Grid",
+                "soa_serial_number": 2,
+            },
+            {
+                "fqdn": "8.b.d.0.1.0.0.2.ip6.arpa",
+                "zone_format": "IPV6",
+                "primary_type": "Grid",
+                "soa_serial_number": 3,
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "query_zone_serials", return_value=zones):
+                            items = ib.complete_dns_delete_zone_or_ip(FakeContext(), None, "")
+
+        self.assertEqual(items, ["example.com"])
 
     def test_dns_delete_accepts_completed_fqdn_without_active_zone(self):
         class FakeClient:
@@ -1153,14 +1324,19 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("corp", result.output)
         self.assertIn("Zone=", result.output)
         self.assertIn("example.com", result.output)
-        self.assertIn("Without --zone", result.output)
+        self.assertIn("Zone rule", result.output)
+        self.assertIn("Current target", result.output)
+        self.assertIn("without --zone", result.output)
         self.assertIn("Example", result.output)
+        self.assertIn("Setup:", result.output)
+        self.assertIn("ib dns zone use example.com", result.output)
         self.assertIn("app 192.0.2.10", result.output)
         self.assertIn("Command:", result.output)
         self.assertIn("Creates:", result.output)
         self.assertIn("A record", result.output)
         self.assertIn("app.example.com", result.output)
         self.assertIn("Application VIP", result.output)
+        self.assertIn("-n/--name", result.output)
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
             with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
                 with patch.object(ib, "read_session_zone", return_value=None):
@@ -1185,6 +1361,32 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("not set", result.output)
         self.assertIn("Set a target with", result.output)
         self.assertIn("ib dns zone use", result.output)
+
+    def test_dns_delete_help_explains_forward_and_reverse_usage(self):
+        runner = CliRunner()
+        with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
+            with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    result = runner.invoke(
+                        ib.cli,
+                        ["dns", "delete", "--help"],
+                        color=True,
+                        prog_name="ib",
+                    )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Usage: ib dns delete [OPTIONS] RECORD_NAME [ZONE]", result.output)
+        self.assertIn("ib dns delete ptr IP_ADDRESS", result.output)
+        self.assertIn("Delete Record Usage", result.output)
+        self.assertIn("Forward", result.output)
+        self.assertIn("Reverse PTR", result.output)
+        self.assertIn("ib dns delete app", result.output)
+        self.assertIn("app.example.com", result.output)
+        self.assertIn("ib dns delete ptr", result.output)
+        self.assertIn("192.168.1.3", result.output)
+        self.assertIn("Normal delete is for forward records only", result.output)
+        self.assertIn("Use the Reverse", result.output)
+        self.assertIn("PTR form for reverse entries", result.output)
 
     def test_dns_context_panel_uses_one_shared_borderless_line(self):
         with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
@@ -1741,6 +1943,47 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(ib.record_value("shared-cname", cname), "target.example.net")
         self.assertEqual(ib.record_name(txt), "spf.example.com")
         self.assertEqual(ib.record_value("txt", txt), "v=spf1 include:example.net -all")
+
+    def test_dns_search_infers_known_unsupported_allrecords_types_from_ref(self):
+        def allrecords_ref(decoded: str) -> str:
+            token = (
+                ib.base64.urlsafe_b64encode(decoded.encode("utf-8"))
+                .decode("ascii")
+                .rstrip("=")
+            )
+            return f"allrecords/{token}:suffix"
+
+        ns_item = {
+            "_ref": allrecords_ref("dns.zone_search_index$..fake_bind_ns$.delegation"),
+            "type": "UNSUPPORTED",
+            "name": "child.example.com",
+            "zone": "example.com",
+            "record": None,
+        }
+        soa_item = {
+            "_ref": allrecords_ref("dns.zone_search_index$dns.bind_soa$._default.example"),
+            "type": "UNSUPPORTED",
+            "name": "example.com",
+            "zone": "example.com",
+            "record": None,
+        }
+        unknown_item = {
+            "_ref": allrecords_ref("dns.zone_search_index$unknown$._default.example"),
+            "type": "UNSUPPORTED",
+            "name": "other.example.com",
+            "zone": "example.com",
+            "record": None,
+        }
+
+        self.assertEqual(ib.allrecord_type(ns_item), "ns")
+        self.assertEqual(ib.allrecord_type(soa_item), "soa")
+        self.assertEqual(ib.allrecord_type(unknown_item), "unsupported")
+        self.assertEqual(ib.allrecord_search_entry(ns_item)["type"], "ns")
+        self.assertEqual(ib.allrecord_search_entry(soa_item)["type"], "soa")
+        self.assertEqual(
+            ib.allrecord_search_entry_type({"type": "unsupported", "record": ns_item}),
+            "ns",
+        )
 
     def test_dns_search_matches_allrecords_name_value_or_comment_only(self):
         txt = {

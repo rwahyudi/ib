@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import configparser
 import hashlib
 import ipaddress
@@ -23,7 +24,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     import click
@@ -60,6 +61,7 @@ ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
 ZONE_COMPLETION_CACHE_TTL = 300
 ALLRECORDS_CACHE_DIR = CONFIG_DIR / "allrecords-cache"
 DNS_DELETE_COMPLETION_LIMIT = 100
+REVERSE_ZONE_SUFFIXES = ("in-addr.arpa", "ip6.arpa")
 COMPLETION_SHELLS = ("bash", "zsh", "fish")
 ALLRECORDS_OBJECT = "allrecords"
 ALLRECORDS_RETURN_FIELDS = "name,type,view,zone,ttl,comment,address,record"
@@ -161,6 +163,7 @@ RECORD_TYPES: dict[str, dict[str, Any]] = {
     },
 }
 FORWARD_RECORD_TYPES = tuple(record_type for record_type in RECORD_TYPES if record_type != "ptr")
+DNS_DELETE_COMPLETION_RECORD_TYPES = frozenset(FORWARD_RECORD_TYPES)
 
 
 def normalize_server(value: str) -> str:
@@ -705,10 +708,12 @@ def add_dns_context_row(
     table.add_row("Context", dns_context_line_text(context))
 
 
-def dns_create_example_text(zone_name: str | None) -> Text:
-    produced_name = f"app.{zone_name}" if zone_name else "app.<active-zone>"
+def dns_create_example_text() -> Text:
     return Text.assemble(
-        ("Command: ", "bold yellow"),
+        ("Setup: ", "bold yellow"),
+        ("ib dns zone use ", "bold white"),
+        ("example.com", "bold green"),
+        ("\nCommand: ", "bold yellow"),
         ("ib dns create a ", "bold white"),
         ("app", "bold cyan"),
         (" 192.0.2.10 ", "bold blue"),
@@ -717,7 +722,7 @@ def dns_create_example_text(zone_name: str | None) -> Text:
         ('"Application VIP"', "bold green"),
         ("\nCreates: ", "bold green"),
         ("A record ", "bold yellow"),
-        (produced_name, "bold green"),
+        ("app.example.com", "bold green"),
         (" -> ", "white"),
         ("192.0.2.10", "bold blue"),
         (" with TTL ", "white"),
@@ -725,6 +730,55 @@ def dns_create_example_text(zone_name: str | None) -> Text:
         (" and comment ", "white"),
         ('"Application VIP"', "bold green"),
         (".", "white"),
+    )
+
+
+def dns_create_zone_rule_text() -> Text:
+    return Text.assemble(
+        ("--zone", "bold magenta"),
+        (" overrides the target. Without it, relative names use ", "white"),
+        ("ib dns zone use", "bold cyan"),
+        (", ", "white"),
+        (DEFAULT_ZONE_ENV, "bold cyan"),
+        (", then ", "white"),
+        ("ib configure", "bold cyan"),
+        (".", "white"),
+    )
+
+
+def dns_create_target_text(zone_name: str | None) -> Text:
+    if zone_name:
+        return Text.assemble(
+            ("Current target: without ", "white"),
+            ("--zone", "bold magenta"),
+            (", ", "white"),
+            ("app", "bold cyan"),
+            (" creates ", "white"),
+            (f"app.{zone_name}", "bold green"),
+            (".", "white"),
+        )
+
+    return Text.assemble(
+        ("Set a target with ", "white"),
+        ("--zone", "bold magenta"),
+        (", ", "white"),
+        ("ib dns zone use", "bold cyan"),
+        (", ", "white"),
+        (DEFAULT_ZONE_ENV, "bold cyan"),
+        (", or ", "white"),
+        ("ib configure", "bold cyan"),
+        (".", "white"),
+    )
+
+
+def dns_create_option_note_text() -> Text:
+    return Text.assemble(
+        ("-t/--ttl", "bold cyan"),
+        (" expects an integer; ", "white"),
+        ("-c/--comment", "bold cyan"),
+        (" accepts plain ASCII comments; ", "white"),
+        ("-n/--name", "bold cyan"),
+        (" is still accepted but optional.", "white"),
     )
 
 
@@ -761,44 +815,86 @@ def dns_create_usage_panel() -> Panel:
         ),
     )
     add_dns_context_row(table, context)
-    if zone_name:
-        target_text = Text.assemble(
-            ("Without --zone, ", "white"),
-            ("app", "bold cyan"),
-            (" creates ", "white"),
-            (f"app.{zone_name}", "bold green"),
-            (".", "white"),
-        )
-    else:
-        target_text = Text.assemble(
-            ("Set a target with ", "white"),
-            ("--zone", "bold cyan"),
-            (", ", "white"),
-            ("ib dns zone use", "bold cyan"),
-            (", ", "white"),
-            (DEFAULT_ZONE_ENV, "bold cyan"),
-            (", or ", "white"),
-            ("ib configure", "bold cyan"),
-            (".", "white"),
-        )
-    table.add_row("Target", target_text)
+    table.add_row("Zone rule", dns_create_zone_rule_text())
+    table.add_row("Target", dns_create_target_text(zone_name))
     table.add_row(
         "Example",
-        dns_create_example_text(zone_name),
+        dns_create_example_text(),
     )
     table.add_row(
         "Options",
-        Text.assemble(
-            ("-t/--ttl", "bold cyan"),
-            (" expects an integer; ", "white"),
-            ("-c/--comment", "bold cyan"),
-            (" accepts plain ASCII comments.", "white"),
-        ),
+        dns_create_option_note_text(),
     )
 
     return Panel(
         table,
         title="Create Record Usage",
+        border_style="bright_magenta",
+        style="white on #0f172a",
+        padding=(0, 1),
+    )
+
+
+def dns_delete_usage_panel() -> Panel:
+    context = dns_context_status()
+    zone_name = context["active_zone"] if context["has_active_zone"] else None
+    forward_example = f"app.{zone_name}" if zone_name else "app.<active-zone>"
+
+    table = Table.grid(expand=True, padding=(0, 2))
+    table.add_column(style="bold cyan", no_wrap=True)
+    table.add_column(ratio=1)
+    table.add_row(
+        "Forward",
+        Text.assemble(
+            ("ib dns delete ", "bold white"),
+            ("<record-name>", "bold green"),
+            (" [zone]", "bold magenta"),
+        ),
+    )
+    table.add_row(
+        "Reverse PTR",
+        Text.assemble(
+            ("ib dns delete ", "bold white"),
+            ("ptr", "bold yellow"),
+            (" ", "white"),
+            ("<ip-address>", "bold blue"),
+        ),
+    )
+    add_dns_context_row(table, context)
+    table.add_row(
+        "Forward example",
+        Text.assemble(
+            ("Command: ", "bold yellow"),
+            ("ib dns delete app", "bold white"),
+            ("\nDeletes: ", "bold green"),
+            ("forward record ", "white"),
+            (forward_example, "bold green"),
+            (".", "white"),
+        ),
+    )
+    table.add_row(
+        "Reverse example",
+        Text.assemble(
+            ("Command: ", "bold yellow"),
+            ("ib dns delete ptr ", "bold white"),
+            ("192.168.1.3", "bold blue"),
+            ("\nDeletes: ", "bold green"),
+            ("PTR/reverse record for ", "white"),
+            ("192.168.1.3", "bold blue"),
+            (" after finding the matching reverse zone.", "white"),
+        ),
+    )
+    table.add_row(
+        "Note",
+        Text.assemble(
+            ("Normal delete is for forward records only. ", "white"),
+            ("Use the Reverse PTR form for reverse entries.", "bold yellow"),
+        ),
+    )
+
+    return Panel(
+        table,
+        title="Delete Record Usage",
         border_style="bright_magenta",
         style="white on #0f172a",
         padding=(0, 1),
@@ -849,6 +945,21 @@ class DnsCreateCommand(UsageContextCommand):
         self.format_epilog(ctx, formatter)
 
 
+class DnsDeleteCommand(UsageContextCommand):
+    def format_usage(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        formatter.write(f"Usage: {ctx.command_path} [OPTIONS] RECORD_NAME [ZONE]\n")
+        formatter.write(f"       {ctx.command_path} ptr IP_ADDRESS\n")
+
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        self.format_usage(ctx, formatter)
+        formatter.write("\n")
+        formatter.write(render_help_text(ctx, dns_delete_usage_panel(), force_color=True))
+        formatter.write("\n")
+        self.format_help_text(ctx, formatter)
+        self.format_options(ctx, formatter)
+        self.format_epilog(ctx, formatter)
+
+
 def dns_create_click_error_help(exc: click.ClickException) -> str | None:
     ctx = getattr(exc, "ctx", None)
     if not ctx or not isinstance(ctx.command, DnsCreateCommand):
@@ -885,12 +996,44 @@ def styled_click_usage_text(usage_text: str) -> Text:
     return text
 
 
+def styled_error_keyword_text(message: str) -> Text:
+    keyword = "Error:"
+    text = Text()
+    start = 0
+    while True:
+        index = message.find(keyword, start)
+        if index == -1:
+            text.append(message[start:], style="white")
+            break
+        if index > start:
+            text.append(message[start:index], style="white")
+        text.append(keyword, style="bold red")
+        start = index + len(keyword)
+    return text
+
+
 def print_click_exception(exc: click.ClickException) -> None:
     usage_text = click_error_usage_text(exc)
     if usage_text:
         err_console.print(styled_click_usage_text(usage_text))
         err_console.print()
-    err_console.print(Text(f"Error: {exc.format_message()}", style="white"))
+    err_console.print(styled_error_keyword_text(f"Error: {exc.format_message()}"))
+
+
+def is_dns_delete_click_error(exc: click.ClickException) -> bool:
+    ctx = getattr(exc, "ctx", None)
+    return bool(ctx and getattr(ctx, "command_path", "").endswith("dns delete"))
+
+
+def print_dns_delete_click_error_hint(exc: click.ClickException) -> None:
+    if not is_dns_delete_click_error(exc):
+        return
+    err_console.print(
+        Text(
+            "HINT: To delete a reverse DNS PTR entry, run: ib dns delete ptr <ip-address>",
+            style="bold yellow",
+        )
+    )
 
 
 class UsageContextGroup(UsageContextHelpMixin, click.Group):
@@ -1458,6 +1601,23 @@ def zone_serial(zone_info: dict[str, Any]) -> str | None:
 def is_secondary_zone(zone_info: dict[str, Any]) -> bool:
     primary_type = str(zone_info.get("primary_type", "")).strip().lower()
     return primary_type in {"external", "microsoft", "secondary"}
+
+
+def is_reverse_zone_name(zone_name: str) -> bool:
+    try:
+        normalized = normalize_zone_name(zone_name)
+    except CliError:
+        normalized = zone_name.strip().rstrip(".").lower()
+    return normalized.endswith(REVERSE_ZONE_SUFFIXES)
+
+
+def is_forward_zone(zone_info: dict[str, Any]) -> bool:
+    zone_format = str(zone_info.get("zone_format", "")).strip().upper()
+    if zone_format in {"IPV4", "IPV6"}:
+        return False
+    if zone_format and zone_format != "FORWARD":
+        return False
+    return not is_reverse_zone_name(str(zone_info.get("fqdn", "")))
 
 
 def search_root_zone(config: dict[str, str]) -> str | None:
@@ -2038,8 +2198,39 @@ def record_in_zone_scope(item: dict[str, Any], root_zone: str) -> bool:
     return bool(record_name) and is_zone_or_child(record_name, root_zone)
 
 
+def decoded_allrecords_ref(item: dict[str, Any]) -> str:
+    ref = str(item.get("_ref", ""))
+    prefix = f"{ALLRECORDS_OBJECT}/"
+    if not ref.startswith(prefix):
+        return ""
+
+    token = ref[len(prefix) :].split(":", 1)[0]
+    if not token:
+        return ""
+
+    padding = "=" * (-len(token) % 4)
+    try:
+        return base64.urlsafe_b64decode(f"{token}{padding}".encode("ascii")).decode(
+            "utf-8",
+            errors="ignore",
+        )
+    except (binascii.Error, UnicodeEncodeError, ValueError):
+        return ""
+
+
+def unsupported_allrecord_type(item: dict[str, Any]) -> str:
+    decoded_ref = decoded_allrecords_ref(item)
+    if "fake_bind_ns" in decoded_ref:
+        return "ns"
+    if "bind_soa" in decoded_ref:
+        return "soa"
+    return "unsupported"
+
+
 def allrecord_type(item: dict[str, Any]) -> str:
     raw_type = str(item.get("type", "")).lower()
+    if raw_type == "unsupported":
+        return unsupported_allrecord_type(item)
     if raw_type.startswith("record:"):
         record_type = raw_type.split(":", 1)[1]
         if record_type in {"host_ipv4addr", "host_ipv6addr"}:
@@ -2143,7 +2334,10 @@ def allrecord_search_entry_record(entry: dict[str, Any]) -> dict[str, Any]:
 
 def allrecord_search_entry_type(entry: dict[str, Any]) -> str:
     record = allrecord_search_entry_record(entry)
-    return str(entry.get("type") or allrecord_type(record))
+    entry_type = str(entry.get("type") or "")
+    if entry_type.lower() == "unsupported":
+        return allrecord_type(record)
+    return entry_type or allrecord_type(record)
 
 
 def allrecord_search_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, str, str]:
@@ -2211,10 +2405,14 @@ def collect_dns_search_results(
     keyword: str,
     case_sensitive: bool,
     root_zone: str | None,
+    *,
+    zone_filter: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     seen: set[str] = set()
     records: list[tuple[str, dict[str, Any]]] = []
     zones = search_zones(client, root_zone)
+    if zone_filter is not None:
+        zones = [zone for zone in zones if zone_filter(zone)]
 
     def collect_zone_entries(zone_info: dict[str, Any]) -> list[dict[str, Any]]:
         worker_client = clone_infoblox_client(client)
@@ -2749,6 +2947,26 @@ def complete_zone_names(
     return filter_zone_names(names, incomplete)
 
 
+def complete_forward_zone_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    try:
+        config = load_config(required=False)
+        if not config:
+            return []
+        client = InfobloxClient(config)
+        forward_zones = [
+            zone for zone in search_zones(client, None) if is_forward_zone(zone)
+        ]
+        names = zone_names_from_results(forward_zones)
+    except (CliError, OSError, ValueError, sqlite3.Error):
+        return []
+
+    return filter_zone_names(names, incomplete)
+
+
 def format_record(record_type: str, item: dict[str, Any]) -> str:
     value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
     value = next((str(item[key]) for key in value_keys if key in item), "")
@@ -2848,6 +3066,19 @@ def dns_delete_ptr_completion(incomplete: str) -> list[CompletionItem]:
     return []
 
 
+def dns_delete_completion_supported_record_type(record_type: str, item: dict[str, Any]) -> bool:
+    candidates = {record_type.lower(), allrecord_type(item).lower()}
+    return bool(candidates & DNS_DELETE_COMPLETION_RECORD_TYPES)
+
+
+def dns_delete_completion_excluded_record(record_type: str, item: dict[str, Any]) -> bool:
+    if not dns_delete_completion_supported_record_type(record_type, item):
+        return True
+    return is_reverse_zone_name(str(item.get("zone", ""))) or is_reverse_zone_name(
+        record_name(item)
+    )
+
+
 def complete_dns_delete_records(
     ctx: click.Context,
     param: click.Parameter,
@@ -2859,13 +3090,19 @@ def complete_dns_delete_records(
         if not config:
             return items
         client = InfobloxClient(config)
-        records = collect_dns_search_results(client, incomplete.strip(), False, None)
+        records = collect_dns_search_results(
+            client,
+            incomplete.strip(),
+            False,
+            None,
+            zone_filter=is_forward_zone,
+        )
     except (CliError, OSError, ValueError, sqlite3.Error):
         return items
 
     seen: set[str] = {str(item.value) for item in items}
     for record_type, item in records:
-        if record_type.lower().endswith("ptr"):
+        if dns_delete_completion_excluded_record(record_type, item):
             continue
         name = record_name(item).strip().rstrip(".")
         if not name or name in seen:
@@ -2884,7 +3121,7 @@ def complete_dns_delete_zone_or_ip(
 ) -> list[str]:
     if str(ctx.params.get("record_name", "")).strip().lower() == "ptr":
         return []
-    return complete_zone_names(ctx, param, incomplete)
+    return complete_forward_zone_names(ctx, param, incomplete)
 
 
 def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
@@ -3223,18 +3460,19 @@ def create(
 
     \b
     Examples:
+      Setup: ib dns zone use example.com
       Command: ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"
-      Creates: A app.<active-zone> -> 192.0.2.10 with TTL 300 and comment "Application VIP"
+      Creates: A app.example.com -> 192.0.2.10 with TTL 300 and comment "Application VIP"
       Command: ib dns create a host1.example-dns.com 192.0.2.10
       Creates: A host1.example-dns.com -> 192.0.2.10 in zone example-dns.com when that forward zone exists
       Command: ib dns create host app 192.0.2.10 -t 300 -c "Application host"
-      Creates: HOST app.<active-zone> with IPv4 address 192.0.2.10, TTL 300, and comment "Application host"
+      Creates: HOST app.example.com with IPv4 address 192.0.2.10, TTL 300, and comment "Application host"
       Command: ib dns create cname www app.example.com
-      Creates: CNAME www.<active-zone> -> app.example.com
+      Creates: CNAME www.example.com -> app.example.com
       Command: ib dns create txt _spf "v=spf1 include:example.net -all"
-      Creates: TXT _spf.<active-zone> = "v=spf1 include:example.net -all"
+      Creates: TXT _spf.example.com = "v=spf1 include:example.net -all"
       Command: ib dns create mx @ "10 mail.example.com"
-      Creates: MX <active-zone> -> mail.example.com with preference 10
+      Creates: MX example.com -> mail.example.com with preference 10
       Command: ib dns create ptr 192.0.2.10 host.example.com
       Creates: PTR 192.0.2.10 -> host.example.com
     """
@@ -3259,7 +3497,7 @@ def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
     run_dns_search(keyword, case_sensitive, global_search)
 
 
-@dns.command()
+@dns.command(cls=DnsDeleteCommand)
 @click.argument("record_name", shell_complete=complete_dns_delete_records)
 @click.argument("zone", required=False, shell_complete=complete_dns_delete_zone_or_ip)
 def delete(record_name: str, zone: str | None) -> None:
@@ -3282,6 +3520,7 @@ def main() -> int:
     except click.ClickException as exc:
         print_click_exception(exc)
         print_dns_create_click_error_help(exc)
+        print_dns_delete_click_error_hint(exc)
         print_click_error_dns_context(exc)
         return exc.exit_code
     except DnsCreateError as exc:
