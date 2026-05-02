@@ -1635,6 +1635,15 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("corp", help_text)
         self.assertIn("example.com", help_text)
 
+    def test_root_help_includes_global_output_option(self):
+        runner = CliRunner()
+        result = runner.invoke(ib.cli, ["--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("-o, --output", result.output)
+        self.assertIn("jq", result.output)
+        self.assertIn("csv", result.output)
+
     def test_dns_create_help_includes_colorful_usage_context(self):
         runner = CliRunner()
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
@@ -1702,6 +1711,15 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("Infoblox does not support changing", normalized_output)
         self.assertIn("delete and recreate", normalized_output.lower())
 
+    def test_help_overrides_structured_output_mode(self):
+        runner = CliRunner()
+        result = runner.invoke(ib.cli, ["-o", "jq", "dns", "edit", "-h"], prog_name="ib")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Usage: ib dns edit", result.output)
+        self.assertIn("Edit an existing DNS record", result.output)
+        self.assertFalse(result.output.lstrip().startswith(("{", "[")))
+
     def test_dns_delete_help_explains_forward_and_reverse_usage(self):
         runner = CliRunner()
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
@@ -1767,6 +1785,51 @@ class DefaultZoneTests(unittest.TestCase):
 
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "zones"])
+
+    def test_dns_zone_list_outputs_csv_with_global_output_option(self):
+        class FakeClient:
+            view = "corp"
+
+        zones = [
+            {
+                "_ref": "zone_auth/example",
+                "fqdn": "example.com",
+                "view": "corp",
+                "zone_format": "FORWARD",
+                "ns_group": "default",
+                "comment": "Production",
+            }
+        ]
+        runner = CliRunner()
+
+        with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "query_zones", return_value=zones):
+                    result = runner.invoke(ib.cli, ["-o", "csv", "dns", "zone", "list"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            result.output.splitlines(),
+            [
+                "zone,view,format,ns_group,comment",
+                "example.com,corp,FORWARD,default,Production",
+            ],
+        )
+
+    def test_dns_zone_use_outputs_json_with_global_output_option(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "write_session_zone") as write_session_zone:
+            result = runner.invoke(ib.cli, ["-o", "jq", "dns", "zone", "use", "example.com"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["action"], "use")
+        self.assertEqual(data["type"], "ZONE")
+        self.assertEqual(data["zone"], "example.com")
+        self.assertNotIn("ref", data)
+        write_session_zone.assert_called_once_with("example.com")
 
     def test_dns_list_uses_active_zone_and_paged_allrecords(self):
         class FakeClient:
@@ -1855,6 +1918,80 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(seen["fqdn"], "example.net")
         print_warning.assert_called_once_with("No records found in zone example.net.")
+
+    def test_dns_search_outputs_json_with_global_output_option(self):
+        class FakeClient:
+            view = "corp"
+
+        records = [
+            (
+                "a",
+                {
+                    "_ref": "record:a/app",
+                    "name": "app.example.com",
+                    "zone": "example.com",
+                    "ipv4addr": "192.0.2.10",
+                    "ttl": 300,
+                    "comment": "Application",
+                },
+            )
+        ]
+        runner = CliRunner()
+
+        with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "search_root_zone", return_value="example.com"):
+                    with patch.object(ib, "collect_dns_search_results", return_value=records):
+                        result = runner.invoke(ib.cli, ["-o", "jq", "dns", "search", "app"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data[0]["type"], "A")
+        self.assertEqual(data[0]["name"], "app.example.com")
+        self.assertEqual(data[0]["value"], "192.0.2.10")
+        self.assertNotIn("ref", data[0])
+        self.assertNotIn("Current DNS Context", result.output)
+
+    def test_dns_search_accepts_global_output_option_after_command_arguments(self):
+        class FakeClient:
+            view = "corp"
+
+        records = [
+            (
+                "a",
+                {
+                    "_ref": "record:a/app",
+                    "name": "app.example.com",
+                    "zone": "example.com",
+                    "ipv4addr": "192.0.2.10",
+                },
+            )
+        ]
+        runner = CliRunner()
+
+        with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "search_root_zone", return_value="example.com"):
+                    with patch.object(ib, "collect_dns_search_results", return_value=records):
+                        result = runner.invoke(ib.cli, ["dns", "search", "app", "-o", "jq"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data[0]["name"], "app.example.com")
+        self.assertNotIn("ref", data[0])
+        self.assertNotIn("No such option", result.output)
+
+    def test_dns_search_accepts_global_output_option_on_dns_group(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+            with patch.object(ib, "InfobloxClient"):
+                with patch.object(ib, "search_root_zone", return_value="example.com"):
+                    with patch.object(ib, "collect_dns_search_results", return_value=[]):
+                        result = runner.invoke(ib.cli, ["dns", "-o", "csv", "search", "app"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output.splitlines(), ["type,name,value,zone,ttl,comment"])
 
     def test_dns_search_searches_active_zone_and_child_zones(self):
         class FakeClient:

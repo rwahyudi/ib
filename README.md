@@ -96,6 +96,25 @@ Command overview:
 - `ib dns zone delete <zone>` deletes a zone.
 - `ib dns zone use <zone>` sets the active zone for the current shell session.
 
+Use the global `-o/--output` option to produce structured output. It can be
+placed at the root, on a command group, or after command arguments. Omitting it
+keeps the current Rich table output. `-o jq` prints JSON for use with `jq`, and
+`-o csv` prints comma-separated values. Structured output omits Infoblox
+reference IDs:
+
+```bash
+ib -o jq dns search app
+ib dns -o jq search app
+ib dns search app -o jq
+ib -o csv dns zone list
+```
+
+Help always stays in normal help format, even when `-o/--output` is present:
+
+```bash
+ib -o jq dns edit -h
+```
+
 Most commands use the configured DNS view. Create and edit commands resolve the
 target zone from `--zone`, then the current shell session, then `IB_ZONE`, then
 the default zone saved by `ib configure`. Delete commands accept an optional

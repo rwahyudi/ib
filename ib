@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import binascii
 import configparser
+import csv
 import hashlib
 import http.client
 import ipaddress
@@ -75,6 +76,9 @@ ZONE_NETWORK_ASSOCIATION_RETURN_FIELDS = "network_view,network_associations"
 ZONE_DETAIL_RETURN_FIELDS = f"{BASE_ZONE_DETAIL_RETURN_FIELDS},network_view"
 ZONE_SERIAL_RETURN_FIELDS = f"{ZONE_RETURN_FIELDS},primary_type,soa_serial_number"
 ZONE_FORMATS = ("FORWARD", "IPV4", "IPV6")
+TABLE_OUTPUT = "table"
+STRUCTURED_OUTPUTS = ("jq", "csv")
+STRUCTURED_EXCLUDED_FIELDS = {"ref", "_ref"}
 console = Console()
 err_console = Console(stderr=True)
 
@@ -97,6 +101,134 @@ class DnsCreateError(CliError):
     def __init__(self, message: str, context: dict[str, Any]) -> None:
         super().__init__(message)
         self.context = context
+
+
+def current_output_format() -> str:
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return TABLE_OUTPUT
+    root = ctx.find_root()
+    output_format = root.params.get("output_format") if root else None
+    return str(output_format or TABLE_OUTPUT).lower()
+
+
+def output_is_table() -> bool:
+    return current_output_format() == TABLE_OUTPUT
+
+
+def json_default(value: Any) -> str:
+    return str(value)
+
+
+def emit_json(data: Any) -> None:
+    click.echo(json.dumps(data, indent=2, default=json_default))
+
+
+def csv_value(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, default=json_default)
+    return value
+
+
+def emit_csv(rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({field: csv_value(row.get(field)) for field in fieldnames})
+
+
+def structured_output_data(data: Any) -> Any:
+    if isinstance(data, list):
+        return [structured_output_data(item) for item in data]
+    if isinstance(data, dict):
+        return {
+            key: value
+            for key, value in data.items()
+            if str(key) not in STRUCTURED_EXCLUDED_FIELDS
+        }
+    return data
+
+
+def structured_output_fields(fieldnames: list[str]) -> list[str]:
+    return [field for field in fieldnames if field not in STRUCTURED_EXCLUDED_FIELDS]
+
+
+def emit_structured(data: Any, fieldnames: list[str] | None = None) -> None:
+    data = structured_output_data(data)
+    if current_output_format() == "jq":
+        emit_json(data)
+        return
+
+    if isinstance(data, list):
+        rows = data
+    else:
+        rows = [data]
+    if fieldnames is None:
+        fieldnames = sorted({key for row in rows for key in row})
+    else:
+        fieldnames = structured_output_fields(fieldnames)
+    emit_csv(rows, fieldnames)
+
+
+def emit_action_result(**fields: Any) -> None:
+    emit_structured(
+        fields,
+        [
+            "status",
+            "action",
+            "type",
+            "name",
+            "zone",
+            "view",
+            "message",
+        ],
+    )
+
+
+OUTPUT_OPTION_HELP = (
+    "Output format. Omit for the current Rich table output; use jq for JSON or csv for CSV."
+)
+
+
+def remember_output_format(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> None:
+    if not value:
+        return None
+    root = ctx.find_root()
+    root.params["output_format"] = value.lower()
+    root.ensure_object(dict)
+    root.obj["output_format"] = value.lower()
+    return None
+
+
+def output_option_is_registered(command: click.Command) -> bool:
+    for param in command.params:
+        if isinstance(param, click.Option) and "--output" in param.opts:
+            return True
+    return False
+
+
+def command_output_option() -> click.Option:
+    return click.Option(
+        ["-o", "--output", "output_format"],
+        type=click.Choice(STRUCTURED_OUTPUTS, case_sensitive=False),
+        expose_value=False,
+        callback=remember_output_format,
+        help=OUTPUT_OPTION_HELP,
+    )
+
+
+def register_output_option_everywhere(command: click.Command) -> None:
+    if not output_option_is_registered(command):
+        command.params.append(command_output_option())
+    if isinstance(command, click.Group):
+        for subcommand in command.commands.values():
+            register_output_option_everywhere(subcommand)
 
 
 def print_success(message: str) -> None:
@@ -1497,6 +1629,18 @@ def run_dns_create(
     if noptr and record_type.lower() not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
     refresh_dns_cache_after_update()
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="create",
+            type=record_type.upper(),
+            name=payload.get("name") or dns_create_target_name(name, resolved_zone),
+            zone=resolved_zone,
+            view=view,
+            ref=ref,
+            message=f"created {record_type.upper()} record",
+        )
+        return
     print_success(f"SUCCESS: created {record_type.upper()} record")
     print_note(f"Reference: {ref}")
 
@@ -2674,15 +2818,18 @@ def run_dns_search(
     config = load_config()
     client = InfobloxClient(config)
     root_zone = None if global_search else search_root_zone(config)
-    if not global_search:
+    if not global_search and output_is_table():
         console.print(dns_context_panel("Current DNS Context"))
     records = collect_dns_search_results(client, keyword, case_sensitive, root_zone)
 
     if not records:
-        print_warning("No records found.")
+        if output_is_table():
+            print_warning("No records found.")
+        else:
+            emit_records(records)
         return
 
-    console.print(record_table(records))
+    emit_records(records)
 
 
 def dns_list_zone_info(client: InfobloxClient, zone_name: str) -> dict[str, Any]:
@@ -2727,15 +2874,19 @@ def run_dns_list(zone_name: str | None = None) -> None:
     client = InfobloxClient(config)
     target = resolve_dns_zone(config, zone_name)
 
-    console.print(dns_context_panel("Current DNS Context"))
+    if output_is_table():
+        console.print(dns_context_panel("Current DNS Context"))
     zone_info = dns_list_zone_info(client, target)
     records = dns_list_records_for_zone(client, zone_info)
 
     if not records:
-        print_warning(f"No records found in zone {target}.")
+        if output_is_table():
+            print_warning(f"No records found in zone {target}.")
+        else:
+            emit_records(records)
         return
 
-    console.print(record_table(records))
+    emit_records(records)
 
 
 def dns_edit_forward_targets(config: dict[str, str], record_name: str, zone: str | None) -> list[str]:
@@ -2926,6 +3077,18 @@ def run_dns_edit(
     if noptr and actual_type not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
     refresh_dns_cache_after_update()
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="edit",
+            type=actual_type.upper(),
+            name=target,
+            zone=str(item.get("zone", "")),
+            view=client.view,
+            ref=updated_ref or ref,
+            message=f"updated {actual_type.upper()} record",
+        )
+        return
     print_success(f"SUCCESS: updated {actual_type.upper()} record {target}")
     print_note(f"Reference: {updated_ref or ref}")
 
@@ -3019,6 +3182,18 @@ def run_dns_delete_ptr(ip_value: str | None) -> None:
         raise CliError("ERROR: matched PTR record does not include an _ref.")
     client.request("DELETE", ref)
     refresh_dns_cache_after_update()
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="delete",
+            type="PTR",
+            name=str(address),
+            zone=reverse_zone,
+            view=client.view,
+            ref=ref,
+            message=f"deleted PTR record {address}",
+        )
+        return
     print_success(f"SUCCESS: deleted PTR record {address} from reverse zone {reverse_zone}")
 
 
@@ -3086,6 +3261,18 @@ def run_dns_delete(record_name: str, zone: str | None) -> None:
         raise CliError("ERROR: matched record does not include an _ref.")
     client.request("DELETE", ref)
     refresh_dns_cache_after_update()
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="delete",
+            type=record_type.upper(),
+            name=target,
+            zone=str(item.get("zone", "")),
+            view=client.view,
+            ref=ref,
+            message=f"deleted {record_type.upper()} record {target}",
+        )
+        return
     print_success(f"SUCCESS: deleted {record_type.upper()} record {target}")
 
 
@@ -3108,18 +3295,34 @@ def run_dns_zone_create(
 
     ref = client.request("POST", ZONE_OBJECT, payload=payload)
     refresh_dns_cache_after_update()
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="create",
+            type="ZONE",
+            name=payload["fqdn"],
+            zone=payload["fqdn"],
+            view=client.view,
+            ref=ref,
+            message=f"created DNS zone {payload['fqdn']}",
+        )
+        return
     print_success(f"SUCCESS: created DNS zone {payload['fqdn']}")
     print_note(f"Reference: {ref}")
 
 
 def run_dns_zone_list(search: str | None = None) -> None:
     client = InfobloxClient(load_config())
-    console.print(dns_context_panel("Current DNS Context"))
+    if output_is_table():
+        console.print(dns_context_panel("Current DNS Context"))
     zones = query_zones(client, search)
     if not zones:
-        print_warning("No zones found.")
+        if output_is_table():
+            print_warning("No zones found.")
+        else:
+            emit_zones(zones)
         return
-    console.print(zone_table(zones))
+    emit_zones(zones)
 
 
 def zone_network_association_unavailable(exc: WapiError) -> str:
@@ -3171,7 +3374,10 @@ def run_dns_zone_view(zone_name: str) -> None:
 
     zone_info = dict(matches[0])
     add_zone_network_association_details(client, target, zone_info)
-    console.print(zone_detail_table(zone_info))
+    if output_is_table():
+        console.print(zone_detail_table(zone_info))
+    else:
+        emit_zone_detail(zone_info)
 
 
 def run_dns_zone_delete(zone_name: str) -> None:
@@ -3191,12 +3397,36 @@ def run_dns_zone_delete(zone_name: str) -> None:
         raise CliError("ERROR: matched zone does not include an _ref.")
     client.request("DELETE", ref)
     refresh_dns_cache_after_update()
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="delete",
+            type="ZONE",
+            name=target,
+            zone=target,
+            view=client.view,
+            ref=ref,
+            message=f"deleted DNS zone {target}",
+        )
+        return
     print_success(f"SUCCESS: deleted DNS zone {target}")
 
 
 def run_dns_zone_use(zone_name: str) -> None:
     default_zone = normalize_zone_name(zone_name)
     write_session_zone(default_zone)
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="use",
+            type="ZONE",
+            name=default_zone,
+            zone=default_zone,
+            view="",
+            ref="",
+            message=f"active DNS zone set to {default_zone}",
+        )
+        return
     print_success(f"SUCCESS: active DNS zone set to {default_zone}")
     print_note("This applies to the current shell session only.")
 
@@ -3398,6 +3628,64 @@ def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = 
             row.append(str(item.get("_ref", "")))
         table.add_row(*row)
     return table
+
+
+RECORD_OUTPUT_FIELDS = ["type", "name", "value", "zone", "ttl", "comment"]
+ZONE_OUTPUT_FIELDS = ["zone", "view", "format", "ns_group", "comment"]
+ZONE_DETAIL_OUTPUT_FIELDS = [
+    "zone",
+    "view",
+    "format",
+    "ns_group",
+    "network_view",
+    "network_associations",
+    "serial_number",
+    "soa_mname",
+    "soa_rname",
+    "refresh",
+    "retry",
+    "expiry",
+    "negative_caching_ttl",
+    "comment",
+]
+
+
+def record_output_row(record_type: str, item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": record_type.upper(),
+        "name": record_name(item),
+        "value": record_value(record_type, item),
+        "zone": str(item.get("zone", "")),
+        "ttl": item.get("ttl", ""),
+        "comment": str(item.get("comment", "")),
+    }
+
+
+def emit_records(records: list[tuple[str, dict[str, Any]]]) -> None:
+    if output_is_table():
+        console.print(record_table(records))
+        return
+    emit_structured(
+        [record_output_row(record_type, item) for record_type, item in records],
+        RECORD_OUTPUT_FIELDS,
+    )
+
+
+def zone_output_row(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "zone": str(item.get("fqdn", "")),
+        "view": str(item.get("view", "")),
+        "format": str(item.get("zone_format", "")),
+        "ns_group": str(item.get("ns_group", "")),
+        "comment": str(item.get("comment", "")),
+    }
+
+
+def emit_zones(zones: list[dict[str, Any]]) -> None:
+    if output_is_table():
+        console.print(zone_table(zones))
+        return
+    emit_structured([zone_output_row(item) for item in zones], ZONE_OUTPUT_FIELDS)
 
 
 def dns_delete_completion_help(record_type: str, item: dict[str, Any]) -> str:
@@ -3622,6 +3910,29 @@ def format_network_association(value: Any) -> str:
     return str(value)
 
 
+def zone_detail_output_row(zone_info: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "zone": zone_info.get("fqdn", ""),
+        "view": zone_info.get("view", ""),
+        "format": zone_info.get("zone_format", ""),
+        "ns_group": zone_info.get("ns_group", ""),
+        "network_view": zone_info.get("network_view", ""),
+        "network_associations": zone_info.get("network_associations", ""),
+        "serial_number": zone_info.get("soa_serial_number", ""),
+        "soa_mname": zone_info.get("member_soa_mnames", ""),
+        "soa_rname": zone_info.get("soa_email", ""),
+        "refresh": zone_info.get("soa_refresh", ""),
+        "retry": zone_info.get("soa_retry", ""),
+        "expiry": zone_info.get("soa_expire", ""),
+        "negative_caching_ttl": zone_info.get("soa_negative_ttl", ""),
+        "comment": zone_info.get("comment", ""),
+    }
+
+
+def emit_zone_detail(zone_info: dict[str, Any]) -> None:
+    emit_structured(zone_detail_output_row(zone_info), ZONE_DETAIL_OUTPUT_FIELDS)
+
+
 def zone_detail_table(zone_info: dict[str, Any]) -> Table:
     zone_name = str(zone_info.get("fqdn", ""))
     table = Table(title=f"DNS Zone: {zone_name}", header_style="bold cyan")
@@ -3652,7 +3963,15 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
 
 
 @click.group(cls=RootGroup, context_settings={"help_option_names": ["-h", "--help"]})
-def cli() -> None:
+@click.option(
+    "-o",
+    "--output",
+    "output_format",
+    type=click.Choice(STRUCTURED_OUTPUTS, case_sensitive=False),
+    help=OUTPUT_OPTION_HELP,
+)
+@click.pass_context
+def cli(ctx: click.Context, output_format: str | None) -> None:
     """Infoblox command line client.
 
     Run `ib configure` first to save the Infoblox server, credentials, DNS view,
@@ -3671,6 +3990,8 @@ def cli() -> None:
     Use `ib dns --help`, `ib dns create --help`, and `ib dns zone --help` for
     command-specific options and examples.
     """
+    ctx.ensure_object(dict)
+    ctx.obj["output_format"] = (output_format or TABLE_OUTPUT).lower()
 
 
 @cli.command("_prewarm-search-cache", hidden=True)
@@ -3999,6 +4320,9 @@ def delete(record_name: str, zone: str | None) -> None:
     matches and exits without deleting.
     """
     run_dns_delete(record_name, zone)
+
+
+register_output_option_everywhere(cli)
 
 
 def main() -> int:
