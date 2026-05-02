@@ -21,9 +21,15 @@ def load_ib_module():
 
 
 ib = load_ib_module()
+ORIGINAL_REFRESH_DNS_CACHE_AFTER_UPDATE = ib.refresh_dns_cache_after_update
 
 
 class DefaultZoneTests(unittest.TestCase):
+    def setUp(self):
+        self.cache_refresh_patcher = patch.object(ib, "refresh_dns_cache_after_update")
+        self.cache_refresh = self.cache_refresh_patcher.start()
+        self.addCleanup(self.cache_refresh_patcher.stop)
+
     def test_dns_create_uses_configured_default_zone_when_zone_is_omitted(self):
         seen = {}
 
@@ -47,6 +53,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(seen["zone"], "example.com")
         self.assertEqual(seen["request"][0], "POST")
+        self.cache_refresh.assert_called_once_with()
 
     def test_dns_create_uses_matching_forward_zone_from_fqdn_name(self):
         seen = {"zone_queries": []}
@@ -233,7 +240,96 @@ class DefaultZoneTests(unittest.TestCase):
         with self.assertRaisesRegex(ib.CliError, "host value must be an IPv4 or IPv6 address"):
             ib.create_payload("host", "target.example.com", "app", "example.com", None, None, FakeClient())
 
-    def test_dns_create_accepts_short_name_ttl_and_comment_options(self):
+    def test_dns_create_cname_checks_target_resolution_without_warning_when_resolved(self):
+        seen = {}
+
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                seen["request"] = (method, object_type, payload)
+                return "record:cname/example"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib.socket, "getaddrinfo", return_value=[object()]) as getaddrinfo:
+                            with patch.object(ib, "print_warning") as print_warning:
+                                with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                    ib.run_dns_create(
+                                        "cname",
+                                        "target.example.net.",
+                                        "www",
+                                        None,
+                                        None,
+                                        False,
+                                        None,
+                                    )
+
+        getaddrinfo.assert_called_once_with("target.example.net", None)
+        print_warning.assert_not_called()
+        self.assertEqual(seen["request"][1], "record:cname")
+        self.assertEqual(seen["request"][2]["canonical"], "target.example.net")
+
+    def test_dns_create_cname_warns_when_target_does_not_resolve_but_continues(self):
+        seen = {}
+
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                seen["request"] = (method, object_type, payload)
+                return "record:cname/example"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(
+                            ib.socket,
+                            "getaddrinfo",
+                            side_effect=ib.socket.gaierror("Name or service not known"),
+                        ):
+                            with patch.object(ib, "print_warning") as print_warning:
+                                with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                    ib.run_dns_create(
+                                        "cname",
+                                        "missing.example.net",
+                                        "www",
+                                        None,
+                                        None,
+                                        False,
+                                        None,
+                                    )
+
+        print_warning.assert_called_once()
+        warning = print_warning.call_args.args[0]
+        self.assertIn("WARNING: CNAME target missing.example.net does not resolve", warning)
+        self.assertIn("Record creation will continue", warning)
+        self.assertEqual(seen["request"][1], "record:cname")
+
+    def test_dns_create_non_cname_does_not_check_target_resolution(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                return "record:a/example"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib.socket, "getaddrinfo") as getaddrinfo:
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                ib.run_dns_create("a", "192.0.2.10", "app", None, None, False, None)
+
+        getaddrinfo.assert_not_called()
+
+    def test_dns_create_accepts_positional_name_ttl_and_comment_options(self):
         runner = CliRunner()
 
         with patch.object(ib, "run_dns_create") as run_dns_create:
@@ -243,7 +339,6 @@ class DefaultZoneTests(unittest.TestCase):
                     "dns",
                     "create",
                     "a",
-                    "-n",
                     "app",
                     "192.0.2.10",
                     "-t",
@@ -264,7 +359,27 @@ class DefaultZoneTests(unittest.TestCase):
             "Application VIP",
         )
 
-    def test_dns_create_bash_completion_suggests_short_name_after_type(self):
+    def test_dns_create_accepts_legacy_name_option(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_create") as run_dns_create:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "create", "a", "-n", "app", "192.0.2.10"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_create.assert_called_once_with(
+            "a",
+            "192.0.2.10",
+            "app",
+            None,
+            None,
+            False,
+            None,
+        )
+
+    def test_dns_create_bash_completion_no_longer_suggests_name_option_after_type(self):
         runner = CliRunner()
 
         result = runner.invoke(
@@ -279,8 +394,8 @@ class DefaultZoneTests(unittest.TestCase):
         )
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("plain,-n", result.output.splitlines())
-        self.assertIn("plain,--name", result.output.splitlines())
+        self.assertNotIn("plain,-n", result.output.splitlines())
+        self.assertNotIn("plain,--name", result.output.splitlines())
 
     def test_dns_create_rejects_non_integer_ttl(self):
         runner = CliRunner()
@@ -288,7 +403,7 @@ class DefaultZoneTests(unittest.TestCase):
         with patch.object(ib, "run_dns_create") as run_dns_create:
             result = runner.invoke(
                 ib.cli,
-                ["dns", "create", "a", "--name", "app", "192.0.2.10", "-t", "soon"],
+                ["dns", "create", "a", "app", "192.0.2.10", "-t", "soon"],
             )
 
         self.assertNotEqual(result.exit_code, 0)
@@ -311,7 +426,7 @@ class DefaultZoneTests(unittest.TestCase):
         with patch.object(ib, "run_dns_create") as run_dns_create:
             result = runner.invoke(
                 ib.cli,
-                ["dns", "create", "a", "--name", "app", "192.0.2.10", "-t", "-1"],
+                ["dns", "create", "a", "app", "192.0.2.10", "-t", "-1"],
             )
 
         self.assertNotEqual(result.exit_code, 0)
@@ -324,7 +439,7 @@ class DefaultZoneTests(unittest.TestCase):
         with patch.object(ib, "run_dns_create") as run_dns_create:
             result = runner.invoke(
                 ib.cli,
-                ["dns", "create", "a", "--name", "app", "192.0.2.10", "-c", "bad|comment"],
+                ["dns", "create", "a", "app", "192.0.2.10", "-c", "bad|comment"],
             )
 
         self.assertNotEqual(result.exit_code, 0)
@@ -345,7 +460,8 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertIsNotNone(help_text)
         self.assertIn("Create Record Usage", help_text)
-        self.assertIn("-n, --name TEXT", help_text)
+        self.assertIn("NAME VALUE", help_text)
+        self.assertNotIn("-n, --name TEXT", help_text)
         self.assertIn("--zone TEXT", help_text)
         self.assertIn("-t, --ttl INTEGER", help_text)
         self.assertIn("--noptr", help_text)
@@ -424,7 +540,7 @@ class DefaultZoneTests(unittest.TestCase):
         context = caught.exception.context
         self.assertEqual(context["record_type"], "a")
         self.assertEqual(context["value"], "192.0.2.10")
-        self.assertEqual(context["--name"], "app")
+        self.assertEqual(context["name"], "app")
         self.assertEqual(context["--zone"], "example.com")
         self.assertEqual(context["target_record"], "app.example.com")
         self.assertEqual(context["resolved_zone"], "example.com")
@@ -435,12 +551,12 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(context["-c/--comment"], "Application VIP")
         self.assertEqual(context["wapi_object"], "record:a")
 
-        test_console = ib.Console(width=120, force_terminal=False)
+        test_console = ib.Console(width=180, force_terminal=False)
         with test_console.capture() as capture:
             test_console.print(ib.dns_create_error_context_panel(context))
         output = capture.get()
         for expected in (
-            "--name",
+            "name",
             "--zone",
             "target record",
             "Context",
@@ -449,7 +565,6 @@ class DefaultZoneTests(unittest.TestCase):
             "-t/--ttl",
             "--noptr",
             "-c/--comment",
-            "-n/--name",
         ):
             self.assertIn(expected, output)
 
@@ -492,17 +607,48 @@ class DefaultZoneTests(unittest.TestCase):
         context = caught.exception.context
         self.assertEqual(context["target_record"], "test.latrobe-test.edu.au")
         self.assertEqual(context["resolved_zone"], "latrobe-test.edu.au")
+        self.assertEqual(
+            context["hints"],
+            [
+                "Infoblox rejected the A record because IP address 10.1.1.1 is not allowed "
+                "for DNS zone latrobe-test.edu.au.",
+                "Use an IP associated with that zone.",
+                "Choose the correct zone with --zone or a fully qualified name.",
+                "Update the zone network association in Infoblox.",
+                "Run `ib dns zone view latrobe-test.edu.au` to view the network association "
+                "for this zone.",
+            ],
+        )
         self.assertIn("IP address 10.1.1.1", context["hint"])
         self.assertIn("DNS zone latrobe-test.edu.au", context["hint"])
-        self.assertIn("--zone or a fully qualified -n name", context["hint"])
+        self.assertIn("--zone or a fully qualified name", context["hint"])
+        self.assertIn(
+            "Run `ib dns zone view latrobe-test.edu.au` to view the network association",
+            context["hint"],
+        )
+        self.assertEqual(
+            str(ib.dns_create_error_hint_value(context["hints"])),
+            "- Infoblox rejected the A record because IP address 10.1.1.1 is not allowed "
+            "for DNS zone latrobe-test.edu.au.\n"
+            "- Use an IP associated with that zone.\n"
+            "- Choose the correct zone with --zone or a fully qualified name.\n"
+            "- Update the zone network association in Infoblox.\n"
+            "- Run `ib dns zone view latrobe-test.edu.au` to view the network association "
+            "for this zone.",
+        )
 
-        test_console = ib.Console(width=120, force_terminal=False)
+        test_console = ib.Console(width=180, force_terminal=False)
         with test_console.capture() as capture:
             test_console.print(ib.dns_create_error_context_panel(context))
         output = capture.get()
-        self.assertIn("Hint", output)
+        self.assertIn("Hints", output)
         self.assertIn("target record", output)
         self.assertIn("test.latrobe-test.edu.au", output)
+        self.assertIn("- Use an IP associated with that zone.", output)
+        self.assertIn("- Choose the correct zone with --zone or a fully qualified name.", output)
+        self.assertIn("- Update the zone network association in Infoblox.", output)
+        self.assertIn("ib dns zone view latrobe-test.edu.au", output)
+        self.assertIn("network association", output)
 
     def test_dns_create_rejects_invalid_comment_characters(self):
         class FakeClient:
@@ -645,6 +791,30 @@ class DefaultZoneTests(unittest.TestCase):
 
         run_prewarm.assert_called_once_with()
 
+    def test_clear_dns_cache_removes_search_and_completion_cache(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / "allrecords-cache"
+            cache_dir.mkdir()
+            (cache_dir / "cache.sqlite3").write_text("cache", encoding="utf-8")
+            (cache_dir / "legacy.json").write_text("cache", encoding="utf-8")
+            zone_cache = Path(tmpdir) / "zone-completion-cache.json"
+            zone_cache.write_text("cache", encoding="utf-8")
+
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", cache_dir):
+                with patch.object(ib, "ZONE_COMPLETION_CACHE_FILE", zone_cache):
+                    ib.clear_dns_cache()
+
+            self.assertFalse(cache_dir.exists())
+            self.assertFalse(zone_cache.exists())
+
+    def test_refresh_dns_cache_after_update_clears_then_warms_in_background(self):
+        with patch.object(ib, "clear_dns_cache") as clear_cache:
+            with patch.object(ib, "start_search_cache_prewarm") as start_prewarm:
+                ORIGINAL_REFRESH_DNS_CACHE_AFTER_UPDATE()
+
+        clear_cache.assert_called_once_with()
+        start_prewarm.assert_called_once_with()
+
     def test_search_cache_prewarm_missing_config_exits_without_lock(self):
         with patch.object(ib, "load_config", return_value=None):
             with patch.object(ib, "acquire_search_cache_prewarm_lock") as acquire_lock:
@@ -695,6 +865,265 @@ class DefaultZoneTests(unittest.TestCase):
         warm_zone.assert_called_once_with(client, zones[0])
         release_lock.assert_called_once_with((123, "token"))
 
+    def test_dns_delete_completion_searches_global_records(self):
+        class FakeClient:
+            view = "corp"
+
+        client = FakeClient()
+        records = [
+            (
+                "a",
+                {
+                    "type": "record:a",
+                    "name": "app.example.com",
+                    "zone": "example.com",
+                    "address": "192.0.2.10",
+                    "comment": "web",
+                },
+            ),
+            (
+                "cname",
+                {
+                    "type": "record:cname",
+                    "name": "www.other.example.net",
+                    "zone": "other.example.net",
+                    "record": {"canonical": "app.example.com"},
+                },
+            ),
+            (
+                "ptr",
+                {
+                    "type": "record:ptr",
+                    "name": "10.2.0.192.in-addr.arpa",
+                    "zone": "2.0.192.in-addr.arpa",
+                    "ipv4addr": "192.0.2.10",
+                    "ptrdname": "app.example.com",
+                },
+            ),
+        ]
+
+        with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+            with patch.object(ib, "InfobloxClient", return_value=client):
+                with patch.object(ib, "collect_dns_search_results", return_value=records) as collect:
+                    items = ib.complete_dns_delete_records(None, None, "app")
+
+        collect.assert_called_once_with(client, "app", False, None)
+        self.assertEqual([item.value for item in items], ["app.example.com", "www.other.example.net"])
+        self.assertNotIn("10.2.0.192.in-addr.arpa", [item.value for item in items])
+        self.assertIn("A", items[0].help)
+        self.assertIn("192.0.2.10", items[0].help)
+        self.assertIn("zone=example.com", items[0].help)
+        self.assertIn("web", items[0].help)
+
+    def test_dns_delete_completion_includes_ptr_command_without_reverse_records(self):
+        records = [
+            (
+                "ptr",
+                {
+                    "type": "record:ptr",
+                    "name": "3.1.168.192.in-addr.arpa",
+                    "zone": "1.168.192.in-addr.arpa",
+                    "ipv4addr": "192.168.1.3",
+                    "ptrdname": "host.example.com",
+                },
+            ),
+        ]
+
+        with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+            with patch.object(ib, "InfobloxClient"):
+                with patch.object(ib, "collect_dns_search_results", return_value=records):
+                    items = ib.complete_dns_delete_records(None, None, "p")
+
+        self.assertEqual([item.value for item in items], ["ptr"])
+        self.assertIn("full IP address", items[0].help)
+
+    def test_dns_delete_second_argument_does_not_complete_zones_for_ptr_mode(self):
+        class FakeContext:
+            params = {"record_name": "ptr"}
+
+        with patch.object(ib, "complete_zone_names") as complete_zone_names:
+            items = ib.complete_dns_delete_zone_or_ip(FakeContext(), None, "")
+
+        self.assertEqual(items, [])
+        complete_zone_names.assert_not_called()
+
+    def test_dns_delete_accepts_completed_fqdn_without_active_zone(self):
+        class FakeClient:
+            view = "corp"
+
+            def __init__(self):
+                self.deleted_ref = None
+
+            def request(self, method, object_type, payload=None, params=None):
+                if method == "DELETE":
+                    self.deleted_ref = object_type
+                    return None
+                raise AssertionError("run_dns_delete should use patched safe_query for GET requests")
+
+        client = FakeClient()
+        queries = []
+
+        def fake_safe_query(client, object_type, params):
+            queries.append((object_type, params["name"]))
+            if object_type == "record:a" and params["name"] == "app.other.example.net":
+                return [
+                    {
+                        "_ref": "record:a/app",
+                        "name": "app.other.example.net",
+                        "zone": "other.example.net",
+                        "ipv4addr": "192.0.2.10",
+                    }
+                ]
+            return []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            with patch.object(ib, "print_success"):
+                                ib.run_dns_delete("app.other.example.net", None)
+
+        self.assertEqual(client.deleted_ref, "record:a/app")
+        self.assertTrue(all(name == "app.other.example.net" for _object_type, name in queries))
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_delete_no_match_for_ip_suggests_ptr_delete_command(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", return_value=[]):
+                            with self.assertRaises(ib.CliError) as caught:
+                                ib.run_dns_delete("192.168.1.3", None)
+
+        message = str(caught.exception)
+        self.assertIn("ERROR: no forward DNS record found", message)
+        self.assertIn("HINT:", message)
+        self.assertIn("ib dns delete ptr 192.168.1.3", message)
+        self.cache_refresh.assert_not_called()
+
+    def test_dns_delete_no_match_for_name_suggests_ptr_delete_form(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", return_value=[]):
+                            with self.assertRaises(ib.CliError) as caught:
+                                ib.run_dns_delete("missing", None)
+
+        message = str(caught.exception)
+        self.assertIn("ERROR: no forward DNS record found", message)
+        self.assertIn("ib dns delete ptr <ip-address>", message)
+        self.cache_refresh.assert_not_called()
+
+    def test_dns_delete_ptr_deletes_reverse_record_by_ip_address(self):
+        class FakeClient:
+            view = "corp"
+
+            def __init__(self):
+                self.deleted_ref = None
+
+            def request(self, method, object_type, payload=None, params=None):
+                if method == "DELETE":
+                    self.deleted_ref = object_type
+                    return None
+                raise AssertionError("run_dns_delete_ptr should use patched safe_query for GET requests")
+
+        client = FakeClient()
+        seen_params = {}
+
+        def fake_safe_query(client, object_type, params):
+            seen_params.update(params)
+            self.assertEqual(object_type, "record:ptr")
+            return [
+                {
+                    "_ref": "record:ptr/reverse",
+                    "ipv4addr": "192.168.1.3",
+                    "ptrdname": "host.example.com",
+                    "zone": "1.168.192.in-addr.arpa",
+                }
+            ]
+
+        zones = [
+            {"fqdn": "168.192.in-addr.arpa", "zone_format": "IPV4"},
+            {"fqdn": "1.168.192.in-addr.arpa", "zone_format": "IPV4"},
+            {"fqdn": "example.com", "zone_format": "FORWARD"},
+        ]
+
+        with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+            with patch.object(ib, "InfobloxClient", return_value=client):
+                with patch.object(ib, "query_zones", return_value=zones) as query_zones:
+                    with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                        with patch.object(ib, "print_success") as print_success:
+                            ib.run_dns_delete("ptr", "192.168.1.3")
+
+        query_zones.assert_called_once_with(client)
+        self.assertEqual(seen_params["ipv4addr"], "192.168.1.3")
+        self.assertEqual(client.deleted_ref, "record:ptr/reverse")
+        print_success.assert_called_once_with(
+            "SUCCESS: deleted PTR record 192.168.1.3 from reverse zone 1.168.192.in-addr.arpa"
+        )
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_delete_ptr_requires_full_ip_address(self):
+        with self.assertRaisesRegex(ib.CliError, "Use: ib dns delete ptr <ip-address>"):
+            ib.run_dns_delete("ptr", None)
+
+        with self.assertRaisesRegex(ib.CliError, "Use: ib dns delete ptr <ip-address>"):
+            ib.run_dns_delete("ptr", "192.168.1.0/24")
+
+    def test_dns_zone_create_refreshes_cache_after_success(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                self.request_args = (method, object_type, payload)
+                return "zone_auth/example"
+
+        client = FakeClient()
+        with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+            with patch.object(ib, "InfobloxClient", return_value=client):
+                with patch.object(ib, "print_success"):
+                    with patch.object(ib, "print_note"):
+                        ib.run_dns_zone_create("example.com", "FORWARD", None, None)
+
+        self.assertEqual(client.request_args[0], "POST")
+        self.assertEqual(client.request_args[1], ib.ZONE_OBJECT)
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_zone_delete_refreshes_cache_after_success(self):
+        class FakeClient:
+            view = "corp"
+
+            def __init__(self):
+                self.deleted_ref = None
+
+            def request(self, method, object_type, payload=None, params=None):
+                if method == "DELETE":
+                    self.deleted_ref = object_type
+                    return None
+                raise AssertionError("run_dns_zone_delete should use patched safe_query for GET requests")
+
+        client = FakeClient()
+        with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+            with patch.object(ib, "InfobloxClient", return_value=client):
+                with patch.object(ib, "safe_query", return_value=[{"_ref": "zone_auth/example"}]):
+                    with patch.object(ib, "print_success"):
+                        ib.run_dns_zone_delete("example.com")
+
+        self.assertEqual(client.deleted_ref, "zone_auth/example")
+        self.cache_refresh.assert_called_once_with()
+
     def test_usage_help_includes_current_view_and_active_zone(self):
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
             with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
@@ -726,7 +1155,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("example.com", result.output)
         self.assertIn("Without --zone", result.output)
         self.assertIn("Example", result.output)
-        self.assertIn("-n app", result.output)
+        self.assertIn("app 192.0.2.10", result.output)
         self.assertIn("Command:", result.output)
         self.assertIn("Creates:", result.output)
         self.assertIn("A record", result.output)

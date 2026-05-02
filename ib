@@ -10,6 +10,8 @@ import ipaddress
 import json
 import os
 import re
+import shutil
+import socket
 import sqlite3
 import ssl
 import subprocess
@@ -57,6 +59,7 @@ SESSION_ZONE_FILE_PREFIX = "active-zone-session"
 ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
 ZONE_COMPLETION_CACHE_TTL = 300
 ALLRECORDS_CACHE_DIR = CONFIG_DIR / "allrecords-cache"
+DNS_DELETE_COMPLETION_LIMIT = 100
 COMPLETION_SHELLS = ("bash", "zsh", "fish")
 ALLRECORDS_OBJECT = "allrecords"
 ALLRECORDS_RETURN_FIELDS = "name,type,view,zone,ttl,comment,address,record"
@@ -707,7 +710,7 @@ def dns_create_example_text(zone_name: str | None) -> Text:
     return Text.assemble(
         ("Command: ", "bold yellow"),
         ("ib dns create a ", "bold white"),
-        ("-n app", "bold cyan"),
+        ("app", "bold cyan"),
         (" 192.0.2.10 ", "bold blue"),
         ("-t 300 ", "bold cyan"),
         ("-c ", "bold cyan"),
@@ -741,7 +744,7 @@ def dns_create_usage_panel() -> Panel:
         Text.assemble(
             ("ib dns create ", "bold white"),
             ("<type>", "bold yellow"),
-            (" -n|--name ", "white"),
+            (" ", "white"),
             ("<name>", "bold green"),
             (" ", "white"),
             ("<value>", "bold blue"),
@@ -761,7 +764,7 @@ def dns_create_usage_panel() -> Panel:
     if zone_name:
         target_text = Text.assemble(
             ("Without --zone, ", "white"),
-            ("-n app", "bold cyan"),
+            ("app", "bold cyan"),
             (" creates ", "white"),
             (f"app.{zone_name}", "bold green"),
             (".", "white"),
@@ -1064,6 +1067,33 @@ def create_payload(
     return object_type, payload
 
 
+def cname_target_for_resolution(value: str) -> str:
+    return value.strip().rstrip(".")
+
+
+def warn_if_cname_target_unresolved(record_type: str, value: str) -> None:
+    if record_type.lower() != "cname":
+        return
+
+    target = cname_target_for_resolution(value)
+    if not target:
+        print_warning("WARNING: CNAME target is empty; DNS resolution check was skipped.")
+        return
+
+    try:
+        socket.getaddrinfo(target, None)
+    except socket.gaierror as exc:
+        print_warning(
+            f"WARNING: CNAME target {target} does not resolve from this system: {exc}. "
+            "Record creation will continue."
+        )
+    except OSError as exc:
+        print_warning(
+            f"WARNING: CNAME target {target} could not be checked from this system: {exc}. "
+            "Record creation will continue."
+        )
+
+
 def dns_create_target_name(name: str, resolved_zone: str | None) -> str | None:
     if not resolved_zone:
         return None
@@ -1073,9 +1103,9 @@ def dns_create_target_name(name: str, resolved_zone: str | None) -> str | None:
         return None
 
 
-def dns_create_error_hint(error_message: str | None, context: dict[str, Any]) -> str | None:
+def dns_create_error_hints(error_message: str | None, context: dict[str, Any]) -> list[str]:
     if not error_message:
-        return None
+        return []
 
     network_match = re.search(
         r"The IP address (?P<ip>\S+) cannot be used for the zone (?P<zone>.+?)\. "
@@ -1086,15 +1116,25 @@ def dns_create_error_hint(error_message: str | None, context: dict[str, Any]) ->
     if network_match:
         ip_address = network_match.group("ip")
         zone_name = network_match.group("zone")
+        selected_zone = str(context.get("resolved_zone") or zone_name)
         record_type = str(context.get("record_type") or "record").upper()
-        return (
+        return [
             f"Infoblox rejected the {record_type} record because IP address {ip_address} is not "
-            f"allowed for DNS zone {zone_name}. Use an IP associated with that zone, choose the "
-            "correct zone with --zone or a fully qualified -n name, or update the zone network "
-            "association in Infoblox."
-        )
+            f"allowed for DNS zone {zone_name}.",
+            "Use an IP associated with that zone.",
+            "Choose the correct zone with --zone or a fully qualified name.",
+            "Update the zone network association in Infoblox.",
+            f"Run `ib dns zone view {selected_zone}` to view the network association for this zone.",
+        ]
 
-    return None
+    return []
+
+
+def dns_create_error_hint(error_message: str | None, context: dict[str, Any]) -> str | None:
+    hints = dns_create_error_hints(error_message, context)
+    if not hints:
+        return None
+    return "\n".join(hints)
 
 
 def dns_create_error_context(
@@ -1117,7 +1157,7 @@ def dns_create_error_context(
     context = {
         "record_type": record_type,
         "value": value,
-        "--name": name,
+        "name": name,
         "--zone": zone,
         "target_record": dns_create_target_name(name, resolved_zone),
         "view": context_status["view"],
@@ -1131,9 +1171,10 @@ def dns_create_error_context(
         "-c/--comment": comment,
         "wapi_object": object_type,
     }
-    hint = dns_create_error_hint(error_message, context)
-    if hint:
-        context["hint"] = hint
+    hints = dns_create_error_hints(error_message, context)
+    if hints:
+        context["hints"] = hints
+        context["hint"] = "\n".join(hints)
     return context
 
 
@@ -1145,6 +1186,35 @@ def dns_create_error_value(value: Any) -> Text:
     return Text(str(value).replace("\n", "\\n"), style="white")
 
 
+def dns_create_error_hint_lines(value: Any) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        raw_lines = [str(item) for item in value]
+    else:
+        raw_lines = str(value).splitlines()
+
+    lines = []
+    for line in raw_lines:
+        hint = line.strip()
+        if not hint:
+            continue
+        if hint.startswith(("- ", "* ")):
+            hint = hint[2:].strip()
+        lines.append(hint)
+    return lines
+
+
+def dns_create_error_hint_value(value: Any) -> Text:
+    text = Text()
+    for index, hint in enumerate(dns_create_error_hint_lines(value)):
+        if index:
+            text.append("\n")
+        text.append("- ", style="bold yellow")
+        text.append(hint, style="white")
+    return text
+
+
 def dns_create_error_context_panel(context: dict[str, Any]) -> Panel:
     table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Field", style="bold cyan", no_wrap=True)
@@ -1153,7 +1223,7 @@ def dns_create_error_context_panel(context: dict[str, Any]) -> Panel:
     rows = (
         ("record type", "record_type"),
         ("value", "value"),
-        ("-n/--name", "--name"),
+        ("name", "name"),
         ("--zone", "--zone"),
         ("target record", "target_record"),
         ("Context", "dns_context"),
@@ -1168,8 +1238,9 @@ def dns_create_error_context_panel(context: dict[str, Any]) -> Panel:
             table.add_row(label, dns_context_line_text(context))
         else:
             table.add_row(label, dns_create_error_value(context.get(key)))
-    if context.get("hint"):
-        table.add_row("Hint", dns_create_error_value(context.get("hint")))
+    hints = context.get("hints") or context.get("hint")
+    if hints:
+        table.add_row("Hints", dns_create_error_hint_value(hints))
 
     return Panel(
         table,
@@ -1201,6 +1272,7 @@ def run_dns_create(
         client = InfobloxClient(config)
         view = getattr(client, "view", config.get("dns_view", "default"))
         resolved_zone = resolve_dns_create_zone(config, client, record_type, name, zone)
+        warn_if_cname_target_unresolved(record_type, value)
         object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
         ref = client.request("POST", object_type, payload=payload)
     except CliError as exc:
@@ -1221,6 +1293,7 @@ def run_dns_create(
         raise DnsCreateError(error_message, context) from exc
     if noptr and record_type.lower() not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
+    refresh_dns_cache_after_update()
     print_success(f"SUCCESS: created {record_type.upper()} record")
     print_note(f"Reference: {ref}")
 
@@ -1421,6 +1494,23 @@ def allrecords_cache_db_file() -> Path:
 
 def search_cache_prewarm_lock_file() -> Path:
     return ALLRECORDS_CACHE_DIR / "prewarm.lock"
+
+
+def clear_dns_cache() -> None:
+    try:
+        if ALLRECORDS_CACHE_DIR.is_dir():
+            shutil.rmtree(ALLRECORDS_CACHE_DIR)
+        else:
+            ALLRECORDS_CACHE_DIR.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    try:
+        ZONE_COMPLETION_CACHE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
 
 
 def zone_serial_cache_key(client: InfobloxClient) -> str:
@@ -2264,6 +2354,11 @@ def start_search_cache_prewarm() -> None:
         return
 
 
+def refresh_dns_cache_after_update() -> None:
+    clear_dns_cache()
+    start_search_cache_prewarm()
+
+
 def run_dns_search(
     keyword: str,
     case_sensitive: bool = False,
@@ -2283,18 +2378,151 @@ def run_dns_search(
     console.print(record_table(records))
 
 
-def run_dns_delete(record_name: str, zone: str | None) -> None:
-    config = load_config()
-    client = InfobloxClient(config)
-    target = fqdn(record_name, resolve_dns_zone(config, zone))
-    matches: list[tuple[str, dict[str, Any]]] = []
+def ptr_delete_ip_address(ip_value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    if not ip_value:
+        raise CliError("ERROR: full IP address is required. Use: ib dns delete ptr <ip-address>")
+    try:
+        return ipaddress.ip_address(ip_value.strip())
+    except ValueError:
+        raise CliError("ERROR: full IP address is required. Use: ib dns delete ptr <ip-address>")
 
-    for record_type, spec in RECORD_TYPES.items():
-        params = object_query_params(spec, client, {"name": target})
-        matches.extend((record_type, item) for item in safe_query(client, spec["object"], params))
+
+def reverse_zone_format_for_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    return "IPV4" if address.version == 4 else "IPV6"
+
+
+def reverse_zone_for_ip(
+    client: InfobloxClient,
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> str:
+    reverse_pointer = address.reverse_pointer.rstrip(".")
+    expected_format = reverse_zone_format_for_ip(address)
+    matches: set[str] = set()
+
+    for zone in query_zones(client):
+        zone_name = str(zone.get("fqdn", "")).strip()
+        if not zone_name:
+            continue
+        zone_format = str(zone.get("zone_format", "")).strip().upper()
+        if zone_format and zone_format != expected_format:
+            continue
+        try:
+            normalized_zone = normalize_zone_name(zone_name)
+        except CliError:
+            continue
+        if is_zone_or_child(reverse_pointer, normalized_zone):
+            matches.add(normalized_zone)
 
     if not matches:
-        raise CliError(f"ERROR: no DNS record found for {target} in view {client.view}")
+        raise CliError(
+            f"ERROR: no {expected_format} reverse DNS zone found for {address} in view {client.view}"
+        )
+    return sorted(matches, key=lambda zone_name: (-len(zone_name), zone_name.lower()))[0]
+
+
+def ptr_address_query_field(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    return "ipv4addr" if address.version == 4 else "ipv6addr"
+
+
+def ptr_record_matches_reverse_zone(item: dict[str, Any], reverse_zone: str) -> bool:
+    item_zone = str(item.get("zone", "")).strip()
+    if not item_zone:
+        return True
+    try:
+        return normalize_zone_name(item_zone) == reverse_zone
+    except CliError:
+        return False
+
+
+def run_dns_delete_ptr(ip_value: str | None) -> None:
+    address = ptr_delete_ip_address(ip_value)
+    config = load_config()
+    client = InfobloxClient(config)
+    reverse_zone = reverse_zone_for_ip(client, address)
+    spec = RECORD_TYPES["ptr"]
+    params = object_query_params(spec, client, {ptr_address_query_field(address): str(address)})
+    raw_matches = safe_query(client, spec["object"], params)
+    matches = [
+        ("ptr", item)
+        for item in raw_matches
+        if ptr_record_matches_reverse_zone(item, reverse_zone)
+    ]
+
+    if not matches:
+        raise CliError(
+            f"ERROR: no PTR record found for {address} in reverse zone {reverse_zone} "
+            f"and view {client.view}"
+        )
+    if len(matches) > 1:
+        print_error(
+            f"ERROR: multiple PTR records found for {address} in reverse zone {reverse_zone}. "
+            "Delete one of these _ref values manually:"
+        )
+        err_console.print(record_table(matches, include_ref=True))
+        raise CliError("ERROR: delete target is ambiguous.")
+
+    item = matches[0][1]
+    ref = item.get("_ref")
+    if not ref:
+        raise CliError("ERROR: matched PTR record does not include an _ref.")
+    client.request("DELETE", ref)
+    refresh_dns_cache_after_update()
+    print_success(f"SUCCESS: deleted PTR record {address} from reverse zone {reverse_zone}")
+
+
+def dns_delete_reverse_entry_hint(record_name: str) -> str:
+    try:
+        address = ipaddress.ip_address(record_name.strip().rstrip("."))
+    except ValueError:
+        return "HINT: To delete a reverse DNS PTR entry, run: ib dns delete ptr <ip-address>"
+    return f"HINT: To delete the reverse DNS PTR entry for {address}, run: ib dns delete ptr {address}"
+
+
+def run_dns_delete(record_name: str, zone: str | None) -> None:
+    if record_name.strip().lower() == "ptr":
+        run_dns_delete_ptr(zone)
+        return
+
+    config = load_config()
+    client = InfobloxClient(config)
+    record_name = record_name.strip().rstrip(".")
+    if zone:
+        targets = [fqdn(record_name, resolve_dns_zone(config, zone))]
+    else:
+        targets = [record_name] if "." in record_name else []
+    matches: list[tuple[str, dict[str, Any]]] = []
+    target = targets[0] if targets else record_name
+
+    for candidate in targets:
+        candidate_matches: list[tuple[str, dict[str, Any]]] = []
+        for record_type, spec in RECORD_TYPES.items():
+            if record_type == "ptr":
+                continue
+            params = object_query_params(spec, client, {"name": candidate})
+            candidate_matches.extend((record_type, item) for item in safe_query(client, spec["object"], params))
+        if candidate_matches:
+            target = candidate
+            matches = candidate_matches
+            break
+
+    if not matches and not zone:
+        active_target = fqdn(record_name, resolve_dns_zone(config))
+        if active_target not in targets:
+            targets.append(active_target)
+            for record_type, spec in RECORD_TYPES.items():
+                if record_type == "ptr":
+                    continue
+                params = object_query_params(spec, client, {"name": active_target})
+                matches.extend((record_type, item) for item in safe_query(client, spec["object"], params))
+            if matches:
+                target = active_target
+
+    if not matches:
+        target_description = " or ".join(targets)
+        raise CliError(
+            f"ERROR: no forward DNS record found for {target_description} in view {client.view}\n"
+            f"{dns_delete_reverse_entry_hint(record_name)}"
+        )
     if len(matches) > 1:
         print_error(f"ERROR: multiple records found for {target}. Delete one of these _ref values manually:")
         err_console.print(record_table(matches, include_ref=True))
@@ -2305,6 +2533,7 @@ def run_dns_delete(record_name: str, zone: str | None) -> None:
     if not ref:
         raise CliError("ERROR: matched record does not include an _ref.")
     client.request("DELETE", ref)
+    refresh_dns_cache_after_update()
     print_success(f"SUCCESS: deleted {record_type.upper()} record {target}")
 
 
@@ -2326,6 +2555,7 @@ def run_dns_zone_create(
         payload["ns_group"] = ns_group
 
     ref = client.request("POST", ZONE_OBJECT, payload=payload)
+    refresh_dns_cache_after_update()
     print_success(f"SUCCESS: created DNS zone {payload['fqdn']}")
     print_note(f"Reference: {ref}")
 
@@ -2408,6 +2638,7 @@ def run_dns_zone_delete(zone_name: str) -> None:
     if not ref:
         raise CliError("ERROR: matched zone does not include an _ref.")
     client.request("DELETE", ref)
+    refresh_dns_cache_after_update()
     print_success(f"SUCCESS: deleted DNS zone {target}")
 
 
@@ -2416,6 +2647,29 @@ def run_dns_zone_use(zone_name: str) -> None:
     write_session_zone(default_zone)
     print_success(f"SUCCESS: active DNS zone set to {default_zone}")
     print_note("This applies to the current shell session only.")
+
+
+def parse_dns_create_name_value(
+    args: tuple[str, ...],
+    name_option: str | None,
+) -> tuple[str, str]:
+    ctx = click.get_current_context(silent=True)
+    usage_hint = "Use: ib dns create <type> <name> <value>"
+
+    if name_option:
+        if len(args) != 1:
+            raise click.UsageError(
+                f"Expected VALUE when using -n/--name. {usage_hint}",
+                ctx=ctx,
+            )
+        return name_option, args[0]
+
+    if len(args) != 2:
+        raise click.UsageError(
+            f"Expected NAME and VALUE after the record type. {usage_hint}",
+            ctx=ctx,
+        )
+    return args[0], args[1]
 
 
 def zone_names_from_results(zones: list[dict[str, Any]]) -> list[str]:
@@ -2495,23 +2749,6 @@ def complete_zone_names(
     return filter_zone_names(names, incomplete)
 
 
-def complete_dns_create_value(
-    ctx: click.Context,
-    param: click.Parameter,
-    incomplete: str,
-) -> list[CompletionItem]:
-    if ctx.params.get("name"):
-        return []
-
-    name_options = (
-        CompletionItem("-n", help="Record name, relative to --zone unless already FQDN."),
-        CompletionItem("--name", help="Record name, relative to --zone unless already FQDN."),
-    )
-    if incomplete:
-        return [item for item in name_options if item.value.startswith(incomplete)]
-    return list(name_options)
-
-
 def format_record(record_type: str, item: dict[str, Any]) -> str:
     value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
     value = next((str(item[key]) for key in value_keys if key in item), "")
@@ -2589,6 +2826,65 @@ def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = 
             row.append(str(item.get("_ref", "")))
         table.add_row(*row)
     return table
+
+
+def dns_delete_completion_help(record_type: str, item: dict[str, Any]) -> str:
+    parts = [record_type.upper()]
+    value = record_value(record_type, item)
+    zone = str(item.get("zone", ""))
+    comment = str(item.get("comment", ""))
+    if value:
+        parts.append(value)
+    if zone:
+        parts.append(f"zone={zone}")
+    if comment:
+        parts.append(comment)
+    return " | ".join(parts)
+
+
+def dns_delete_ptr_completion(incomplete: str) -> list[CompletionItem]:
+    if "ptr".startswith(incomplete.lower()):
+        return [CompletionItem("ptr", help="Delete PTR record by full IP address")]
+    return []
+
+
+def complete_dns_delete_records(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[CompletionItem]:
+    items = dns_delete_ptr_completion(incomplete)
+    try:
+        config = load_config(required=False)
+        if not config:
+            return items
+        client = InfobloxClient(config)
+        records = collect_dns_search_results(client, incomplete.strip(), False, None)
+    except (CliError, OSError, ValueError, sqlite3.Error):
+        return items
+
+    seen: set[str] = {str(item.value) for item in items}
+    for record_type, item in records:
+        if record_type.lower().endswith("ptr"):
+            continue
+        name = record_name(item).strip().rstrip(".")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        items.append(CompletionItem(name, help=dns_delete_completion_help(record_type, item)))
+        if len(items) >= DNS_DELETE_COMPLETION_LIMIT:
+            break
+    return items
+
+
+def complete_dns_delete_zone_or_ip(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    if str(ctx.params.get("record_name", "")).strip().lower() == "ptr":
+        return []
+    return complete_zone_names(ctx, param, incomplete)
 
 
 def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
@@ -2701,7 +2997,7 @@ def cli() -> None:
       ib dns zone list
       ib dns zone use example.com
       ib dns search app
-      ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
+      ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"
       ib dns delete app
 
     Use `ib dns --help`, `ib dns create --help`, and `ib dns zone --help` for
@@ -2803,9 +3099,9 @@ def dns() -> None:
     Examples:
       ib dns search app
       ib dns search -g app
-      ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
-      ib dns create host -n app 192.0.2.10 -t 300
-      ib dns create cname -n www app.example.com
+      ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"
+      ib dns create host app 192.0.2.10 -t 300
+      ib dns create cname www app.example.com
       ib dns delete app
     """
 
@@ -2901,8 +3197,8 @@ def zone_use(zone_name: str) -> None:
 
 @dns.command(cls=DnsCreateCommand)
 @click.argument("record_type", type=click.Choice(sorted(RECORD_TYPES), case_sensitive=False))
-@click.option("-n", "--name", required=True, help="Record name, relative to --zone unless already FQDN.")
-@click.argument("value", shell_complete=complete_dns_create_value)
+@click.argument("args", nargs=-1, metavar="NAME VALUE")
+@click.option("-n", "--name", "name_option", hidden=True)
 @click.option(
     "--zone",
     help=f"DNS zone. Defaults to the session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
@@ -2912,8 +3208,8 @@ def zone_use(zone_name: str) -> None:
 @click.option("-c", "--comment", callback=validate_record_comment_option, help="Record comment.")
 def create(
     record_type: str,
-    value: str,
-    name: str,
+    args: tuple[str, ...],
+    name_option: str | None,
     zone: str | None,
     ttl: int | None,
     noptr: bool,
@@ -2927,21 +3223,22 @@ def create(
 
     \b
     Examples:
-      Command: ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
+      Command: ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"
       Creates: A app.<active-zone> -> 192.0.2.10 with TTL 300 and comment "Application VIP"
-      Command: ib dns create a -n host1.example-dns.com 192.0.2.10
+      Command: ib dns create a host1.example-dns.com 192.0.2.10
       Creates: A host1.example-dns.com -> 192.0.2.10 in zone example-dns.com when that forward zone exists
-      Command: ib dns create host -n app 192.0.2.10 -t 300 -c "Application host"
+      Command: ib dns create host app 192.0.2.10 -t 300 -c "Application host"
       Creates: HOST app.<active-zone> with IPv4 address 192.0.2.10, TTL 300, and comment "Application host"
-      Command: ib dns create cname -n www app.example.com
+      Command: ib dns create cname www app.example.com
       Creates: CNAME www.<active-zone> -> app.example.com
-      Command: ib dns create txt -n _spf "v=spf1 include:example.net -all"
+      Command: ib dns create txt _spf "v=spf1 include:example.net -all"
       Creates: TXT _spf.<active-zone> = "v=spf1 include:example.net -all"
-      Command: ib dns create mx -n @ "10 mail.example.com"
+      Command: ib dns create mx @ "10 mail.example.com"
       Creates: MX <active-zone> -> mail.example.com with preference 10
-      Command: ib dns create ptr -n 192.0.2.10 host.example.com
+      Command: ib dns create ptr 192.0.2.10 host.example.com
       Creates: PTR 192.0.2.10 -> host.example.com
     """
+    name, value = parse_dns_create_name_value(args, name_option)
     run_dns_create(record_type, value, name, zone, ttl, noptr, comment)
 
 
@@ -2963,14 +3260,15 @@ def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
 
 
 @dns.command()
-@click.argument("record_name")
-@click.argument("zone", required=False)
+@click.argument("record_name", shell_complete=complete_dns_delete_records)
+@click.argument("zone", required=False, shell_complete=complete_dns_delete_zone_or_ip)
 def delete(record_name: str, zone: str | None) -> None:
     """Delete a DNS record by name.
 
-    The optional zone argument uses the same fallback rules as create. If the
-    record name matches multiple records, ib prints the ambiguous matches and
-    exits without deleting.
+    The optional zone argument uses the same fallback rules as create. Use
+    `ib dns delete ptr <ip-address>` to delete a PTR record by full IP address.
+    If the record name matches multiple records, ib prints the ambiguous
+    matches and exits without deleting.
     """
     run_dns_delete(record_name, zone)
 

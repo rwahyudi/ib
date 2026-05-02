@@ -70,7 +70,7 @@ ib configure
 ib dns zone list
 ib dns zone use example.com
 ib dns search app
-ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
+ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"
 ib dns delete app
 ```
 
@@ -78,9 +78,10 @@ Command overview:
 
 - `ib configure` creates or updates Infoblox connection settings.
 - `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
-- `ib dns create <type> -n|--name <name> <value>` creates DNS records.
+- `ib dns create <type> <name> <value>` creates DNS records.
 - `ib dns search [-g] [-i] <keyword>` searches records by name, value, or comment.
-- `ib dns delete <record-name> [zone]` deletes a single matching DNS record.
+- `ib dns delete <record-name> [zone]` deletes a single matching forward DNS record.
+- `ib dns delete ptr <ip-address>` deletes a reverse DNS PTR record by full IP address.
 - `ib dns zone list [keyword]` lists authoritative zones in the configured view.
 - `ib dns zone view <zone>` shows zone details, network associations, and SOA settings.
 - `ib dns zone create <zone> [--format FORWARD|IPV4|IPV6]` creates a zone.
@@ -123,40 +124,45 @@ Record names are relative to the active zone unless already fully qualified.
 Use `-t` or `--ttl` for record TTL, and `-c` or `--comment` for a plain ASCII
 comment.
 
-For forward records, a fully qualified `-n` or `--name` can select its zone
+For forward records, a fully qualified name can select its zone
 automatically. For example, if `example-dns.com` exists as a forward zone,
-`-n host1.example-dns.com` uses `example-dns.com`; if no forward zone
+`host1.example-dns.com` uses `example-dns.com`; if no forward zone
 matches, `ib` falls back to the active/default zone.
 
 Assuming the active zone is `example.com`, these commands produce:
 
 | Command | Record produced |
 | --- | --- |
-| `ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"` | `A app.example.com -> 192.0.2.10`, TTL `300`, comment `Application VIP` |
-| `ib dns create a -n host1.example-dns.com 192.0.2.10` | `A host1.example-dns.com -> 192.0.2.10` in zone `example-dns.com` when that forward zone exists |
-| `ib dns create host -n app 192.0.2.10 -t 300 -c "Application host"` | `HOST app.example.com` with IPv4 address `192.0.2.10`, TTL `300`, comment `Application host` |
-| `ib dns create aaaa -n app 2001:db8::10 --ttl 300` | `AAAA app.example.com -> 2001:db8::10`, TTL `300` |
-| `ib dns create cname -n www app.example.com` | `CNAME www.example.com -> app.example.com` |
-| `ib dns create txt -n _spf "v=spf1 include:example.net -all"` | `TXT _spf.example.com = "v=spf1 include:example.net -all"` |
-| `ib dns create mx -n @ "10 mail.example.com"` | `MX example.com -> mail.example.com` with preference `10` |
-| `ib dns create ptr -n 192.0.2.10 host.example.com` | `PTR 192.0.2.10 -> host.example.com` |
+| `ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"` | `A app.example.com -> 192.0.2.10`, TTL `300`, comment `Application VIP` |
+| `ib dns create a host1.example-dns.com 192.0.2.10` | `A host1.example-dns.com -> 192.0.2.10` in zone `example-dns.com` when that forward zone exists |
+| `ib dns create host app 192.0.2.10 -t 300 -c "Application host"` | `HOST app.example.com` with IPv4 address `192.0.2.10`, TTL `300`, comment `Application host` |
+| `ib dns create aaaa app 2001:db8::10 --ttl 300` | `AAAA app.example.com -> 2001:db8::10`, TTL `300` |
+| `ib dns create cname www app.example.com` | `CNAME www.example.com -> app.example.com` |
+| `ib dns create txt _spf "v=spf1 include:example.net -all"` | `TXT _spf.example.com = "v=spf1 include:example.net -all"` |
+| `ib dns create mx @ "10 mail.example.com"` | `MX example.com -> mail.example.com` with preference `10` |
+| `ib dns create ptr 192.0.2.10 host.example.com` | `PTR 192.0.2.10 -> host.example.com` |
+
+CNAME creates check whether the target resolves from the local system before
+submitting the record. If the target does not resolve, `ib` prints a warning
+and continues with the create request.
 
 If Infoblox returns `The IP address ... cannot be used for the zone ...`,
 the selected forward zone does not allow that IP based on its network
 association. Use an IP associated with that zone, choose the correct zone with
-`--zone` or a fully qualified `-n` name, or update the zone network association
-in Infoblox.
+`--zone` or a fully qualified name, or update the zone network association
+in Infoblox. The error details instruct the client to run
+`ib dns zone view <zone>` to view the network association for the selected zone.
 
 Use `--zone` to bypass the active zone for one command:
 
 ```bash
-ib dns create a -n app 192.0.2.10 --zone example.com
+ib dns create a app 192.0.2.10 --zone example.com
 ```
 
 For A/AAAA workflows, add `--noptr` when you do not want PTR handling:
 
 ```bash
-ib dns create a -n app 192.0.2.10 --noptr
+ib dns create a app 192.0.2.10 --noptr
 ```
 
 ## Search Records
@@ -193,15 +199,29 @@ Search performance notes:
 - A zone's records are refreshed only when its SOA serial number changes.
 - Cached records include normalized searchable fields, so repeated searches are faster.
 - Cold or refreshed searches process zones with 8 workers by default.
+- Successful DNS record or zone updates clear the DNS caches and start a silent
+  background cache warm.
 
 ## Delete Records
 
-Delete by record name. The optional zone argument uses the same active-zone
-fallback rules as create.
+Delete forward records by record name. The optional zone argument uses the same
+active-zone fallback rules as create. Tab completion for the record name uses
+the global DNS search cache, so `ib dns delete <TAB>` can suggest records
+outside the active zone. Reverse PTR records are excluded from normal delete
+completion.
 
 ```bash
 ib dns delete app
+ib dns delete app.other.example.net
 ib dns delete app example.com
+```
+
+Delete reverse PTR records with the dedicated PTR command and a full IP
+address. `ib` looks up the most specific reverse zone for the IP address before
+deleting the PTR record.
+
+```bash
+ib dns delete ptr 192.168.1.3
 ```
 
 If a name matches multiple records, `ib` prints the ambiguous matches instead of
@@ -293,6 +313,7 @@ If search results look stale, confirm the zone SOA serial changed:
 ib dns zone view example.com
 ```
 
-The record cache refreshes from Infoblox when the serial number changes. Zone
-serial metadata can lag by up to 30 seconds because it is cached briefly for
-faster repeated searches.
+The record cache refreshes from Infoblox when the serial number changes.
+Successful record or zone updates clear the DNS caches and start a silent
+background cache warm. Zone serial metadata can otherwise lag by up to 30
+seconds because it is cached briefly for faster repeated searches.
