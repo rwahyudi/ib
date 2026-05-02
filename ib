@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import base64
 import configparser
+import hashlib
 import json
 import os
 import re
-import shlex
 import ssl
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,7 @@ from typing import Any
 try:
     import click
     from cryptography.fernet import Fernet, InvalidToken
+    from click.shell_completion import CompletionItem
     from rich.console import Console
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
@@ -43,11 +45,20 @@ DEFAULT_TIMEOUT = 30
 DEFAULT_ZONE_ENV = "IB_ZONE"
 ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
 WAPI_PAGE_SIZE = 1000
+SESSION_ZONE_FILE_PREFIX = "active-zone-session"
 ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
 ZONE_COMPLETION_CACHE_TTL = 300
+ALLRECORDS_CACHE_DIR = CONFIG_DIR / "allrecords-cache"
 COMPLETION_SHELLS = ("bash", "zsh", "fish")
+ALLRECORDS_OBJECT = "allrecords"
+ALLRECORDS_RETURN_FIELDS = "name,type,view,zone,ttl,comment,address,record"
 ZONE_OBJECT = "zone_auth"
 ZONE_RETURN_FIELDS = "fqdn,view,zone_format,comment,ns_group"
+ZONE_DETAIL_RETURN_FIELDS = (
+    f"{ZONE_RETURN_FIELDS},member_soa_mnames,soa_email,soa_expire,soa_negative_ttl,"
+    "soa_refresh,soa_retry,soa_serial_number"
+)
+ZONE_SERIAL_RETURN_FIELDS = f"{ZONE_RETURN_FIELDS},primary_type,soa_serial_number"
 ZONE_FORMATS = ("FORWARD", "IPV4", "IPV6")
 console = Console()
 err_console = Console(stderr=True)
@@ -268,6 +279,12 @@ def save_config_interactive() -> None:
         "WAPI version", default=current.get("wapi_version", DEFAULT_WAPI_VERSION)
     )
     dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
+    default_zone = Prompt.ask(
+        "Default DNS zone (optional)",
+        default=current.get("default_zone", ""),
+    ).strip()
+    if default_zone:
+        default_zone = normalize_zone_name(default_zone)
     verify_ssl = Confirm.ask(
         "Verify SSL certificates",
         default=parse_bool(current.get("verify_ssl", "true")),
@@ -279,6 +296,7 @@ def save_config_interactive() -> None:
         "password": password,
         "wapi_version": wapi_version,
         "dns_view": dns_view,
+        "default_zone": default_zone,
         "verify_ssl": "true" if verify_ssl else "false",
         "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
     }
@@ -308,8 +326,7 @@ def load_config(required: bool = True) -> dict[str, str] | None:
     if "default" not in parser:
         raise CliError(f"ERROR: missing [default] section in {CONFIG_FILE}")
 
-    raw_cfg = dict(parser["default"])
-    cfg = dict(raw_cfg)
+    cfg = dict(parser["default"])
     for key in ("server", "username", "password"):
         if not cfg.get(key):
             raise CliError(f"ERROR: missing '{key}' in {CONFIG_FILE}")
@@ -319,6 +336,7 @@ def load_config(required: bool = True) -> dict[str, str] | None:
     cfg["server"] = normalize_server(cfg["server"])
     cfg.setdefault("wapi_version", DEFAULT_WAPI_VERSION)
     cfg.setdefault("dns_view", "default")
+    cfg.setdefault("default_zone", "")
     cfg.setdefault("verify_ssl", "true")
     cfg.setdefault("timeout", str(DEFAULT_TIMEOUT))
     if not is_encrypted_password(raw_password):
@@ -409,17 +427,223 @@ def default_zone_from_env() -> str | None:
     return normalize_zone_name(zone_name) if zone_name else None
 
 
-def resolve_dns_zone(zone_name: str | None = None) -> str:
+def default_config_values() -> dict[str, str]:
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_FILE)
+    except (OSError, configparser.Error):
+        return {}
+    if "default" not in parser:
+        return {}
+    return dict(parser["default"])
+
+
+def session_zone_dir() -> Path:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and os.access(runtime_dir, os.W_OK):
+        return Path(runtime_dir) / "ib" / "active-zones"
+    user_id = str(os.getuid()) if hasattr(os, "getuid") else "user"
+    return Path(tempfile.gettempdir()) / f"ib-{user_id}" / "active-zones"
+
+
+def session_zone_file() -> Path:
+    return session_zone_dir() / f"{SESSION_ZONE_FILE_PREFIX}-{os.getppid()}.json"
+
+
+def read_session_zone() -> str | None:
+    try:
+        with session_zone_file().open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict) or payload.get("parent_pid") != os.getppid():
+        return None
+    zone_name = str(payload.get("zone", "")).strip()
+    if not zone_name:
+        return None
+    try:
+        return normalize_zone_name(zone_name)
+    except CliError:
+        return None
+
+
+def write_session_zone(zone_name: str) -> None:
+    path = session_zone_file()
+    payload = {
+        "zone": normalize_zone_name(zone_name),
+        "parent_pid": os.getppid(),
+        "created_at": time.time(),
+    }
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.chmod(path, 0o600)
+    except OSError:
+        raise CliError(f"ERROR: cannot write session active zone at {path}")
+
+
+def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> str:
     if zone_name:
         return normalize_zone_name(zone_name)
+
+    session_zone = read_session_zone()
+    if session_zone:
+        return session_zone
 
     env_zone = default_zone_from_env()
     if env_zone:
         return env_zone
 
+    if config.get("default_zone"):
+        return normalize_zone_name(config["default_zone"])
+
     raise CliError(
-        f"ERROR: DNS zone is required. Use --zone or export {DEFAULT_ZONE_ENV}."
+        f"ERROR: DNS zone is required. Use --zone, ib dns zone use, export {DEFAULT_ZONE_ENV}, "
+        "or set a default zone with: ib configure"
     )
+
+
+def default_zone_from_config_file() -> str | None:
+    zone_name = default_config_values().get("default_zone", "").strip()
+    if not zone_name:
+        return None
+    try:
+        return normalize_zone_name(zone_name)
+    except CliError:
+        return None
+
+
+def current_view_status() -> tuple[str, str]:
+    config_values = default_config_values()
+    if not config_values:
+        return "not configured", "run ib configure"
+
+    dns_view = config_values.get("dns_view", "").strip()
+    if dns_view:
+        return dns_view, "configured"
+    return "default", "implicit default"
+
+
+def active_zone_status() -> tuple[str | None, str]:
+    session_zone = read_session_zone()
+    if session_zone:
+        return session_zone, "shell session"
+
+    try:
+        env_zone = default_zone_from_env()
+    except CliError:
+        env_zone = None
+    if env_zone:
+        return env_zone, DEFAULT_ZONE_ENV
+
+    config_zone = default_zone_from_config_file()
+    if config_zone:
+        return config_zone, "configured default"
+
+    return None, "not set"
+
+
+def active_zone_completion_help() -> str:
+    zone_name, source = active_zone_status()
+    if zone_name:
+        return f"Active zone: {zone_name} ({source})"
+    return "Active zone: not set"
+
+
+def active_zone_completion_value() -> str:
+    zone_name, _source = active_zone_status()
+    return f"active-zone={zone_name or 'not-set'}"
+
+
+def dns_context_panel(title: str = "DNS Context") -> Panel:
+    view_name, view_source = current_view_status()
+    zone_name, zone_source = active_zone_status()
+    active_zone = zone_name or "not set"
+    background_style = "white on #0f172a"
+    label_style = "bold cyan on #0f172a"
+    source_style = "dim white on #0f172a"
+    view_style = (
+        "bold magenta on #0f172a" if view_name != "not configured" else "bold yellow on #0f172a"
+    )
+    zone_style = "bold green on #0f172a" if zone_name else "bold yellow on #0f172a"
+
+    context = Text()
+    context.append("View: ", style=label_style)
+    context.append(view_name, style=view_style)
+    context.append(f" ({view_source})", style=source_style)
+    context.append("  |  ", style=background_style)
+    context.append("Active zone: ", style=label_style)
+    context.append(active_zone, style=zone_style)
+    context.append(f" ({zone_source})", style=source_style)
+
+    return Panel(
+        context,
+        title=title,
+        style=background_style,
+        border_style="bright_cyan",
+        padding=(0, 1),
+    )
+
+
+def usage_context_panel_text(ctx: click.Context) -> str:
+    width = min(ctx.terminal_width or console.width or 80, 100)
+    help_console = Console(
+        color_system=console.color_system,
+        force_terminal=ctx.color if ctx.color is not None else console.is_terminal,
+        width=width,
+    )
+    with help_console.capture() as capture:
+        help_console.print(dns_context_panel())
+    return capture.get()
+
+
+class UsageContextHelpMixin:
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        self.format_usage(ctx, formatter)
+        formatter.write("\n")
+        formatter.write(usage_context_panel_text(ctx))
+        formatter.write("\n")
+        self.format_help_text(ctx, formatter)
+        self.format_options(ctx, formatter)
+        self.format_epilog(ctx, formatter)
+
+
+class UsageContextCommand(UsageContextHelpMixin, click.Command):
+    pass
+
+
+class UsageContextGroup(UsageContextHelpMixin, click.Group):
+    command_class = UsageContextCommand
+    group_class = type
+
+
+def is_bash_completion() -> bool:
+    return os.environ.get("_IB_COMPLETE", "").startswith("bash_")
+
+
+def append_active_zone_help(item_help: str | None, active_zone_help: str) -> str:
+    if not item_help:
+        return active_zone_help
+    return f"{item_help} {active_zone_help}."
+
+
+class DnsGroup(UsageContextGroup):
+    def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        items = super().shell_complete(ctx, incomplete)
+
+        zone_help = active_zone_completion_help()
+        if is_bash_completion():
+            if incomplete:
+                return items
+            return [CompletionItem(active_zone_completion_value(), help=zone_help), *items]
+
+        for item in items:
+            if item.type == "plain" and str(item.value) in self.commands:
+                item.help = append_active_zone_help(item.help, zone_help)
+        return items
 
 
 def ttl_payload(ttl: int | None) -> dict[str, Any]:
@@ -495,7 +719,7 @@ def run_dns_create(
 ) -> None:
     config = load_config()
     client = InfobloxClient(config)
-    resolved_zone = resolve_dns_zone(zone)
+    resolved_zone = resolve_dns_zone(config, zone)
     object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
     ref = client.request("POST", object_type, payload=payload)
     if noptr and record_type.lower() not in {"a", "aaaa"}:
@@ -516,11 +740,23 @@ def object_query_params(
     }
 
 
-def zone_query_params(client: InfobloxClient, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+def zone_query_params(
+    client: InfobloxClient,
+    extra: dict[str, Any] | None = None,
+    return_fields: str = ZONE_RETURN_FIELDS,
+) -> dict[str, Any]:
     return {
-        "_return_fields": ZONE_RETURN_FIELDS,
+        "_return_fields": return_fields,
         "view": client.view,
         **(extra or {}),
+    }
+
+
+def allrecords_query_params(client: InfobloxClient, zone_name: str) -> dict[str, Any]:
+    return {
+        "_return_fields": ALLRECORDS_RETURN_FIELDS,
+        "view": client.view,
+        "zone": normalize_zone_name(zone_name),
     }
 
 
@@ -638,21 +874,290 @@ def search_pattern(keyword: str, case_sensitive: bool) -> str:
     return re.escape(keyword) if case_sensitive else case_insensitive_literal_pattern(keyword)
 
 
-def run_dns_search(keyword: str, case_sensitive: bool = False) -> None:
-    client = InfobloxClient(load_config())
+def is_zone_or_child(zone_name: str, parent_zone: str) -> bool:
+    zone = normalize_zone_name(zone_name)
+    parent = normalize_zone_name(parent_zone)
+    return zone == parent or zone.endswith(f".{parent}")
+
+
+def zone_serial(zone_info: dict[str, Any]) -> str | None:
+    serial = zone_info.get("soa_serial_number")
+    return str(serial) if serial is not None else None
+
+
+def is_secondary_zone(zone_info: dict[str, Any]) -> bool:
+    primary_type = str(zone_info.get("primary_type", "")).strip().lower()
+    return primary_type in {"external", "microsoft", "secondary"}
+
+
+def search_root_zone(config: dict[str, str]) -> str | None:
+    try:
+        return resolve_dns_zone(config)
+    except CliError:
+        return None
+
+
+def record_result_key(item: dict[str, Any]) -> str:
+    return str(item.get("_ref") or json.dumps(item, sort_keys=True))
+
+
+def allrecords_cache_file(client: InfobloxClient, zone_name: str) -> Path:
+    cache_key = json.dumps(
+        {
+            "server": client.server,
+            "wapi_version": client.wapi_version,
+            "view": client.view,
+            "zone": normalize_zone_name(zone_name),
+        },
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+    return ALLRECORDS_CACHE_DIR / f"{digest}.json"
+
+
+def read_allrecords_cache(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+) -> list[dict[str, Any]] | None:
+    if serial_number is None:
+        return None
+    try:
+        with allrecords_cache_file(client, zone_name).open("r", encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(cache, dict):
+        return None
+    if cache.get("server") != client.server or cache.get("view") != client.view:
+        return None
+    if cache.get("zone") != normalize_zone_name(zone_name):
+        return None
+    if str(cache.get("soa_serial_number", "")) != serial_number:
+        return None
+
+    records = cache.get("records")
+    if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
+        return None
+    return records
+
+
+def write_allrecords_cache(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+    records: list[dict[str, Any]],
+) -> None:
+    if serial_number is None:
+        return
+    try:
+        ALLRECORDS_CACHE_DIR.parent.mkdir(mode=0o700, exist_ok=True)
+        ALLRECORDS_CACHE_DIR.mkdir(mode=0o700, exist_ok=True)
+        try:
+            os.chmod(ALLRECORDS_CACHE_DIR.parent, 0o700)
+            os.chmod(ALLRECORDS_CACHE_DIR, 0o700)
+        except OSError:
+            pass
+        cache_file = allrecords_cache_file(client, zone_name)
+        with cache_file.open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "created_at": time.time(),
+                    "server": client.server,
+                    "wapi_version": client.wapi_version,
+                    "view": client.view,
+                    "zone": normalize_zone_name(zone_name),
+                    "soa_serial_number": serial_number,
+                    "records": records,
+                },
+                handle,
+            )
+        try:
+            os.chmod(cache_file, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        return
+
+
+def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
+    return paged_query(
+        client,
+        ZONE_OBJECT,
+        zone_query_params(client, return_fields=ZONE_SERIAL_RETURN_FIELDS),
+    )
+
+
+def search_zones(client: InfobloxClient, root_zone: str | None) -> list[dict[str, Any]]:
+    zones = query_zone_serials(client)
+    if not root_zone:
+        return sorted(
+            [zone for zone in zones if not is_secondary_zone(zone)],
+            key=lambda zone: str(zone.get("fqdn", "")).lower(),
+        )
+
+    filtered = []
+    seen_names: set[str] = set()
+    for zone in zones:
+        zone_name = str(zone.get("fqdn", "")).strip()
+        if not zone_name:
+            continue
+        try:
+            normalized = normalize_zone_name(zone_name)
+        except CliError:
+            continue
+        if is_zone_or_child(normalized, root_zone):
+            seen_names.add(normalized)
+            if is_secondary_zone(zone):
+                continue
+            filtered.append(zone)
+
+    normalized_root = normalize_zone_name(root_zone)
+    if normalized_root not in seen_names:
+        filtered.append({"fqdn": normalized_root, "view": client.view})
+    return sorted(filtered, key=lambda zone: str(zone.get("fqdn", "")).lower())
+
+
+def allrecords_for_zone(client: InfobloxClient, zone_info: dict[str, Any]) -> list[dict[str, Any]]:
+    zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
+    serial_number = zone_serial(zone_info)
+    cached_records = read_allrecords_cache(client, zone_name, serial_number)
+    if cached_records is not None:
+        return cached_records
+
+    records = paged_query(client, ALLRECORDS_OBJECT, allrecords_query_params(client, zone_name))
+    write_allrecords_cache(client, zone_name, serial_number, records)
+    return records
+
+
+def record_in_zone_scope(item: dict[str, Any], root_zone: str) -> bool:
+    zone_name = str(item.get("zone", "")).strip()
+    if zone_name:
+        return is_zone_or_child(zone_name, root_zone)
+
+    record_name = str(item.get("name", "")).strip()
+    return bool(record_name) and is_zone_or_child(record_name, root_zone)
+
+
+def allrecord_type(item: dict[str, Any]) -> str:
+    raw_type = str(item.get("type", "")).lower()
+    if raw_type.startswith("record:"):
+        record_type = raw_type.split(":", 1)[1]
+        if record_type in {"host_ipv4addr", "host_ipv6addr"}:
+            return "host"
+        return record_type
+    if raw_type.startswith("sharedrecord:"):
+        return raw_type.replace("sharedrecord:", "shared-", 1)
+    return raw_type or "record"
+
+
+def nested_record(item: dict[str, Any]) -> dict[str, Any]:
+    record = item.get("record")
+    return record if isinstance(record, dict) else {}
+
+
+def first_record_value(item: dict[str, Any], keys: tuple[str, ...]) -> str:
+    record = nested_record(item)
+    for key in keys:
+        value = record.get(key, item.get(key))
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def allrecord_display_name(item: dict[str, Any]) -> str:
+    return first_record_value(item, ("name",)) or str(item.get("name", ""))
+
+
+def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
+    if record_type in {"cname", "shared-cname"}:
+        return first_record_value(item, ("canonical",))
+    if record_type in {"txt", "shared-txt"}:
+        return first_record_value(item, ("text",))
+    if record_type in {"mx", "shared-mx"}:
+        exchanger = first_record_value(item, ("mail_exchanger",))
+        preference = first_record_value(item, ("preference",))
+        return f"{preference} {exchanger}".strip() if exchanger else ""
+    if record_type == "ptr":
+        return first_record_value(item, ("ptrdname", "ipv4addr", "ipv6addr"))
+    if record_type == "host":
+        values = []
+        record = nested_record(item)
+        for key, nested_key in (("ipv4addrs", "ipv4addr"), ("ipv6addrs", "ipv6addr")):
+            for address in record.get(key, item.get(key, [])) or []:
+                if isinstance(address, dict) and address.get(nested_key):
+                    values.append(str(address[nested_key]))
+                elif isinstance(address, str):
+                    values.append(address)
+        if values:
+            return ", ".join(values)
+    if record_type in {"a", "shared-a"}:
+        return first_record_value(item, ("ipv4addr", "address"))
+    if record_type in {"aaaa", "shared-aaaa"}:
+        return first_record_value(item, ("ipv6addr", "address"))
+    if item.get("address"):
+        return str(item["address"])
+    record = item.get("record")
+    return str(record) if record not in (None, "") else ""
+
+
+def allrecord_search_values(record_type: str, item: dict[str, Any]) -> list[str]:
+    return [
+        allrecord_display_name(item),
+        allrecord_display_value(record_type, item),
+        str(item.get("comment", "")),
+    ]
+
+
+def allrecord_matches_keyword(
+    item: dict[str, Any],
+    keyword: str,
+    case_sensitive: bool,
+) -> bool:
+    needle = keyword if case_sensitive else keyword.lower()
+    record_type = allrecord_type(item)
+    for value in allrecord_search_values(record_type, item):
+        haystack = value if case_sensitive else value.lower()
+        if needle in haystack:
+            return True
+    return False
+
+
+def collect_dns_search_results(
+    client: InfobloxClient,
+    keyword: str,
+    case_sensitive: bool,
+    root_zone: str | None,
+) -> list[tuple[str, dict[str, Any]]]:
     seen: set[str] = set()
     records: list[tuple[str, dict[str, Any]]] = []
-    pattern = search_pattern(keyword, case_sensitive)
-    for record_type, spec in RECORD_TYPES.items():
-        object_type = spec["object"]
-        for field in search_fields(spec):
-            params = object_query_params(spec, client, {f"{field}~": pattern})
-            for item in safe_query(client, object_type, params):
-                ref = item.get("_ref", json.dumps(item, sort_keys=True))
-                if ref in seen:
-                    continue
-                seen.add(ref)
-                records.append((record_type, item))
+
+    for zone_info in search_zones(client, root_zone):
+        for item in allrecords_for_zone(client, zone_info):
+            if not allrecord_matches_keyword(item, keyword, case_sensitive):
+                continue
+            if root_zone and not record_in_zone_scope(item, root_zone):
+                continue
+            key = record_result_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append((allrecord_type(item), item))
+    return records
+
+
+def run_dns_search(
+    keyword: str,
+    case_sensitive: bool = False,
+    global_search: bool = False,
+) -> None:
+    config = load_config()
+    client = InfobloxClient(config)
+    root_zone = None if global_search else search_root_zone(config)
+    if not global_search:
+        console.print(dns_context_panel("Current DNS Context"))
+    records = collect_dns_search_results(client, keyword, case_sensitive, root_zone)
 
     if not records:
         print_warning("No records found.")
@@ -664,7 +1169,7 @@ def run_dns_search(keyword: str, case_sensitive: bool = False) -> None:
 def run_dns_delete(record_name: str, zone: str | None) -> None:
     config = load_config()
     client = InfobloxClient(config)
-    target = fqdn(record_name, resolve_dns_zone(zone))
+    target = fqdn(record_name, resolve_dns_zone(config, zone))
     matches: list[tuple[str, dict[str, Any]]] = []
 
     for record_type, spec in RECORD_TYPES.items():
@@ -710,11 +1215,31 @@ def run_dns_zone_create(
 
 def run_dns_zone_list(search: str | None = None) -> None:
     client = InfobloxClient(load_config())
+    console.print(dns_context_panel("Current DNS Context"))
     zones = query_zones(client, search)
     if not zones:
         print_warning("No zones found.")
         return
     console.print(zone_table(zones))
+
+
+def run_dns_zone_view(zone_name: str) -> None:
+    client = InfobloxClient(load_config())
+    target = normalize_zone_name(zone_name)
+    matches = safe_query(
+        client,
+        ZONE_OBJECT,
+        zone_query_params(client, {"fqdn": target}, return_fields=ZONE_DETAIL_RETURN_FIELDS),
+    )
+
+    if not matches:
+        raise CliError(f"ERROR: no DNS zone found for {target} in view {client.view}")
+    if len(matches) > 1:
+        print_error(f"ERROR: multiple zones found for {target}:")
+        err_console.print(zone_table(matches, include_ref=True))
+        raise CliError("ERROR: view target is ambiguous.")
+
+    console.print(zone_detail_table(matches[0]))
 
 
 def run_dns_zone_delete(zone_name: str) -> None:
@@ -738,8 +1263,9 @@ def run_dns_zone_delete(zone_name: str) -> None:
 
 def run_dns_zone_use(zone_name: str) -> None:
     default_zone = normalize_zone_name(zone_name)
-    os.environ[DEFAULT_ZONE_ENV] = default_zone
-    click.echo(f"export {DEFAULT_ZONE_ENV}={shlex.quote(default_zone)}")
+    write_session_zone(default_zone)
+    print_success(f"SUCCESS: active DNS zone set to {default_zone}")
+    print_note("This applies to the current shell session only.")
 
 
 def zone_names_from_results(zones: list[dict[str, Any]]) -> list[str]:
@@ -841,11 +1367,35 @@ def format_record(record_type: str, item: dict[str, Any]) -> str:
 
 
 def record_value(record_type: str, item: dict[str, Any]) -> str:
+    if item.get("type"):
+        return allrecord_display_value(record_type, item)
+
+    if item.get("address"):
+        return str(item["address"])
+    if item.get("record"):
+        return str(item["record"])
+
+    if record_type == "host":
+        values = []
+        for key, nested_key in (("ipv4addrs", "ipv4addr"), ("ipv6addrs", "ipv6addr")):
+            for address in item.get(key, []) or []:
+                if isinstance(address, dict) and address.get(nested_key):
+                    values.append(str(address[nested_key]))
+                elif isinstance(address, str):
+                    values.append(address)
+        return ", ".join(values)
+
     value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
     value = next((str(item[key]) for key in value_keys if key in item), "")
     if record_type == "mx" and "preference" in item and value:
         return f"{item['preference']} {value}"
     return value
+
+
+def record_name(item: dict[str, Any]) -> str:
+    if item.get("type"):
+        return allrecord_display_name(item)
+    return str(item.get("name", ""))
 
 
 def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = False) -> Table:
@@ -862,7 +1412,7 @@ def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = 
     for record_type, item in records:
         row = [
             record_type.upper(),
-            str(item.get("name", "")),
+            record_name(item),
             record_value(record_type, item),
             str(item.get("zone", "")),
             str(item.get("ttl", "")),
@@ -898,7 +1448,55 @@ def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
     return table
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+def format_zone_detail_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(
+            formatted for item in value if (formatted := format_zone_detail_value(item))
+        )
+    if isinstance(value, dict):
+        mname = value.get("mname") or value.get("soa_mname") or value.get("host_name")
+        member = value.get("member") or value.get("name")
+        if mname:
+            return f"{mname} ({member})" if member else str(mname)
+
+        parts = []
+        for key, item in sorted(value.items()):
+            formatted = format_zone_detail_value(item)
+            if formatted:
+                parts.append(f"{key.replace('_', ' ')}: {formatted}")
+        return ", ".join(parts)
+    return str(value)
+
+
+def zone_detail_table(zone_info: dict[str, Any]) -> Table:
+    zone_name = str(zone_info.get("fqdn", ""))
+    table = Table(title=f"DNS Zone: {zone_name}", header_style="bold cyan")
+    table.add_column("Field", style="bold cyan", no_wrap=True)
+    table.add_column("Value", overflow="fold")
+
+    fields = [
+        ("Zone", "fqdn"),
+        ("View", "view"),
+        ("Format", "zone_format"),
+        ("NS Group", "ns_group"),
+        ("Serial Number", "soa_serial_number"),
+        ("SOA MNAME", "member_soa_mnames"),
+        ("SOA RNAME", "soa_email"),
+        ("Refresh", "soa_refresh"),
+        ("Retry", "soa_retry"),
+        ("Expiry", "soa_expire"),
+        ("Negative Caching TTL", "soa_negative_ttl"),
+        ("Comment", "comment"),
+        ("Ref", "_ref"),
+    ]
+    for label, key in fields:
+        table.add_row(label, format_zone_detail_value(zone_info.get(key)))
+    return table
+
+
+@click.group(cls=UsageContextGroup, context_settings={"help_option_names": ["-h", "--help"]})
 def cli() -> None:
     """Infoblox command line client."""
 
@@ -916,7 +1514,7 @@ def completion(shell: str | None) -> None:
     shells = (shell,) if shell else COMPLETION_SHELLS
     console.print(
         Panel.fit(
-            "Enable tab completion for ib commands, options, and DNS record types.",
+            "Enable tab completion for ib commands, options, DNS record types, and active zone hints.",
             title="ib shell completion setup",
             border_style="cyan",
         )
@@ -971,7 +1569,7 @@ def completion(shell: str | None) -> None:
     print_command_block(["ib <TAB><TAB>", "ib dns create <TAB><TAB>"])
 
 
-@cli.group()
+@cli.group(cls=DnsGroup)
 def dns() -> None:
     """Manage Infoblox DNS records."""
 
@@ -1010,6 +1608,13 @@ def zone_list(search: str | None) -> None:
     run_dns_zone_list(search)
 
 
+@zone.command("view")
+@click.argument("zone_name", shell_complete=complete_zone_names)
+def zone_view(zone_name: str) -> None:
+    """View DNS zone information."""
+    run_dns_zone_view(zone_name)
+
+
 @zone.command("delete")
 @click.argument("zone_name")
 def zone_delete(zone_name: str) -> None:
@@ -1020,7 +1625,7 @@ def zone_delete(zone_name: str) -> None:
 @zone.command("use")
 @click.argument("zone_name", shell_complete=complete_zone_names)
 def zone_use(zone_name: str) -> None:
-    """Print an IB_ZONE export command."""
+    """Set the active DNS zone for this shell session."""
     run_dns_zone_use(zone_name)
 
 
@@ -1030,7 +1635,7 @@ def zone_use(zone_name: str) -> None:
 @click.argument("value")
 @click.option(
     "--zone",
-    help=f"DNS zone. Defaults to ${DEFAULT_ZONE_ENV}.",
+    help=f"DNS zone. Defaults to the session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
 )
 @click.option("--ttl", type=int, help="Record TTL in seconds.")
 @click.option("--noptr", is_flag=True, help="Do not manage PTR records for A/AAAA workflows.")
@@ -1051,9 +1656,10 @@ def create(
 @dns.command()
 @click.argument("keyword")
 @click.option("-i", "case_sensitive", is_flag=True, help="Use case-sensitive matching.")
-def search(keyword: str, case_sensitive: bool) -> None:
+@click.option("-g", "global_search", is_flag=True, help="Search across the configured DNS view.")
+def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
     """Search DNS records by name, value, or comment."""
-    run_dns_search(keyword, case_sensitive)
+    run_dns_search(keyword, case_sensitive, global_search)
 
 
 @dns.command()
