@@ -9,13 +9,16 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import ssl
+import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -44,7 +47,10 @@ DEFAULT_WAPI_VERSION = "v2.12.3"
 DEFAULT_TIMEOUT = 30
 DEFAULT_ZONE_ENV = "IB_ZONE"
 ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
-WAPI_PAGE_SIZE = 1000
+WAPI_PAGE_SIZE = 2000
+DNS_SEARCH_WORKERS = 8
+ZONE_SERIAL_CACHE_TTL = 30
+PREWARM_LOCK_STALE_SECONDS = 600
 SESSION_ZONE_FILE_PREFIX = "active-zone-session"
 ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
 ZONE_COMPLETION_CACHE_TTL = 300
@@ -646,6 +652,14 @@ class DnsGroup(UsageContextGroup):
         return items
 
 
+class RootGroup(UsageContextGroup):
+    def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        items = super().shell_complete(ctx, incomplete)
+        if not incomplete:
+            start_search_cache_prewarm()
+        return items
+
+
 def ttl_payload(ttl: int | None) -> dict[str, Any]:
     if ttl is None:
         return {}
@@ -901,7 +915,7 @@ def record_result_key(item: dict[str, Any]) -> str:
     return str(item.get("_ref") or json.dumps(item, sort_keys=True))
 
 
-def allrecords_cache_file(client: InfobloxClient, zone_name: str) -> Path:
+def allrecords_cache_key(client: InfobloxClient, zone_name: str) -> str:
     cache_key = json.dumps(
         {
             "server": client.server,
@@ -911,15 +925,265 @@ def allrecords_cache_file(client: InfobloxClient, zone_name: str) -> Path:
         },
         sort_keys=True,
     )
-    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
-    return ALLRECORDS_CACHE_DIR / f"{digest}.json"
+    return hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
 
 
-def read_allrecords_cache(
+def allrecords_cache_file(client: InfobloxClient, zone_name: str) -> Path:
+    return ALLRECORDS_CACHE_DIR / f"{allrecords_cache_key(client, zone_name)}.json"
+
+
+def allrecords_cache_db_file() -> Path:
+    return ALLRECORDS_CACHE_DIR / "cache.sqlite3"
+
+
+def search_cache_prewarm_lock_file() -> Path:
+    return ALLRECORDS_CACHE_DIR / "prewarm.lock"
+
+
+def zone_serial_cache_key(client: InfobloxClient) -> str:
+    cache_key = json.dumps(
+        {
+            "server": client.server,
+            "wapi_version": client.wapi_version,
+            "view": client.view,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+
+
+def ensure_allrecords_cache_dir() -> None:
+    ALLRECORDS_CACHE_DIR.parent.mkdir(mode=0o700, exist_ok=True)
+    ALLRECORDS_CACHE_DIR.mkdir(mode=0o700, exist_ok=True)
+    try:
+        os.chmod(ALLRECORDS_CACHE_DIR.parent, 0o700)
+        os.chmod(ALLRECORDS_CACHE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def initialize_search_cache_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS zone_serial_cache (
+            cache_key TEXT PRIMARY KEY,
+            server TEXT NOT NULL,
+            wapi_version TEXT NOT NULL,
+            view TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            zones_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS zone_record_cache (
+            cache_key TEXT PRIMARY KEY,
+            server TEXT NOT NULL,
+            wapi_version TEXT NOT NULL,
+            view TEXT NOT NULL,
+            zone TEXT NOT NULL,
+            serial_number TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS search_entries (
+            cache_key TEXT NOT NULL,
+            record_key TEXT NOT NULL,
+            type TEXT NOT NULL,
+            zone TEXT NOT NULL,
+            name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            comment TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY (cache_key, record_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_search_entries_cache
+            ON search_entries(cache_key);
+        CREATE INDEX IF NOT EXISTS idx_search_entries_zone_name
+            ON search_entries(cache_key, zone, name);
+        """
+    )
+
+
+def connect_search_cache_db() -> sqlite3.Connection:
+    ensure_allrecords_cache_dir()
+    db_file = allrecords_cache_db_file()
+    conn = sqlite3.connect(db_file, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 30000")
+    initialize_search_cache_db(conn)
+    try:
+        os.chmod(db_file, 0o600)
+    except OSError:
+        pass
+    return conn
+
+
+def normalize_zone_serial_cache(zones: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(zones, list) or not all(isinstance(zone, dict) for zone in zones):
+        return None
+    return zones
+
+
+def read_zone_serial_cache(client: InfobloxClient) -> list[dict[str, Any]] | None:
+    try:
+        with connect_search_cache_db() as conn:
+            row = conn.execute(
+                "SELECT created_at, zones_json FROM zone_serial_cache WHERE cache_key = ?",
+                (zone_serial_cache_key(client),),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+
+    if row is None or time.time() - float(row["created_at"]) > ZONE_SERIAL_CACHE_TTL:
+        return None
+
+    try:
+        zones = json.loads(str(row["zones_json"]))
+    except json.JSONDecodeError:
+        return None
+    return normalize_zone_serial_cache(zones)
+
+
+def write_zone_serial_cache(client: InfobloxClient, zones: list[dict[str, Any]]) -> None:
+    try:
+        with connect_search_cache_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO zone_serial_cache
+                    (cache_key, server, wapi_version, view, created_at, zones_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    zone_serial_cache_key(client),
+                    client.server,
+                    client.wapi_version,
+                    client.view,
+                    time.time(),
+                    json.dumps(zones),
+                ),
+            )
+    except (OSError, sqlite3.Error):
+        return
+
+
+def sqlite_zone_record_cache_is_valid(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    serial_number: str,
+) -> bool:
+    row = conn.execute(
+        "SELECT serial_number FROM zone_record_cache WHERE cache_key = ?",
+        (cache_key,),
+    ).fetchone()
+    return row is not None and str(row["serial_number"]) == serial_number
+
+
+def sqlite_search_entry_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
+    try:
+        record = json.loads(str(row["record_json"]))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(record, dict):
+        return None
+
+    return {
+        "type": str(row["type"]),
+        "zone": str(row["zone"]),
+        "name": str(row["name"]),
+        "value": str(row["value"]),
+        "comment": str(row["comment"]),
+        "record": record,
+    }
+
+
+def read_sqlite_allrecords_search_entries(
     client: InfobloxClient,
     zone_name: str,
     serial_number: str | None,
 ) -> list[dict[str, Any]] | None:
+    if serial_number is None:
+        return None
+    cache_key = allrecords_cache_key(client, zone_name)
+    try:
+        with connect_search_cache_db() as conn:
+            if not sqlite_zone_record_cache_is_valid(conn, cache_key, serial_number):
+                return None
+            rows = conn.execute(
+                """
+                SELECT type, zone, name, value, comment, record_json
+                FROM search_entries
+                WHERE cache_key = ?
+                ORDER BY lower(zone), lower(name), lower(type), lower(value), record_key
+                """,
+                (cache_key,),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+
+    entries = []
+    for row in rows:
+        entry = sqlite_search_entry_from_row(row)
+        if entry is None:
+            return None
+        entries.append(entry)
+    return entries
+
+
+def search_sqlite_allrecords_cache(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+    keyword: str,
+    case_sensitive: bool,
+) -> list[dict[str, Any]] | None:
+    if serial_number is None:
+        return None
+    cache_key = allrecords_cache_key(client, zone_name)
+    if not keyword:
+        return read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+
+    if case_sensitive:
+        condition = "instr(name, ?) > 0 OR instr(value, ?) > 0 OR instr(comment, ?) > 0"
+        params = (keyword, keyword, keyword)
+    else:
+        needle = keyword.lower()
+        condition = (
+            "instr(lower(name), ?) > 0 OR "
+            "instr(lower(value), ?) > 0 OR "
+            "instr(lower(comment), ?) > 0"
+        )
+        params = (needle, needle, needle)
+
+    try:
+        with connect_search_cache_db() as conn:
+            if not sqlite_zone_record_cache_is_valid(conn, cache_key, serial_number):
+                return None
+            rows = conn.execute(
+                f"""
+                SELECT type, zone, name, value, comment, record_json
+                FROM search_entries
+                WHERE cache_key = ? AND ({condition})
+                """,
+                (cache_key, *params),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return None
+
+    entries = []
+    for row in rows:
+        entry = sqlite_search_entry_from_row(row)
+        if entry is None:
+            return None
+        if allrecord_search_entry_matches_keyword(entry, keyword, case_sensitive):
+            entries.append(entry)
+    return entries
+
+
+def read_legacy_allrecords_cache_payload(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+) -> dict[str, Any] | None:
     if serial_number is None:
         return None
     try:
@@ -936,11 +1200,121 @@ def read_allrecords_cache(
         return None
     if str(cache.get("soa_serial_number", "")) != serial_number:
         return None
+    return cache
 
+
+def read_allrecords_cache_payload(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+) -> dict[str, Any] | None:
+    entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+    if entries is not None:
+        return {
+            "server": client.server,
+            "wapi_version": client.wapi_version,
+            "view": client.view,
+            "zone": normalize_zone_name(zone_name),
+            "soa_serial_number": serial_number,
+            "records": [entry["record"] for entry in entries],
+            "search_entries": entries,
+        }
+
+    return read_legacy_allrecords_cache_payload(client, zone_name, serial_number)
+
+
+def cached_records(cache: dict[str, Any]) -> list[dict[str, Any]] | None:
     records = cache.get("records")
     if not isinstance(records, list) or not all(isinstance(item, dict) for item in records):
         return None
     return records
+
+
+def read_allrecords_cache(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+) -> list[dict[str, Any]] | None:
+    cache = read_allrecords_cache_payload(client, zone_name, serial_number)
+    return cached_records(cache) if cache else None
+
+
+def allrecord_search_entry(item: dict[str, Any], zone_name: str | None = None) -> dict[str, Any]:
+    record_type = allrecord_type(item)
+    return {
+        "type": record_type,
+        "zone": str(item.get("zone", "") or zone_name or ""),
+        "name": allrecord_display_name(item),
+        "value": allrecord_display_value(record_type, item),
+        "comment": str(item.get("comment", "")),
+        "record": item,
+    }
+
+
+def allrecord_search_entries(
+    records: list[dict[str, Any]],
+    zone_name: str | None = None,
+) -> list[dict[str, Any]]:
+    return [allrecord_search_entry(item, zone_name) for item in records]
+
+
+def normalize_cached_search_entry(entry: Any) -> dict[str, Any] | None:
+    if not isinstance(entry, dict):
+        return None
+    record = entry.get("record")
+    if not isinstance(record, dict):
+        return None
+
+    return {
+        "type": str(entry.get("type", "")),
+        "zone": str(entry.get("zone", "")),
+        "name": str(entry.get("name", "")),
+        "value": str(entry.get("value", "")),
+        "comment": str(entry.get("comment", "")),
+        "record": record,
+    }
+
+
+def normalize_cached_search_entries(entries: Any) -> list[dict[str, Any]] | None:
+    if not isinstance(entries, list):
+        return None
+
+    normalized = []
+    for entry in entries:
+        normalized_entry = normalize_cached_search_entry(entry)
+        if normalized_entry is None:
+            return None
+        normalized.append(normalized_entry)
+    return normalized
+
+
+def read_allrecords_search_cache(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+) -> list[dict[str, Any]] | None:
+    cached_entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+    if cached_entries is not None:
+        return cached_entries
+
+    cache = read_legacy_allrecords_cache_payload(client, zone_name, serial_number)
+    if not cache:
+        return None
+
+    search_entries = normalize_cached_search_entries(cache.get("search_entries"))
+    if search_entries is not None:
+        records = cached_records(cache)
+        if records is not None:
+            write_allrecords_cache(client, zone_name, serial_number, records, search_entries)
+        return search_entries
+
+    records = cached_records(cache)
+    if records is None:
+        return None
+
+    search_entries = allrecord_search_entries(records, zone_name)
+    write_allrecords_cache(client, zone_name, serial_number, records, search_entries)
+    return search_entries
 
 
 def write_allrecords_cache(
@@ -948,45 +1322,80 @@ def write_allrecords_cache(
     zone_name: str,
     serial_number: str | None,
     records: list[dict[str, Any]],
+    search_entries: list[dict[str, Any]] | None = None,
 ) -> None:
     if serial_number is None:
         return
-    try:
-        ALLRECORDS_CACHE_DIR.parent.mkdir(mode=0o700, exist_ok=True)
-        ALLRECORDS_CACHE_DIR.mkdir(mode=0o700, exist_ok=True)
+    if search_entries is None:
+        search_entries = allrecord_search_entries(records, zone_name)
+    cache_key = allrecords_cache_key(client, zone_name)
+    normalized_zone = normalize_zone_name(zone_name)
+    now = time.time()
+    rows = []
+    for entry in search_entries:
+        record = allrecord_search_entry_record(entry)
+        if not record:
+            continue
         try:
-            os.chmod(ALLRECORDS_CACHE_DIR.parent, 0o700)
-            os.chmod(ALLRECORDS_CACHE_DIR, 0o700)
-        except OSError:
-            pass
-        cache_file = allrecords_cache_file(client, zone_name)
-        with cache_file.open("w", encoding="utf-8") as handle:
-            json.dump(
-                {
-                    "created_at": time.time(),
-                    "server": client.server,
-                    "wapi_version": client.wapi_version,
-                    "view": client.view,
-                    "zone": normalize_zone_name(zone_name),
-                    "soa_serial_number": serial_number,
-                    "records": records,
-                },
-                handle,
+            record_json = json.dumps(record, sort_keys=True)
+        except (TypeError, ValueError):
+            continue
+        rows.append(
+            (
+                cache_key,
+                record_result_key(record),
+                str(entry.get("type", "")),
+                str(entry.get("zone", "") or normalized_zone),
+                str(entry.get("name", "")),
+                str(entry.get("value", "")),
+                str(entry.get("comment", "")),
+                record_json,
             )
-        try:
-            os.chmod(cache_file, 0o600)
-        except OSError:
-            pass
-    except OSError:
+        )
+
+    try:
+        with connect_search_cache_db() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO zone_record_cache
+                    (cache_key, server, wapi_version, view, zone, serial_number, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cache_key,
+                    client.server,
+                    client.wapi_version,
+                    client.view,
+                    normalized_zone,
+                    str(serial_number),
+                    now,
+                ),
+            )
+            conn.execute("DELETE FROM search_entries WHERE cache_key = ?", (cache_key,))
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO search_entries
+                    (cache_key, record_key, type, zone, name, value, comment, record_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows,
+            )
+    except (OSError, sqlite3.Error):
         return
 
 
 def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
-    return paged_query(
+    cached_zones = read_zone_serial_cache(client)
+    if cached_zones is not None:
+        return cached_zones
+
+    zones = paged_query(
         client,
         ZONE_OBJECT,
         zone_query_params(client, return_fields=ZONE_SERIAL_RETURN_FIELDS),
     )
+    write_zone_serial_cache(client, zones)
+    return zones
 
 
 def search_zones(client: InfobloxClient, root_zone: str | None) -> list[dict[str, Any]]:
@@ -1029,6 +1438,22 @@ def allrecords_for_zone(client: InfobloxClient, zone_info: dict[str, Any]) -> li
     records = paged_query(client, ALLRECORDS_OBJECT, allrecords_query_params(client, zone_name))
     write_allrecords_cache(client, zone_name, serial_number, records)
     return records
+
+
+def allrecords_search_entries_for_zone(
+    client: InfobloxClient,
+    zone_info: dict[str, Any],
+) -> list[dict[str, Any]]:
+    zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
+    serial_number = zone_serial(zone_info)
+    cached_entries = read_allrecords_search_cache(client, zone_name, serial_number)
+    if cached_entries is not None:
+        return cached_entries
+
+    records = paged_query(client, ALLRECORDS_OBJECT, allrecords_query_params(client, zone_name))
+    search_entries = allrecord_search_entries(records, zone_name)
+    write_allrecords_cache(client, zone_name, serial_number, records, search_entries)
+    return search_entries
 
 
 def record_in_zone_scope(item: dict[str, Any], root_zone: str) -> bool:
@@ -1124,6 +1549,90 @@ def allrecord_matches_keyword(
     return False
 
 
+def allrecord_search_entry_matches_keyword(
+    entry: dict[str, Any],
+    keyword: str,
+    case_sensitive: bool,
+) -> bool:
+    needle = keyword if case_sensitive else keyword.lower()
+    for key in ("name", "value", "comment"):
+        value = str(entry.get(key, ""))
+        haystack = value if case_sensitive else value.lower()
+        if needle in haystack:
+            return True
+    return False
+
+
+def allrecord_search_entry_record(entry: dict[str, Any]) -> dict[str, Any]:
+    record = entry.get("record")
+    return record if isinstance(record, dict) else {}
+
+
+def allrecord_search_entry_type(entry: dict[str, Any]) -> str:
+    record = allrecord_search_entry_record(entry)
+    return str(entry.get("type") or allrecord_type(record))
+
+
+def allrecord_search_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, str, str, str]:
+    record = allrecord_search_entry_record(entry)
+    record_type = allrecord_search_entry_type(entry)
+    zone_name = str(entry.get("zone") or record.get("zone", ""))
+    name = str(entry.get("name") or record_name(record))
+    value = str(entry.get("value") or record_value(record_type, record))
+    return (
+        zone_name.lower(),
+        name.lower(),
+        record_type.lower(),
+        value.lower(),
+        record_result_key(record),
+    )
+
+
+def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
+    attrs = ("server", "wapi_version", "username", "password", "view", "timeout", "verify_ssl")
+    if not all(hasattr(client, attr) for attr in attrs):
+        return client
+
+    worker = InfobloxClient.__new__(InfobloxClient)
+    for attr in attrs:
+        setattr(worker, attr, getattr(client, attr))
+    return worker
+
+
+def matching_search_entries_for_zone(
+    client: InfobloxClient,
+    zone_info: dict[str, Any],
+    keyword: str,
+    case_sensitive: bool,
+    root_zone: str | None,
+) -> list[dict[str, Any]]:
+    zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
+    serial_number = zone_serial(zone_info)
+    entries = search_sqlite_allrecords_cache(
+        client,
+        zone_name,
+        serial_number,
+        keyword,
+        case_sensitive,
+    )
+    if entries is None:
+        entries = read_allrecords_search_cache(client, zone_name, serial_number)
+    if entries is None:
+        records = paged_query(client, ALLRECORDS_OBJECT, allrecords_query_params(client, zone_name))
+        entries = allrecord_search_entries(records, zone_name)
+        write_allrecords_cache(client, zone_name, serial_number, records, entries)
+
+    matches = []
+    for entry in entries:
+        if not allrecord_search_entry_matches_keyword(entry, keyword, case_sensitive):
+            continue
+        record = allrecord_search_entry_record(entry)
+        if root_zone and not record_in_zone_scope(record, root_zone):
+            continue
+        matches.append(entry)
+    return matches
+
+
 def collect_dns_search_results(
     client: InfobloxClient,
     keyword: str,
@@ -1132,19 +1641,144 @@ def collect_dns_search_results(
 ) -> list[tuple[str, dict[str, Any]]]:
     seen: set[str] = set()
     records: list[tuple[str, dict[str, Any]]] = []
+    zones = search_zones(client, root_zone)
 
-    for zone_info in search_zones(client, root_zone):
-        for item in allrecords_for_zone(client, zone_info):
-            if not allrecord_matches_keyword(item, keyword, case_sensitive):
-                continue
-            if root_zone and not record_in_zone_scope(item, root_zone):
-                continue
-            key = record_result_key(item)
-            if key in seen:
-                continue
-            seen.add(key)
-            records.append((allrecord_type(item), item))
+    def collect_zone_entries(zone_info: dict[str, Any]) -> list[dict[str, Any]]:
+        worker_client = clone_infoblox_client(client)
+        return matching_search_entries_for_zone(
+            worker_client,
+            zone_info,
+            keyword,
+            case_sensitive,
+            root_zone,
+        )
+
+    search_entries: list[dict[str, Any]] = []
+    if len(zones) > 1:
+        worker_count = min(DNS_SEARCH_WORKERS, len(zones))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for zone_entries in executor.map(collect_zone_entries, zones):
+                search_entries.extend(zone_entries)
+    elif zones:
+        search_entries.extend(collect_zone_entries(zones[0]))
+
+    for entry in sorted(search_entries, key=allrecord_search_entry_sort_key):
+        record = allrecord_search_entry_record(entry)
+        if not record:
+            continue
+        key = record_result_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append((allrecord_search_entry_type(entry), record))
     return records
+
+
+def search_cache_prewarm_lock_is_stale(lock_file: Path) -> bool:
+    try:
+        return time.time() - lock_file.stat().st_mtime > PREWARM_LOCK_STALE_SECONDS
+    except OSError:
+        return True
+
+
+def write_search_cache_prewarm_lock(lock_file: Path) -> tuple[int, str]:
+    token = f"{os.getpid()}:{time.time()}"
+    fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        os.write(fd, f"{token}\n".encode("ascii"))
+    except OSError:
+        os.close(fd)
+        raise
+    return fd, token
+
+
+def acquire_search_cache_prewarm_lock() -> tuple[int, str] | None:
+    try:
+        ensure_allrecords_cache_dir()
+        lock_file = search_cache_prewarm_lock_file()
+        try:
+            return write_search_cache_prewarm_lock(lock_file)
+        except FileExistsError:
+            if not search_cache_prewarm_lock_is_stale(lock_file):
+                return None
+            try:
+                lock_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            try:
+                return write_search_cache_prewarm_lock(lock_file)
+            except FileExistsError:
+                return None
+    except OSError:
+        return None
+
+
+def release_search_cache_prewarm_lock(lock: tuple[int, str]) -> None:
+    lock_fd, token = lock
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+
+    lock_file = search_cache_prewarm_lock_file()
+    try:
+        if lock_file.read_text(encoding="utf-8").strip() == token:
+            lock_file.unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def warm_global_search_cache(client: InfobloxClient) -> None:
+    zones = search_zones(client, None)
+
+    def warm_zone(zone_info: dict[str, Any]) -> None:
+        try:
+            allrecords_search_entries_for_zone(clone_infoblox_client(client), zone_info)
+        except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
+            return
+
+    if len(zones) > 1:
+        worker_count = min(DNS_SEARCH_WORKERS, len(zones))
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            list(executor.map(warm_zone, zones))
+    elif zones:
+        warm_zone(zones[0])
+
+
+def run_search_cache_prewarm() -> None:
+    lock: tuple[int, str] | None = None
+    try:
+        config = load_config(required=False)
+        if not config:
+            return
+        client = InfobloxClient(config)
+        lock = acquire_search_cache_prewarm_lock()
+        if lock is None:
+            return
+        warm_global_search_cache(client)
+    except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
+        return
+    finally:
+        if lock is not None:
+            release_search_cache_prewarm_lock(lock)
+
+
+def start_search_cache_prewarm() -> None:
+    env = os.environ.copy()
+    env.pop("_IB_COMPLETE", None)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "_prewarm-search-cache"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            env=env,
+        )
+    except (OSError, ValueError):
+        return
 
 
 def run_dns_search(
@@ -1496,14 +2130,39 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
     return table
 
 
-@click.group(cls=UsageContextGroup, context_settings={"help_option_names": ["-h", "--help"]})
+@click.group(cls=RootGroup, context_settings={"help_option_names": ["-h", "--help"]})
 def cli() -> None:
-    """Infoblox command line client."""
+    """Infoblox command line client.
+
+    Run `ib configure` first to save the Infoblox server, credentials, DNS view,
+    and default zone.
+
+    \b
+    Common usage:
+      ib dns zone list
+      ib dns zone use example.com
+      ib dns search app
+      ib dns create a --name app 192.0.2.10 --ttl 300
+      ib dns delete app
+
+    Use `ib dns --help`, `ib dns create --help`, and `ib dns zone --help` for
+    command-specific options and examples.
+    """
+
+
+@cli.command("_prewarm-search-cache", hidden=True)
+def prewarm_search_cache() -> None:
+    """Prewarm the DNS search cache."""
+    run_search_cache_prewarm()
 
 
 @cli.command()
 def configure() -> None:
-    """Create or update ~/.ib/config."""
+    """Create or update ~/.ib/config.
+
+    Prompts for the Infoblox server, username, password, WAPI version, DNS view,
+    default DNS zone, and SSL verification preference.
+    """
     save_config_interactive()
 
 
@@ -1571,12 +2230,34 @@ def completion(shell: str | None) -> None:
 
 @cli.group(cls=DnsGroup)
 def dns() -> None:
-    """Manage Infoblox DNS records."""
+    """Manage Infoblox DNS records.
+
+    Record commands use the active zone unless you pass `--zone`. The active
+    zone is resolved from `ib dns zone use`, then IB_ZONE, then the default zone
+    saved by `ib configure`.
+
+    \b
+    Examples:
+      ib dns search app
+      ib dns search -g app
+      ib dns create a --name app 192.0.2.10 --ttl 300
+      ib dns create cname --name www app.example.com
+      ib dns delete app
+    """
 
 
 @dns.group()
 def zone() -> None:
-    """Manage authoritative DNS zones."""
+    """Manage authoritative DNS zones.
+
+    \b
+    Examples:
+      ib dns zone list
+      ib dns zone list test
+      ib dns zone view example.com
+      ib dns zone create test.local --comment "Lab zone"
+      ib dns zone use example.com
+    """
 
 
 @zone.command("create")
@@ -1597,35 +2278,60 @@ def zone_create(
     comment: str | None,
     ns_group: str | None,
 ) -> None:
-    """Create a DNS zone."""
+    """Create a DNS zone.
+
+    Use `--format IPV4` for reverse IPv4 zones and `--format IPV6` for reverse
+    IPv6 zones. The default format is FORWARD.
+
+    \b
+    Examples:
+      ib dns zone create test.local --comment "Lab zone"
+      ib dns zone create 2.0.192.in-addr.arpa --format IPV4
+    """
     run_dns_zone_create(zone_name, zone_format, comment, ns_group)
 
 
 @zone.command("list")
 @click.argument("search", required=False)
 def zone_list(search: str | None) -> None:
-    """List DNS zones in the configured view."""
+    """List DNS zones in the configured view.
+
+    Pass an optional keyword to filter by zone name or comment.
+    """
     run_dns_zone_list(search)
 
 
 @zone.command("view")
 @click.argument("zone_name", shell_complete=complete_zone_names)
 def zone_view(zone_name: str) -> None:
-    """View DNS zone information."""
+    """View DNS zone information.
+
+    Shows the zone format, name server group, comment, reference, and SOA
+    settings such as serial, MNAME, RNAME, refresh, retry, expiry, and negative
+    caching TTL.
+    """
     run_dns_zone_view(zone_name)
 
 
 @zone.command("delete")
 @click.argument("zone_name")
 def zone_delete(zone_name: str) -> None:
-    """Delete a DNS zone."""
+    """Delete a DNS zone.
+
+    The command refuses ambiguous matches and prints the matching references
+    instead of deleting the wrong zone.
+    """
     run_dns_zone_delete(zone_name)
 
 
 @zone.command("use")
 @click.argument("zone_name", shell_complete=complete_zone_names)
 def zone_use(zone_name: str) -> None:
-    """Set the active DNS zone for this shell session."""
+    """Set the active DNS zone for this shell session.
+
+    A new shell session falls back to IB_ZONE or the default zone saved by
+    `ib configure`.
+    """
     run_dns_zone_use(zone_name)
 
 
@@ -1649,7 +2355,21 @@ def create(
     noptr: bool,
     comment: str | None,
 ) -> None:
-    """Create a DNS record."""
+    """Create a DNS record.
+
+    Record names are relative to the active zone unless already fully qualified.
+    Use `@` as the name for the zone apex. Supported record types are A, AAAA,
+    CNAME, TXT, MX, and PTR.
+
+    \b
+    Examples:
+      ib dns create a --name app 192.0.2.10 --ttl 300
+      ib dns create a --name app 192.0.2.10 --zone example.com
+      ib dns create cname --name www app.example.com
+      ib dns create txt --name _spf "v=spf1 include:example.net -all"
+      ib dns create mx --name @ "10 mail.example.com"
+      ib dns create ptr --name 192.0.2.10 host.example.com
+    """
     run_dns_create(record_type, value, name, zone, ttl, noptr, comment)
 
 
@@ -1658,7 +2378,15 @@ def create(
 @click.option("-i", "case_sensitive", is_flag=True, help="Use case-sensitive matching.")
 @click.option("-g", "global_search", is_flag=True, help="Search across the configured DNS view.")
 def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
-    """Search DNS records by name, value, or comment."""
+    """Search DNS records by name, value, or comment.
+
+    Normal search uses the active/default zone as the root and includes child
+    authoritative zones. Use `-g` to search the configured DNS view globally.
+    Use `-i` for case-sensitive matching.
+
+    Search data is cached under ~/.ib/allrecords-cache and refreshed when the
+    zone SOA serial changes.
+    """
     run_dns_search(keyword, case_sensitive, global_search)
 
 
@@ -1666,7 +2394,12 @@ def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
 @click.argument("record_name")
 @click.argument("zone", required=False)
 def delete(record_name: str, zone: str | None) -> None:
-    """Delete a DNS record by name."""
+    """Delete a DNS record by name.
+
+    The optional zone argument uses the same fallback rules as create. If the
+    record name matches multiple records, ib prints the ambiguous matches and
+    exits without deleting.
+    """
     run_dns_delete(record_name, zone)
 
 
