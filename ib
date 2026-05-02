@@ -1521,17 +1521,20 @@ def update_value_payload(record_type: str, value: str) -> dict[str, Any]:
 
 def update_payload(
     record_type: str,
-    value: str,
+    value: str | None,
     ttl: int | None,
     comment: str | None,
 ) -> dict[str, Any]:
     payload = {
-        **update_value_payload(record_type, value),
         **ttl_payload(ttl),
     }
+    if value is not None:
+        payload.update(update_value_payload(record_type, value))
     record_comment = normalize_record_comment(comment)
     if record_comment:
         payload["comment"] = record_comment
+    if not payload:
+        raise CliError("ERROR: nothing to update. Provide TYPE VALUE, -t/--ttl, or -c/--comment.")
     return payload
 
 
@@ -2756,20 +2759,23 @@ def dns_edit_forward_targets(config: dict[str, str], record_name: str, zone: str
     return targets
 
 
-def dns_edit_forward_matches(
+def dns_edit_forward_records(
     config: dict[str, str],
     client: InfobloxClient,
-    record_type: str,
     record_name: str,
     zone: str | None,
 ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
-    spec = RECORD_TYPES[record_type]
     targets = dns_edit_forward_targets(config, record_name, zone)
     target = targets[0]
 
     for candidate in targets:
-        params = object_query_params(spec, client, {"name": candidate})
-        matches = [(record_type, item) for item in safe_query(client, spec["object"], params)]
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for candidate_type in FORWARD_RECORD_TYPES:
+            spec = RECORD_TYPES[candidate_type]
+            params = object_query_params(spec, client, {"name": candidate})
+            matches.extend(
+                (candidate_type, item) for item in safe_query(client, spec["object"], params)
+            )
         if matches:
             return candidate, matches
     return target, []
@@ -2791,56 +2797,136 @@ def dns_edit_ptr_matches(
     return str(address), matches
 
 
+def record_name_is_ip_address(record_name: str) -> bool:
+    try:
+        ipaddress.ip_address(record_name.strip())
+    except ValueError:
+        return False
+    return True
+
+
 def dns_edit_matches(
     config: dict[str, str],
     client: InfobloxClient,
-    record_type: str,
+    record_type: str | None,
     record_name: str,
     zone: str | None,
-) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+) -> tuple[
+    str,
+    list[tuple[str, dict[str, Any]]],
+    list[tuple[str, dict[str, Any]]],
+]:
     if record_type == "ptr":
-        return dns_edit_ptr_matches(client, record_name)
-    return dns_edit_forward_matches(config, client, record_type, record_name, zone)
+        if not record_name_is_ip_address(record_name):
+            target, forward_matches = dns_edit_forward_records(config, client, record_name, zone)
+            if forward_matches:
+                return target, [], forward_matches
+        target, matches = dns_edit_ptr_matches(client, record_name)
+        return target, matches, matches
+
+    target, matches = dns_edit_forward_records(config, client, record_name, zone)
+    if record_type:
+        typed_matches = [
+            (item_type, item) for item_type, item in matches if item_type == record_type
+        ]
+        if not typed_matches and zone is None and record_name_is_ip_address(record_name):
+            try:
+                ptr_target, ptr_matches = dns_edit_ptr_matches(client, record_name)
+            except CliError:
+                pass
+            else:
+                if ptr_matches:
+                    return ptr_target, [], ptr_matches
+        return target, typed_matches, matches
+    if matches:
+        return target, matches, matches
+
+    if zone is None and record_name_is_ip_address(record_name):
+        try:
+            target, ptr_matches = dns_edit_ptr_matches(client, record_name)
+        except CliError:
+            pass
+        else:
+            if ptr_matches:
+                return target, ptr_matches, ptr_matches
+
+    return target, [], []
+
+
+def normalize_optional_record_type(record_type: str | None) -> str | None:
+    if record_type is None:
+        return None
+    normalized = record_type.lower()
+    if normalized not in RECORD_TYPES:
+        supported = ", ".join(sorted(RECORD_TYPES))
+        raise CliError(f"ERROR: unsupported record type '{record_type}'. Supported: {supported}")
+    return normalized
+
+
+def dns_edit_record_types(matches: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    return sorted({record_type.upper() for record_type, _item in matches})
+
+
+def raise_dns_edit_type_mismatch(
+    target: str,
+    requested_type: str,
+    matches: list[tuple[str, dict[str, Any]]],
+) -> None:
+    if len(matches) == 1:
+        actual_type = matches[0][0].upper()
+        raise CliError(
+            f"ERROR: {target} is a {actual_type} record, so edit type must be {actual_type}."
+        )
+
+    actual_types = ", ".join(dns_edit_record_types(matches)) or "unknown"
+    print_error(
+        f"ERROR: {target} has existing record types {actual_types}; "
+        f"requested edit type was {requested_type.upper()}."
+    )
+    err_console.print(record_table(matches, include_ref=True))
+    raise CliError("ERROR: edit type does not match the selected record.")
 
 
 def run_dns_edit(
     record_name: str,
-    record_type: str,
-    value: str,
+    record_type: str | None,
+    value: str | None,
     zone: str | None,
     ttl: int | None,
     noptr: bool,
     comment: str | None,
 ) -> None:
-    record_type = record_type.lower()
-    if record_type not in RECORD_TYPES:
-        supported = ", ".join(sorted(RECORD_TYPES))
-        raise CliError(f"ERROR: unsupported record type '{record_type}'. Supported: {supported}")
-
+    requested_type = normalize_optional_record_type(record_type)
+    if value is not None and requested_type is None:
+        raise CliError("ERROR: record type is required when updating the record value.")
     config = load_config()
     client = InfobloxClient(config)
-    target, matches = dns_edit_matches(config, client, record_type, record_name, zone)
+    target, matches, all_matches = dns_edit_matches(config, client, requested_type, record_name, zone)
 
     if not matches:
-        raise CliError(f"ERROR: no {record_type.upper()} DNS record found for {target} in view {client.view}")
+        if requested_type and all_matches:
+            raise_dns_edit_type_mismatch(target, requested_type, all_matches)
+        type_label = f" {requested_type.upper()}" if requested_type else ""
+        raise CliError(f"ERROR: no{type_label} DNS record found for {target} in view {client.view}")
     if len(matches) > 1:
-        print_error(f"ERROR: multiple {record_type.upper()} records found for {target}. Edit one _ref manually:")
+        print_error(f"ERROR: multiple records found for {target}. Edit one _ref manually:")
         err_console.print(record_table(matches, include_ref=True))
         raise CliError("ERROR: edit target is ambiguous.")
 
-    _, item = matches[0]
+    actual_type, item = matches[0]
     ref = item.get("_ref")
     if not ref:
         raise CliError("ERROR: matched record does not include an _ref.")
 
-    warn_if_cname_target_unresolved(record_type, value)
-    payload = update_payload(record_type, value, ttl, comment)
+    if value is not None:
+        warn_if_cname_target_unresolved(actual_type, value)
+    payload = update_payload(actual_type, value, ttl, comment)
     updated_ref = client.request("PUT", ref, payload=payload)
 
-    if noptr and record_type not in {"a", "aaaa"}:
+    if noptr and actual_type not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
     refresh_dns_cache_after_update()
-    print_success(f"SUCCESS: updated {record_type.upper()} record {target}")
+    print_success(f"SUCCESS: updated {actual_type.upper()} record {target}")
     print_note(f"Reference: {updated_ref or ref}")
 
 
@@ -3427,6 +3513,46 @@ def complete_dns_edit_records(
     return items
 
 
+def complete_dns_edit_record_types(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[CompletionItem]:
+    record_name_value = str(ctx.params.get("record_name", "")).strip()
+    if not record_name_value:
+        return []
+
+    try:
+        config = load_config(required=False)
+        if not config:
+            return []
+        client = InfobloxClient(config)
+        _target, matches, _all_matches = dns_edit_matches(
+            config,
+            client,
+            None,
+            record_name_value,
+            None,
+        )
+    except (CliError, OSError, ValueError, sqlite3.Error):
+        return []
+
+    items: list[CompletionItem] = []
+    seen: set[str] = set()
+    normalized_incomplete = incomplete.lower()
+    for record_type, item in matches:
+        if record_type in seen or not record_type.startswith(normalized_incomplete):
+            continue
+        seen.add(record_type)
+        items.append(
+            CompletionItem(
+                record_type,
+                help=f"Existing {record_type.upper()} record: {record_value(record_type, item)}",
+            )
+        )
+    return items
+
+
 def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
     table = Table(title=f"DNS Zones ({len(zones)})", header_style="bold cyan")
     table.add_column("Zone", overflow="fold")
@@ -3787,8 +3913,13 @@ def create(
 
 @dns.command()
 @click.argument("record_name", shell_complete=complete_dns_edit_records)
-@click.argument("record_type", type=click.Choice(sorted(RECORD_TYPES), case_sensitive=False))
-@click.argument("value")
+@click.argument(
+    "record_type",
+    required=False,
+    type=click.Choice(sorted(RECORD_TYPES), case_sensitive=False),
+    shell_complete=complete_dns_edit_record_types,
+)
+@click.argument("value", required=False)
 @click.option(
     "--zone",
     help=f"DNS zone. Defaults to the session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
@@ -3798,8 +3929,8 @@ def create(
 @click.option("-c", "--comment", callback=validate_record_comment_option, help="Record comment.")
 def edit(
     record_name: str,
-    record_type: str,
-    value: str,
+    record_type: str | None,
+    value: str | None,
     zone: str | None,
     ttl: int | None,
     noptr: bool,
@@ -3807,13 +3938,16 @@ def edit(
 ) -> None:
     """Edit an existing DNS record.
 
-    NAME supports shell completion from the DNS search cache. TYPE and VALUE
-    use the same record value rules as `ib dns create`, then ib updates the
-    matched record instead of creating a new one.
+    NAME supports shell completion from the DNS search cache. TYPE completion
+    only suggests the selected record's existing type. Provide TYPE VALUE to
+    update the record value, or omit both when changing only TTL or comment.
+    Infoblox does not support changing a record object's type; delete and
+    recreate the record when the type must change.
 
     \b
     Examples:
       ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
+      ib dns edit app -t 300 -c "Application host"
       ib dns edit www cname app.example.com
       ib dns edit app.example.com a 192.0.2.20
     """

@@ -83,7 +83,7 @@ Command overview:
 - `ib dns list [zone]` lists all DNS records in the active or specified zone.
 - `ib dns create <a|aaaa|cname|host|mx|ptr|txt> <name> <value>` creates DNS
   records.
-- `ib dns edit <name> <a|aaaa|cname|host|mx|ptr|txt> <value>` updates one
+- `ib dns edit <name> [a|aaaa|cname|host|mx|ptr|txt] [value]` updates one
   existing DNS record.
 - `ib dns search [-i] [-g] <keyword>` searches records by name, value, or comment.
 - `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
@@ -179,19 +179,25 @@ ib dns create aaaa app 2001:db8::10 --noptr
 
 ## Edit Records
 
-The command shape is `ib dns edit NAME {a|aaaa|cname|host|mx|ptr|txt} VALUE`.
-The `NAME` argument supports shell completion when completion is enabled. Edit
-uses the same value format, `--zone`, `-t/--ttl`, `--noptr`, and `-c/--comment`
-options as create, but updates the matched record by its Infoblox `_ref`.
+The command shape is `ib dns edit NAME [TYPE] [VALUE]`. The `NAME` argument
+supports shell completion when completion is enabled. `TYPE` completion only
+suggests the selected record's current type, and a supplied type must match the
+existing record. Use `TYPE VALUE` to update the record value, or omit both when
+changing only `-t/--ttl` or `-c/--comment`.
+
+`ib dns edit` cannot change a record's type because Infoblox does not support
+changing the WAPI object type of an existing record. Delete and recreate the
+record when the type must change.
 
 ```bash
 ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
+ib dns edit app -t 300 -c "Application host"
 ib dns edit www cname app.example.com
 ib dns edit app.example.com a 192.0.2.20
 ```
 
-If a name and type match multiple records, `ib` prints the ambiguous matches
-instead of updating the wrong record.
+If a name matches multiple records, `ib` prints the ambiguous matches instead of
+updating the wrong record.
 
 ## Search Records
 

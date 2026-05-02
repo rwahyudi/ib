@@ -423,15 +423,17 @@ class DefaultZoneTests(unittest.TestCase):
                 return "record:a/app"
 
         def fake_safe_query(client, object_type, params):
-            seen["query"] = (object_type, params)
-            return [
-                {
-                    "_ref": "record:a/app",
-                    "name": "app.example.com",
-                    "zone": "example.com",
-                    "ipv4addr": "192.0.2.10",
-                }
-            ]
+            seen.setdefault("queries", []).append((object_type, params))
+            if object_type == "record:a":
+                return [
+                    {
+                        "_ref": "record:a/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addr": "192.0.2.10",
+                    }
+                ]
+            return []
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
@@ -450,8 +452,17 @@ class DefaultZoneTests(unittest.TestCase):
                                     "Application host",
                                 )
 
-        self.assertEqual(seen["query"][0], "record:a")
-        self.assertEqual(seen["query"][1]["name"], "app.example.com")
+        self.assertIn(
+            (
+                "record:a",
+                {
+                    "_return_fields": ib.RECORD_TYPES["a"]["return_fields"],
+                    "view": "corp",
+                    "name": "app.example.com",
+                },
+            ),
+            seen["queries"],
+        )
         self.assertEqual(seen["request"][0], "PUT")
         self.assertEqual(seen["request"][1], "record:a/app")
         self.assertEqual(
@@ -464,6 +475,142 @@ class DefaultZoneTests(unittest.TestCase):
             },
         )
         self.cache_refresh.assert_called_once_with()
+
+    def test_dns_edit_accepts_metadata_only_without_type_or_value(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_edit") as run_dns_edit:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "edit", "app", "-t", "600", "-c", "Updated comment"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_edit.assert_called_once_with(
+            "app",
+            None,
+            None,
+            None,
+            600,
+            False,
+            "Updated comment",
+        )
+
+    def test_dns_edit_updates_ttl_and_comment_without_type(self):
+        seen = {}
+
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                seen["request"] = (method, object_type, payload)
+                return "record:host/app"
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:host":
+                return [
+                    {
+                        "_ref": "record:host/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addrs": [{"ipv4addr": "192.0.2.10"}],
+                    }
+                ]
+            return []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                ib.run_dns_edit(
+                                    "app",
+                                    None,
+                                    None,
+                                    None,
+                                    600,
+                                    False,
+                                    "Updated comment",
+                                )
+
+        self.assertEqual(seen["request"][0], "PUT")
+        self.assertEqual(seen["request"][1], "record:host/app")
+        self.assertEqual(
+            seen["request"][2],
+            {"ttl": 600, "use_ttl": True, "comment": "Updated comment"},
+        )
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_edit_rejects_type_that_does_not_match_selected_record(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                raise AssertionError("type mismatch must not update Infoblox")
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:host":
+                return [
+                    {
+                        "_ref": "record:host/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addrs": [{"ipv4addr": "192.0.2.10"}],
+                    }
+                ]
+            return []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            with self.assertRaises(ib.CliError) as caught:
+                                ib.run_dns_edit(
+                                    "app",
+                                    "a",
+                                    "192.0.2.20",
+                                    None,
+                                    None,
+                                    False,
+                                    None,
+                                )
+
+        self.assertIn("app.example.com is a HOST record", str(caught.exception))
+        self.assertIn("edit type must be HOST", str(caught.exception))
+        self.cache_refresh.assert_not_called()
+
+    def test_dns_edit_requires_a_change_when_type_and_value_are_omitted(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                raise AssertionError("empty edit must not update Infoblox")
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:a":
+                return [
+                    {
+                        "_ref": "record:a/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                    }
+                ]
+            return []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            with self.assertRaisesRegex(ib.CliError, "nothing to update"):
+                                ib.run_dns_edit("app", None, None, None, None, False, None)
+
+        self.cache_refresh.assert_not_called()
 
     def test_dns_create_bash_completion_no_longer_suggests_name_option_after_type(self):
         runner = CliRunner()
@@ -1545,6 +1692,16 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("Set a target with", result.output)
         self.assertIn("ib dns zone use", result.output)
 
+    def test_dns_edit_help_explains_type_change_limitation(self):
+        runner = CliRunner()
+        result = runner.invoke(ib.cli, ["dns", "edit", "--help"], prog_name="ib")
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        normalized_output = " ".join(result.output.split())
+        self.assertIn("TYPE completion", normalized_output)
+        self.assertIn("Infoblox does not support changing", normalized_output)
+        self.assertIn("delete and recreate", normalized_output.lower())
+
     def test_dns_delete_help_explains_forward_and_reverse_usage(self):
         runner = CliRunner()
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
@@ -2528,6 +2685,36 @@ class DefaultZoneTests(unittest.TestCase):
         dns_edit = ib.dns.commands["edit"]
 
         self.assertIs(dns_edit.params[0]._custom_shell_complete, ib.complete_dns_edit_records)
+        self.assertIs(dns_edit.params[1]._custom_shell_complete, ib.complete_dns_edit_record_types)
+
+    def test_dns_edit_type_completion_only_suggests_existing_record_type(self):
+        class FakeClient:
+            view = "corp"
+
+        class FakeContext:
+            params = {"record_name": "app"}
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:host":
+                return [
+                    {
+                        "_ref": "record:host/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addrs": [{"ipv4addr": "192.0.2.10"}],
+                    }
+                ]
+            return []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            items = ib.complete_dns_edit_record_types(FakeContext(), None, "")
+
+        self.assertEqual([item.value for item in items], ["host"])
 
 
 if __name__ == "__main__":
