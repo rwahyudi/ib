@@ -444,8 +444,8 @@ class DefaultZoneTests(unittest.TestCase):
             "--zone",
             "target record",
             "Context",
-            "Current view",
-            "Active zone",
+            "View=",
+            "Zone=",
             "-t/--ttl",
             "--noptr",
             "-c/--comment",
@@ -720,9 +720,9 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("<name>", result.output)
         self.assertIn("<value>", result.output)
         self.assertIn("Context", result.output)
-        self.assertIn("Current view", result.output)
+        self.assertIn("View", result.output)
         self.assertIn("corp", result.output)
-        self.assertIn("Active zone", result.output)
+        self.assertIn("Zone=", result.output)
         self.assertIn("example.com", result.output)
         self.assertIn("Without --zone", result.output)
         self.assertIn("Example", result.output)
@@ -752,34 +752,34 @@ class DefaultZoneTests(unittest.TestCase):
                     result = runner.invoke(ib.cli, ["dns", "create", "--help"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("Active zone", result.output)
+        self.assertIn("Zone=", result.output)
         self.assertIn("not set", result.output)
         self.assertIn("Set a target with", result.output)
         self.assertIn("ib dns zone use", result.output)
 
-    def test_dns_context_panel_uses_one_shared_line_with_background(self):
+    def test_dns_context_panel_uses_one_shared_borderless_line(self):
         with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
             with patch.object(ib, "active_zone_status", return_value=("example.com", "shell session")):
-                panel = ib.dns_context_panel("Current DNS Context")
+                context_line = ib.dns_context_panel("Current DNS Context")
 
-        self.assertIsInstance(panel.renderable, ib.Text)
+        self.assertIsInstance(context_line, ib.Text)
         self.assertEqual(
-            panel.renderable.plain,
-            "Current view: corp  |  Active zone: example.com",
+            context_line.plain,
+            "Current DNS Context: View=corp | Zone=example.com",
         )
-        self.assertNotIn("\n", panel.renderable.plain)
-        self.assertIn("on #0f172a", str(panel.style))
+        self.assertNotIn("\n", context_line.plain)
+        self.assertFalse(any(span.style and "on " in str(span.style) for span in context_line.spans))
 
     def test_dns_context_omits_redundant_missing_active_zone_source(self):
         with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
             with patch.object(ib, "active_zone_status", return_value=(None, "not set")):
-                panel = ib.dns_context_panel("Current DNS Context")
+                context_line = ib.dns_context_panel("Current DNS Context")
 
         self.assertEqual(
-            panel.renderable.plain,
-            "Current view: corp  |  Active zone: not set",
+            context_line.plain,
+            "Current DNS Context: View=corp | Zone=not set",
         )
-        self.assertNotIn("not set (not set)", panel.renderable.plain)
+        self.assertNotIn("not set (not set)", context_line.plain)
 
     def test_dns_zone_list_prints_context_before_zone_table(self):
         class FakeClient:
@@ -1412,11 +1412,27 @@ class DefaultZoneTests(unittest.TestCase):
         class FakeClient:
             view = "corp"
 
+            def request(self, method, object_type, params=None, payload=None):
+                self.association_params = params
+                return [
+                    {
+                        "network_view": "default",
+                        "network_associations": [{"network": "10.1.1.0/24"}],
+                    }
+                ]
+
         zone_info = {"fqdn": "example.com", "view": "corp", "zone_format": "FORWARD"}
+        fake_client = FakeClient()
+        table_inputs = []
+
+        def fake_zone_detail_table(item):
+            table_inputs.append(item)
+            return "details"
+
         with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
-            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+            with patch.object(ib, "InfobloxClient", return_value=fake_client):
                 with patch.object(ib, "safe_query", return_value=[zone_info]) as safe_query:
-                    with patch.object(ib, "zone_detail_table", return_value="details"):
+                    with patch.object(ib, "zone_detail_table", side_effect=fake_zone_detail_table):
                         with patch.object(ib.console, "print") as print_mock:
                             ib.run_dns_zone_view("example.com.")
 
@@ -1427,7 +1443,41 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("soa_serial_number", params["_return_fields"])
         self.assertIn("member_soa_mnames", params["_return_fields"])
         self.assertIn("soa_negative_ttl", params["_return_fields"])
+        self.assertIn("network_view", params["_return_fields"])
+        self.assertNotIn("network_associations", params["_return_fields"])
+        self.assertEqual(fake_client.association_params["fqdn"], "example.com")
+        self.assertEqual(fake_client.association_params["view"], "corp")
+        self.assertEqual(
+            fake_client.association_params["_return_fields"],
+            ib.ZONE_NETWORK_ASSOCIATION_RETURN_FIELDS,
+        )
+        self.assertEqual(table_inputs[0]["network_view"], "default")
+        self.assertEqual(table_inputs[0]["network_associations"], [{"network": "10.1.1.0/24"}])
         print_mock.assert_called_once_with("details")
+
+    def test_dns_zone_view_does_not_fail_when_network_association_query_returns_500(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, params=None, payload=None):
+                raise ib.WapiError("ERROR: Infoblox WAPI 500: Internal Error", status=500)
+
+        zone_info = {"fqdn": "example.com", "view": "corp", "zone_format": "FORWARD"}
+        table_inputs = []
+
+        def fake_zone_detail_table(item):
+            table_inputs.append(item)
+            return "details"
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "safe_query", return_value=[zone_info]):
+                    with patch.object(ib, "zone_detail_table", side_effect=fake_zone_detail_table):
+                        with patch.object(ib.console, "print") as print_mock:
+                            ib.run_dns_zone_view("example.com.")
+
+        print_mock.assert_called_once_with("details")
+        self.assertIn("Unavailable: Infoblox WAPI 500", table_inputs[0]["network_associations"])
 
     def test_zone_serial_query_includes_primary_type(self):
         class FakeClient:
@@ -1488,6 +1538,15 @@ class DefaultZoneTests(unittest.TestCase):
                 "view": "corp",
                 "zone_format": "FORWARD",
                 "member_soa_mnames": [{"mname": "ns1.example.com"}],
+                "network_view": "default",
+                "network_associations": [
+                    {"network": "10.1.1.0/24", "network_view": "default"},
+                    {
+                        "network": "10.1.2.0/24",
+                        "network_view": "default",
+                        "comment": "Lab network",
+                    },
+                ],
                 "soa_email": "hostmaster.example.com",
                 "soa_refresh": 10800,
                 "soa_retry": 3600,
@@ -1505,6 +1564,12 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(rows["Retry"], "3600")
         self.assertEqual(rows["Expiry"], "604800")
         self.assertEqual(rows["Negative Caching TTL"], "300")
+        self.assertEqual(rows["Network View"], "default")
+        self.assertIn("10.1.1.0/24 (view: default)", rows["Network Associations"])
+        self.assertIn(
+            "10.1.2.0/24 (view: default, comment: Lab network)",
+            rows["Network Associations"],
+        )
 
     def test_dns_zone_view_uses_zone_name_completion(self):
         zone_view = ib.zone.commands["view"]

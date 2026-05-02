@@ -62,10 +62,12 @@ ALLRECORDS_OBJECT = "allrecords"
 ALLRECORDS_RETURN_FIELDS = "name,type,view,zone,ttl,comment,address,record"
 ZONE_OBJECT = "zone_auth"
 ZONE_RETURN_FIELDS = "fqdn,view,zone_format,comment,ns_group"
-ZONE_DETAIL_RETURN_FIELDS = (
+BASE_ZONE_DETAIL_RETURN_FIELDS = (
     f"{ZONE_RETURN_FIELDS},member_soa_mnames,soa_email,soa_expire,soa_negative_ttl,"
     "soa_refresh,soa_retry,soa_serial_number"
 )
+ZONE_NETWORK_ASSOCIATION_RETURN_FIELDS = "network_view,network_associations"
+ZONE_DETAIL_RETURN_FIELDS = f"{BASE_ZONE_DETAIL_RETURN_FIELDS},network_view"
 ZONE_SERIAL_RETURN_FIELDS = f"{ZONE_RETURN_FIELDS},primary_type,soa_serial_number"
 ZONE_FORMATS = ("FORWARD", "IPV4", "IPV6")
 console = Console()
@@ -625,9 +627,9 @@ def active_zone_completion_value() -> str:
     return f"active-zone={zone_name or 'not-set'}"
 
 
-DNS_CONTEXT_BACKGROUND_STYLE = "white on #0f172a"
-DNS_CONTEXT_LABEL_STYLE = f"bold cyan on #0f172a"
-DNS_CONTEXT_SOURCE_STYLE = f"dim white on #0f172a"
+DNS_CONTEXT_TITLE_STYLE = "bold cyan"
+DNS_CONTEXT_LABEL_STYLE = "cyan"
+DNS_CONTEXT_SOURCE_STYLE = "dim"
 
 
 def dns_context_status() -> dict[str, Any]:
@@ -662,9 +664,7 @@ def current_view_context_text(
 ) -> Text:
     context = status or dns_context_status()
     view_name = context["view"]
-    view_style = (
-        "bold magenta on #0f172a" if view_name != "not configured" else "bold yellow on #0f172a"
-    )
+    view_style = "bold magenta" if view_name != "not configured" else "bold yellow"
     return dns_context_value_text(view_name, context["view_source"], view_style, include_source)
 
 
@@ -673,9 +673,7 @@ def active_zone_context_text(
     include_source: bool = True,
 ) -> Text:
     context = status or dns_context_status()
-    zone_style = (
-        "bold green on #0f172a" if context["has_active_zone"] else "bold yellow on #0f172a"
-    )
+    zone_style = "bold green" if context["has_active_zone"] else "bold yellow"
     return dns_context_value_text(
         context["active_zone"],
         context["active_zone_source"] if context["has_active_zone"] else None,
@@ -687,10 +685,11 @@ def active_zone_context_text(
 def dns_context_line_text(status: dict[str, Any] | None = None) -> Text:
     context = status or dns_context_status()
     text = Text(no_wrap=True, overflow="ellipsis")
-    text.append("Current view: ", style=DNS_CONTEXT_LABEL_STYLE)
+    text.append("Current DNS Context: ", style=DNS_CONTEXT_TITLE_STYLE)
+    text.append("View=", style=DNS_CONTEXT_LABEL_STYLE)
     text.append_text(current_view_context_text(context, include_source=False))
-    text.append("  |  ", style=DNS_CONTEXT_BACKGROUND_STYLE)
-    text.append("Active zone: ", style=DNS_CONTEXT_LABEL_STYLE)
+    text.append(" | ")
+    text.append("Zone=", style=DNS_CONTEXT_LABEL_STYLE)
     text.append_text(active_zone_context_text(context, include_source=False))
     return text
 
@@ -726,14 +725,8 @@ def dns_create_example_text(zone_name: str | None) -> Text:
     )
 
 
-def dns_context_panel(title: str = "Current DNS Context") -> Panel:
-    return Panel(
-        dns_context_line_text(),
-        title=title,
-        style=DNS_CONTEXT_BACKGROUND_STYLE,
-        border_style="bright_cyan",
-        padding=(0, 1),
-    )
+def dns_context_panel(title: str = "Current DNS Context") -> Text:
+    return dns_context_line_text()
 
 
 def dns_create_usage_panel() -> Panel:
@@ -2347,6 +2340,37 @@ def run_dns_zone_list(search: str | None = None) -> None:
     console.print(zone_table(zones))
 
 
+def zone_network_association_unavailable(exc: WapiError) -> str:
+    status = f" {exc.status}" if exc.status else ""
+    return f"Unavailable: Infoblox WAPI{status} failed while reading network associations."
+
+
+def add_zone_network_association_details(
+    client: InfobloxClient,
+    target: str,
+    zone_info: dict[str, Any],
+) -> None:
+    params = zone_query_params(
+        client,
+        {"fqdn": target},
+        return_fields=ZONE_NETWORK_ASSOCIATION_RETURN_FIELDS,
+    )
+    try:
+        result = client.request("GET", ZONE_OBJECT, params=params)
+    except WapiError as exc:
+        zone_info.setdefault("network_associations", zone_network_association_unavailable(exc))
+        return
+
+    matches = result if isinstance(result, list) else []
+    if len(matches) != 1:
+        return
+
+    association_info = matches[0]
+    for key in ("network_view", "network_associations"):
+        if key in association_info:
+            zone_info[key] = association_info[key]
+
+
 def run_dns_zone_view(zone_name: str) -> None:
     client = InfobloxClient(load_config())
     target = normalize_zone_name(zone_name)
@@ -2363,7 +2387,9 @@ def run_dns_zone_view(zone_name: str) -> None:
         err_console.print(zone_table(matches, include_ref=True))
         raise CliError("ERROR: view target is ambiguous.")
 
-    console.print(zone_detail_table(matches[0]))
+    zone_info = dict(matches[0])
+    add_zone_network_association_details(client, target, zone_info)
+    console.print(zone_detail_table(zone_info))
 
 
 def run_dns_zone_delete(zone_name: str) -> None:
@@ -2611,6 +2637,29 @@ def format_zone_detail_value(value: Any) -> str:
     return str(value)
 
 
+def format_network_association(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(
+            formatted for item in value if (formatted := format_network_association(item))
+        )
+    if isinstance(value, dict):
+        network = value.get("network") or value.get("address") or value.get("_ref")
+        if not network:
+            return format_zone_detail_value(value)
+
+        details = []
+        if value.get("network_view"):
+            details.append(f"view: {value['network_view']}")
+        if value.get("comment"):
+            details.append(f"comment: {value['comment']}")
+        if details:
+            return f"{network} ({', '.join(details)})"
+        return str(network)
+    return str(value)
+
+
 def zone_detail_table(zone_info: dict[str, Any]) -> Table:
     zone_name = str(zone_info.get("fqdn", ""))
     table = Table(title=f"DNS Zone: {zone_name}", header_style="bold cyan")
@@ -2622,6 +2671,8 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
         ("View", "view"),
         ("Format", "zone_format"),
         ("NS Group", "ns_group"),
+        ("Network View", "network_view"),
+        ("Network Associations", "network_associations"),
         ("Serial Number", "soa_serial_number"),
         ("SOA MNAME", "member_soa_mnames"),
         ("SOA RNAME", "soa_email"),
@@ -2633,7 +2684,8 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
         ("Ref", "_ref"),
     ]
     for label, key in fields:
-        table.add_row(label, format_zone_detail_value(zone_info.get(key)))
+        formatter = format_network_association if key == "network_associations" else format_zone_detail_value
+        table.add_row(label, formatter(zone_info.get(key)))
     return table
 
 
@@ -2818,9 +2870,9 @@ def zone_list(search: str | None) -> None:
 def zone_view(zone_name: str) -> None:
     """View DNS zone information.
 
-    Shows the zone format, name server group, comment, reference, and SOA
-    settings such as serial, MNAME, RNAME, refresh, retry, expiry, and negative
-    caching TTL.
+    Shows the zone format, name server group, network view, network
+    associations, comment, reference, and SOA settings such as serial, MNAME,
+    RNAME, refresh, retry, expiry, and negative caching TTL.
     """
     run_dns_zone_view(zone_name)
 

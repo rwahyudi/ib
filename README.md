@@ -82,7 +82,7 @@ Command overview:
 - `ib dns search [-g] [-i] <keyword>` searches records by name, value, or comment.
 - `ib dns delete <record-name> [zone]` deletes a single matching DNS record.
 - `ib dns zone list [keyword]` lists authoritative zones in the configured view.
-- `ib dns zone view <zone>` shows zone details and SOA settings.
+- `ib dns zone view <zone>` shows zone details, network associations, and SOA settings.
 - `ib dns zone create <zone> [--format FORWARD|IPV4|IPV6]` creates a zone.
 - `ib dns zone delete <zone>` deletes a zone.
 - `ib dns zone use <zone>` sets the active zone for the current shell session.
