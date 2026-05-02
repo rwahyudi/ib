@@ -9,7 +9,7 @@ readable terminal output.
 ## Features
 
 - Configure server, credentials, DNS view, and default zone with `ib configure`.
-- Create A, AAAA, CNAME, TXT, MX, and PTR records.
+- Create A, AAAA, CNAME, TXT, MX, PTR, and HOST records.
 - Search DNS records by name, value, or comment.
 - Search the active zone plus child authoritative zones, or search globally with `-g`.
 - Cache `allrecords` data in SQLite and refresh by SOA serial number.
@@ -44,6 +44,11 @@ ib configure
 - Default DNS zone
 - SSL verification preference
 
+You can run `ib configure` multiple times. It will not wipe existing values just
+because you rerun it: saved values are shown as defaults, pressing Enter keeps
+the current value, and leaving the password prompt blank keeps the current
+password.
+
 Private files are written under `~/.ib/`. The config directory is kept at
 `0700`; the config and key files are kept at `0600`.
 
@@ -65,7 +70,7 @@ ib configure
 ib dns zone list
 ib dns zone use example.com
 ib dns search app
-ib dns create a --name app 192.0.2.10 --ttl 300 --comment "Application VIP"
+ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
 ib dns delete app
 ```
 
@@ -73,7 +78,7 @@ Command overview:
 
 - `ib configure` creates or updates Infoblox connection settings.
 - `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
-- `ib dns create <type> --name <name> <value>` creates DNS records.
+- `ib dns create <type> -n|--name <name> <value>` creates DNS records.
 - `ib dns search [-g] [-i] <keyword>` searches records by name, value, or comment.
 - `ib dns delete <record-name> [zone]` deletes a single matching DNS record.
 - `ib dns zone list [keyword]` lists authoritative zones in the configured view.
@@ -115,26 +120,43 @@ export IB_ZONE=test.local
 ## Create Records
 
 Record names are relative to the active zone unless already fully qualified.
+Use `-t` or `--ttl` for record TTL, and `-c` or `--comment` for a plain ASCII
+comment.
 
-```bash
-ib dns create a --name app 192.0.2.10 --ttl 300 --comment "Application VIP"
-ib dns create aaaa --name app 2001:db8::10 --ttl 300
-ib dns create cname --name www app.example.com
-ib dns create txt --name _spf "v=spf1 include:example.net -all"
-ib dns create mx --name @ "10 mail.example.com"
-ib dns create ptr --name 192.0.2.10 host.example.com
-```
+For forward records, a fully qualified `-n` or `--name` can select its zone
+automatically. For example, if `example-dns.com` exists as a forward zone,
+`-n host1.example-dns.com` uses `example-dns.com`; if no forward zone
+matches, `ib` falls back to the active/default zone.
+
+Assuming the active zone is `example.com`, these commands produce:
+
+| Command | Record produced |
+| --- | --- |
+| `ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"` | `A app.example.com -> 192.0.2.10`, TTL `300`, comment `Application VIP` |
+| `ib dns create a -n host1.example-dns.com 192.0.2.10` | `A host1.example-dns.com -> 192.0.2.10` in zone `example-dns.com` when that forward zone exists |
+| `ib dns create host -n app 192.0.2.10 -t 300 -c "Application host"` | `HOST app.example.com` with IPv4 address `192.0.2.10`, TTL `300`, comment `Application host` |
+| `ib dns create aaaa -n app 2001:db8::10 --ttl 300` | `AAAA app.example.com -> 2001:db8::10`, TTL `300` |
+| `ib dns create cname -n www app.example.com` | `CNAME www.example.com -> app.example.com` |
+| `ib dns create txt -n _spf "v=spf1 include:example.net -all"` | `TXT _spf.example.com = "v=spf1 include:example.net -all"` |
+| `ib dns create mx -n @ "10 mail.example.com"` | `MX example.com -> mail.example.com` with preference `10` |
+| `ib dns create ptr -n 192.0.2.10 host.example.com` | `PTR 192.0.2.10 -> host.example.com` |
+
+If Infoblox returns `The IP address ... cannot be used for the zone ...`,
+the selected forward zone does not allow that IP based on its network
+association. Use an IP associated with that zone, choose the correct zone with
+`--zone` or a fully qualified `-n` name, or update the zone network association
+in Infoblox.
 
 Use `--zone` to bypass the active zone for one command:
 
 ```bash
-ib dns create a --name app 192.0.2.10 --zone example.com
+ib dns create a -n app 192.0.2.10 --zone example.com
 ```
 
 For A/AAAA workflows, add `--noptr` when you do not want PTR handling:
 
 ```bash
-ib dns create a --name app 192.0.2.10 --noptr
+ib dns create a -n app 192.0.2.10 --noptr
 ```
 
 ## Search Records

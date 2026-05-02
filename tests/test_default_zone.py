@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from click.testing import CliRunner
+
 
 def load_ib_module():
     repo_root = Path(__file__).resolve().parents[1]
@@ -45,6 +47,494 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(seen["zone"], "example.com")
         self.assertEqual(seen["request"][0], "POST")
+
+    def test_dns_create_uses_matching_forward_zone_from_fqdn_name(self):
+        seen = {"zone_queries": []}
+
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                seen["request"] = (method, object_type, payload)
+                return "record:a/example"
+
+        def fake_safe_query(client, object_type, params):
+            seen["zone_queries"].append(params["fqdn"])
+            if params["fqdn"] == "example-dns.com":
+                return [{"fqdn": "example-dns.com", "zone_format": "FORWARD"}]
+            return []
+
+        def fake_create_payload(record_type, value, name, zone, ttl, comment, client):
+            seen["zone"] = zone
+            return "record:a", {"name": name, "ipv4addr": value}
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "fallback.example"}):
+                with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                    with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                        with patch.object(ib, "create_payload", side_effect=fake_create_payload):
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                ib.run_dns_create(
+                                    "a",
+                                    "192.0.2.10",
+                                    "host1.example-dns.com",
+                                    None,
+                                    None,
+                                    False,
+                                    None,
+                                )
+
+        self.assertEqual(seen["zone"], "example-dns.com")
+        self.assertEqual(
+            seen["zone_queries"][:2],
+            ["host1.example-dns.com", "example-dns.com"],
+        )
+        self.assertEqual(seen["request"][0], "POST")
+
+    def test_dns_create_uses_longest_matching_forward_zone_from_fqdn_name(self):
+        class FakeClient:
+            view = "corp"
+
+        def fake_safe_query(client, object_type, params):
+            if params["fqdn"] == "dev.example.com":
+                return [{"fqdn": "dev.example.com", "zone_format": "FORWARD"}]
+            if params["fqdn"] == "example.com":
+                return [{"fqdn": "example.com", "zone_format": "FORWARD"}]
+            return []
+
+        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+            zone = ib.resolve_dns_create_zone(
+                {"default_zone": "fallback.example"},
+                FakeClient(),
+                "a",
+                "app.dev.example.com",
+            )
+
+        self.assertEqual(zone, "dev.example.com")
+
+    def test_dns_create_falls_back_when_fqdn_name_has_no_matching_forward_zone(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "read_session_zone", return_value=None):
+                with patch.object(ib, "safe_query", return_value=[]):
+                    zone = ib.resolve_dns_create_zone(
+                        {"default_zone": "fallback.example"},
+                        FakeClient(),
+                        "a",
+                        "host1.unknown.example",
+                    )
+
+        self.assertEqual(zone, "fallback.example")
+
+    def test_dns_create_explicit_zone_skips_fqdn_name_zone_lookup(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.object(ib, "safe_query") as safe_query:
+            zone = ib.resolve_dns_create_zone(
+                {"default_zone": "fallback.example"},
+                FakeClient(),
+                "a",
+                "host1.example-dns.com",
+                "explicit.example",
+            )
+
+        self.assertEqual(zone, "explicit.example")
+        safe_query.assert_not_called()
+
+    def test_dns_create_ptr_skips_fqdn_name_zone_lookup(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "read_session_zone", return_value=None):
+                with patch.object(ib, "safe_query") as safe_query:
+                    zone = ib.resolve_dns_create_zone(
+                        {"default_zone": "fallback.example"},
+                        FakeClient(),
+                        "ptr",
+                        "host1.example-dns.com",
+                    )
+
+        self.assertEqual(zone, "fallback.example")
+        safe_query.assert_not_called()
+
+    def test_dns_create_ignores_non_forward_zone_match_for_fqdn_name(self):
+        class FakeClient:
+            view = "corp"
+
+        def fake_safe_query(client, object_type, params):
+            if params["fqdn"] == "example-dns.com":
+                return [{"fqdn": "example-dns.com", "zone_format": "IPV4"}]
+            return []
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "read_session_zone", return_value=None):
+                with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                    zone = ib.resolve_dns_create_zone(
+                        {"default_zone": "fallback.example"},
+                        FakeClient(),
+                        "a",
+                        "host1.example-dns.com",
+                    )
+
+        self.assertEqual(zone, "fallback.example")
+
+    def test_dns_create_host_payload_uses_ipv4addrs(self):
+        class FakeClient:
+            view = "corp"
+
+        object_type, payload = ib.create_payload(
+            "host",
+            "192.0.2.10",
+            "app",
+            "example.com",
+            300,
+            "Application host",
+            FakeClient(),
+        )
+
+        self.assertEqual(object_type, "record:host")
+        self.assertEqual(payload["name"], "app.example.com")
+        self.assertEqual(payload["view"], "corp")
+        self.assertEqual(payload["ipv4addrs"], [{"ipv4addr": "192.0.2.10"}])
+        self.assertEqual(payload["ttl"], 300)
+        self.assertTrue(payload["use_ttl"])
+        self.assertEqual(payload["comment"], "Application host")
+
+    def test_dns_create_host_payload_uses_ipv6addrs(self):
+        class FakeClient:
+            view = "corp"
+
+        object_type, payload = ib.create_payload(
+            "host",
+            "2001:db8::10",
+            "app",
+            "example.com",
+            None,
+            None,
+            FakeClient(),
+        )
+
+        self.assertEqual(object_type, "record:host")
+        self.assertEqual(payload["ipv6addrs"], [{"ipv6addr": "2001:db8::10"}])
+        self.assertNotIn("ipv4addrs", payload)
+
+    def test_dns_create_host_requires_ip_address_value(self):
+        class FakeClient:
+            view = "corp"
+
+        with self.assertRaisesRegex(ib.CliError, "host value must be an IPv4 or IPv6 address"):
+            ib.create_payload("host", "target.example.com", "app", "example.com", None, None, FakeClient())
+
+    def test_dns_create_accepts_short_name_ttl_and_comment_options(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_create") as run_dns_create:
+            result = runner.invoke(
+                ib.cli,
+                [
+                    "dns",
+                    "create",
+                    "a",
+                    "-n",
+                    "app",
+                    "192.0.2.10",
+                    "-t",
+                    "300",
+                    "-c",
+                    "Application VIP",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_create.assert_called_once_with(
+            "a",
+            "192.0.2.10",
+            "app",
+            None,
+            300,
+            False,
+            "Application VIP",
+        )
+
+    def test_dns_create_bash_completion_suggests_short_name_after_type(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns create a ",
+                "COMP_CWORD": "4",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("plain,-n", result.output.splitlines())
+        self.assertIn("plain,--name", result.output.splitlines())
+
+    def test_dns_create_rejects_non_integer_ttl(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_create") as run_dns_create:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "create", "a", "--name", "app", "192.0.2.10", "-t", "soon"],
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not a valid integer", result.output)
+        run_dns_create.assert_not_called()
+
+    def test_configure_help_explains_repeated_runs_keep_existing_values(self):
+        runner = CliRunner()
+
+        result = runner.invoke(ib.cli, ["configure", "--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("run this command multiple times", result.output)
+        self.assertIn("pressing Enter keeps the current value", result.output)
+        self.assertIn("password prompt is left blank", result.output)
+
+    def test_dns_create_rejects_negative_ttl_option(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_create") as run_dns_create:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "create", "a", "--name", "app", "192.0.2.10", "-t", "-1"],
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("ttl must be 0 or greater", result.output)
+        run_dns_create.assert_not_called()
+
+    def test_dns_create_rejects_invalid_comment_option(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_create") as run_dns_create:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "create", "a", "--name", "app", "192.0.2.10", "-c", "bad|comment"],
+            )
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("comment may only contain", result.output)
+        run_dns_create.assert_not_called()
+
+    def test_dns_create_click_error_help_includes_all_options(self):
+        try:
+            ib.cli.main(
+                args=["dns", "create", "a", "192.0.2.10"],
+                prog_name="ib",
+                standalone_mode=False,
+            )
+        except ib.click.ClickException as exc:
+            help_text = ib.dns_create_click_error_help(exc)
+        else:
+            self.fail("expected click error")
+
+        self.assertIsNotNone(help_text)
+        self.assertIn("Create Record Usage", help_text)
+        self.assertIn("-n, --name TEXT", help_text)
+        self.assertIn("--zone TEXT", help_text)
+        self.assertIn("-t, --ttl INTEGER", help_text)
+        self.assertIn("--noptr", help_text)
+        self.assertIn("-c, --comment TEXT", help_text)
+
+    def test_dns_search_missing_keyword_error_prints_current_context(self):
+        with patch.object(ib.sys, "argv", ["ib", "dns", "search"]):
+            with patch.object(ib, "dns_context_panel", return_value="context") as dns_context_panel:
+                with patch.object(ib.err_console, "print") as err_print:
+                    exit_code = ib.main()
+
+        self.assertEqual(exit_code, 2)
+        dns_context_panel.assert_called_once_with()
+        printed_texts = [call.args[0] for call in err_print.call_args_list if call.args]
+        error_lines = [
+            item
+            for item in printed_texts
+            if isinstance(item, ib.Text) and "Error:" in item.plain
+        ]
+        self.assertTrue(error_lines)
+        self.assertEqual(str(error_lines[0].style), "white")
+        err_print.assert_any_call("context")
+
+    def test_click_error_only_usage_prefix_is_cyan(self):
+        try:
+            ib.cli.main(args=["dns", "search"], prog_name="ib", standalone_mode=False)
+        except ib.click.ClickException as exc:
+            with patch.object(ib.err_console, "print") as err_print:
+                ib.print_click_exception(exc)
+        else:
+            self.fail("expected click error")
+
+        printed_texts = [call.args[0] for call in err_print.call_args_list if call.args]
+        usage_line = next(item for item in printed_texts if isinstance(item, ib.Text) and "Usage:" in item.plain)
+        error_line = next(item for item in printed_texts if isinstance(item, ib.Text) and "Error:" in item.plain)
+        self.assertEqual(usage_line.spans[0].start, 0)
+        self.assertEqual(usage_line.spans[0].end, len("Usage: "))
+        self.assertEqual(str(usage_line.spans[0].style), "cyan")
+        self.assertTrue(
+            all("cyan" not in str(span.style) for span in usage_line.spans[1:]),
+            usage_line.spans,
+        )
+        self.assertEqual(str(error_line.style), "white")
+
+    def test_dns_create_runtime_error_context_includes_all_options(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                raise ib.WapiError("ERROR: duplicate record", status=400)
+
+        with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "dns_context_status",
+                    return_value={
+                        "view": "corp",
+                        "view_source": "configured",
+                        "active_zone": "example.com",
+                        "active_zone_source": "configured default",
+                        "has_active_zone": True,
+                    },
+                ):
+                    with self.assertRaises(ib.DnsCreateError) as caught:
+                        ib.run_dns_create(
+                            "a",
+                            "192.0.2.10",
+                            "app",
+                            "example.com",
+                            300,
+                            True,
+                            "Application VIP",
+                        )
+
+        context = caught.exception.context
+        self.assertEqual(context["record_type"], "a")
+        self.assertEqual(context["value"], "192.0.2.10")
+        self.assertEqual(context["--name"], "app")
+        self.assertEqual(context["--zone"], "example.com")
+        self.assertEqual(context["target_record"], "app.example.com")
+        self.assertEqual(context["resolved_zone"], "example.com")
+        self.assertEqual(context["view"], "corp")
+        self.assertEqual(context["active_zone"], "example.com")
+        self.assertEqual(context["-t/--ttl"], 300)
+        self.assertIs(context["--noptr"], True)
+        self.assertEqual(context["-c/--comment"], "Application VIP")
+        self.assertEqual(context["wapi_object"], "record:a")
+
+        test_console = ib.Console(width=120, force_terminal=False)
+        with test_console.capture() as capture:
+            test_console.print(ib.dns_create_error_context_panel(context))
+        output = capture.get()
+        for expected in (
+            "--name",
+            "--zone",
+            "target record",
+            "Context",
+            "Current view",
+            "Active zone",
+            "-t/--ttl",
+            "--noptr",
+            "-c/--comment",
+            "-n/--name",
+        ):
+            self.assertIn(expected, output)
+
+    def test_dns_create_network_association_error_includes_hint(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                raise ib.WapiError(
+                    "ERROR: Infoblox WAPI 400: The IP address 10.1.1.1 cannot be used "
+                    "for the zone latrobe-test.edu.au. Verify the network association "
+                    "in the zone properties.",
+                    status=400,
+                )
+
+        with patch.object(ib, "load_config", return_value={"default_zone": "latrobe-test.edu.au"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "dns_context_status",
+                    return_value={
+                        "view": "corp",
+                        "view_source": "configured",
+                        "active_zone": "latrobe-test.edu.au",
+                        "active_zone_source": "configured default",
+                        "has_active_zone": True,
+                    },
+                ):
+                    with self.assertRaises(ib.DnsCreateError) as caught:
+                        ib.run_dns_create(
+                            "a",
+                            "10.1.1.1",
+                            "test",
+                            None,
+                            None,
+                            False,
+                            None,
+                        )
+
+        context = caught.exception.context
+        self.assertEqual(context["target_record"], "test.latrobe-test.edu.au")
+        self.assertEqual(context["resolved_zone"], "latrobe-test.edu.au")
+        self.assertIn("IP address 10.1.1.1", context["hint"])
+        self.assertIn("DNS zone latrobe-test.edu.au", context["hint"])
+        self.assertIn("--zone or a fully qualified -n name", context["hint"])
+
+        test_console = ib.Console(width=120, force_terminal=False)
+        with test_console.capture() as capture:
+            test_console.print(ib.dns_create_error_context_panel(context))
+        output = capture.get()
+        self.assertIn("Hint", output)
+        self.assertIn("target record", output)
+        self.assertIn("test.latrobe-test.edu.au", output)
+
+    def test_dns_create_rejects_invalid_comment_characters(self):
+        class FakeClient:
+            view = "corp"
+
+        for comment in ("bad" + chr(233), "bad|comment", "bad\ncomment"):
+            with self.subTest(comment=comment):
+                with self.assertRaisesRegex(ib.CliError, "comment may only contain"):
+                    ib.create_payload(
+                        "a",
+                        "192.0.2.10",
+                        "app",
+                        "example.com",
+                        None,
+                        comment,
+                        FakeClient(),
+                    )
+
+    def test_dns_create_rejects_non_integer_ttl_in_payload_builder(self):
+        class FakeClient:
+            view = "corp"
+
+        with self.assertRaisesRegex(ib.CliError, "ttl must be an integer"):
+            ib.create_payload(
+                "a",
+                "192.0.2.10",
+                "app",
+                "example.com",
+                "300",
+                None,
+                FakeClient(),
+            )
 
     def test_explicit_zone_still_wins(self):
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "env.example.com"}, clear=False):
@@ -215,9 +705,59 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("DNS Context", help_text)
         self.assertIn("corp", help_text)
         self.assertIn("example.com", help_text)
-        self.assertIn("IB_ZONE", help_text)
 
-    def test_dns_context_panel_is_one_line_with_background(self):
+    def test_dns_create_help_includes_colorful_usage_context(self):
+        runner = CliRunner()
+        with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
+            with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    result = runner.invoke(ib.cli, ["dns", "create", "--help"], color=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Create Record Usage", result.output)
+        self.assertIn("ib dns create", result.output)
+        self.assertIn("<type>", result.output)
+        self.assertIn("<name>", result.output)
+        self.assertIn("<value>", result.output)
+        self.assertIn("Context", result.output)
+        self.assertIn("Current view", result.output)
+        self.assertIn("corp", result.output)
+        self.assertIn("Active zone", result.output)
+        self.assertIn("example.com", result.output)
+        self.assertIn("Without --zone", result.output)
+        self.assertIn("Example", result.output)
+        self.assertIn("-n app", result.output)
+        self.assertIn("Command:", result.output)
+        self.assertIn("Creates:", result.output)
+        self.assertIn("A record", result.output)
+        self.assertIn("app.example.com", result.output)
+        self.assertIn("Application VIP", result.output)
+        with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
+            with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with ib.cli.make_context("ib", [], resilient_parsing=True, color=True) as ctx:
+                        color_output = ib.render_help_text(
+                            ctx,
+                            ib.dns_create_usage_panel(),
+                            force_color=True,
+                        )
+        self.assertIn("\x1b[", color_output)
+
+    def test_dns_create_help_guides_when_active_zone_is_missing(self):
+        runner = CliRunner()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    result = runner.invoke(ib.cli, ["dns", "create", "--help"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Active zone", result.output)
+        self.assertIn("not set", result.output)
+        self.assertIn("Set a target with", result.output)
+        self.assertIn("ib dns zone use", result.output)
+
+    def test_dns_context_panel_uses_one_shared_line_with_background(self):
         with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
             with patch.object(ib, "active_zone_status", return_value=("example.com", "shell session")):
                 panel = ib.dns_context_panel("Current DNS Context")
@@ -225,10 +765,21 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIsInstance(panel.renderable, ib.Text)
         self.assertEqual(
             panel.renderable.plain,
-            "View: corp (configured)  |  Active zone: example.com (shell session)",
+            "Current view: corp  |  Active zone: example.com",
         )
         self.assertNotIn("\n", panel.renderable.plain)
         self.assertIn("on #0f172a", str(panel.style))
+
+    def test_dns_context_omits_redundant_missing_active_zone_source(self):
+        with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
+            with patch.object(ib, "active_zone_status", return_value=(None, "not set")):
+                panel = ib.dns_context_panel("Current DNS Context")
+
+        self.assertEqual(
+            panel.renderable.plain,
+            "Current view: corp  |  Active zone: not set",
+        )
+        self.assertNotIn("not set (not set)", panel.renderable.plain)
 
     def test_dns_zone_list_prints_context_before_zone_table(self):
         class FakeClient:

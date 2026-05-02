@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import configparser
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -47,6 +48,7 @@ DEFAULT_WAPI_VERSION = "v2.12.3"
 DEFAULT_TIMEOUT = 30
 DEFAULT_ZONE_ENV = "IB_ZONE"
 ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
+COMMENT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9 .,_:;@#%+=/()[\]'&-]*$")
 WAPI_PAGE_SIZE = 2000
 DNS_SEARCH_WORKERS = 8
 ZONE_SERIAL_CACHE_TTL = 30
@@ -80,6 +82,14 @@ class WapiError(CliError):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+class DnsCreateError(CliError):
+    """DNS create failure with command context attached."""
+
+    def __init__(self, message: str, context: dict[str, Any]) -> None:
+        super().__init__(message)
+        self.context = context
 
 
 def print_success(message: str) -> None:
@@ -134,12 +144,18 @@ RECORD_TYPES: dict[str, dict[str, Any]] = {
         "search_value_fields": ("mail_exchanger",),
         "return_fields": "name,mail_exchanger,preference,ttl,use_ttl,view,zone,comment",
     },
+    "host": {
+        "object": "record:host",
+        "search_value_fields": ("ipv4addrs", "ipv6addrs"),
+        "return_fields": "name,ipv4addrs,ipv6addrs,ttl,use_ttl,view,zone,comment",
+    },
     "ptr": {
         "object": "record:ptr",
         "search_value_fields": ("ptrdname", "ipv4addr", "ipv6addr"),
         "return_fields": "name,ptrdname,ipv4addr,ipv6addr,ttl,use_ttl,view,zone,comment",
     },
 }
+FORWARD_RECORD_TYPES = tuple(record_type for record_type in RECORD_TYPES if record_type != "ptr")
 
 
 def normalize_server(value: str) -> str:
@@ -261,7 +277,9 @@ def save_config_interactive() -> None:
     current = load_config_for_prompt()
     console.print(
         Panel.fit(
-            f"Configuration will be saved to [bold]{CONFIG_FILE}[/bold].",
+            f"Configuration will be saved to [bold]{CONFIG_FILE}[/bold].\n"
+            "You can run this multiple times; existing values are shown as defaults.\n"
+            "Press Enter to keep a value, or leave the password blank to keep it unchanged.",
             title="Infoblox Configuration",
             border_style="cyan",
         )
@@ -512,6 +530,49 @@ def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> st
     )
 
 
+def forward_zone_candidates_from_record_name(record_name: str) -> list[str]:
+    normalized = record_name.strip().rstrip(".")
+    if not normalized or normalized == "@" or "." not in normalized:
+        return []
+    labels = [label for label in normalized.split(".") if label]
+    if len(labels) != len(normalized.split(".")):
+        return []
+    return [".".join(labels[index:]) for index in range(len(labels))]
+
+
+def matching_forward_zone_for_record_name(client: InfobloxClient, record_name: str) -> str | None:
+    for candidate in forward_zone_candidates_from_record_name(record_name):
+        matches = safe_query(
+            client,
+            ZONE_OBJECT,
+            zone_query_params(client, {"fqdn": candidate}, return_fields=ZONE_RETURN_FIELDS),
+        )
+        for zone_info in matches:
+            zone_format = str(zone_info.get("zone_format", "FORWARD")).upper()
+            if zone_format != "FORWARD":
+                continue
+            return normalize_zone_name(str(zone_info.get("fqdn") or candidate))
+    return None
+
+
+def resolve_dns_create_zone(
+    config: dict[str, str],
+    client: InfobloxClient,
+    record_type: str,
+    record_name: str,
+    zone_name: str | None = None,
+) -> str:
+    if zone_name:
+        return resolve_dns_zone(config, zone_name)
+
+    if record_type.lower() in FORWARD_RECORD_TYPES:
+        matched_zone = matching_forward_zone_for_record_name(client, record_name)
+        if matched_zone:
+            return matched_zone
+
+    return resolve_dns_zone(config)
+
+
 def default_zone_from_config_file() -> str | None:
     zone_name = default_config_values().get("default_zone", "").strip()
     if not zone_name:
@@ -564,46 +625,206 @@ def active_zone_completion_value() -> str:
     return f"active-zone={zone_name or 'not-set'}"
 
 
-def dns_context_panel(title: str = "DNS Context") -> Panel:
+DNS_CONTEXT_BACKGROUND_STYLE = "white on #0f172a"
+DNS_CONTEXT_LABEL_STYLE = f"bold cyan on #0f172a"
+DNS_CONTEXT_SOURCE_STYLE = f"dim white on #0f172a"
+
+
+def dns_context_status() -> dict[str, Any]:
     view_name, view_source = current_view_status()
     zone_name, zone_source = active_zone_status()
-    active_zone = zone_name or "not set"
-    background_style = "white on #0f172a"
-    label_style = "bold cyan on #0f172a"
-    source_style = "dim white on #0f172a"
+    return {
+        "view": view_name,
+        "view_source": view_source,
+        "active_zone": zone_name or "not set",
+        "active_zone_source": zone_source,
+        "has_active_zone": bool(zone_name),
+    }
+
+
+def dns_context_value_text(
+    value: str | None,
+    source: str | None,
+    value_style: str,
+    include_source: bool = True,
+) -> Text:
+    display_value = value or "not set"
+    text = Text()
+    text.append(display_value, style=value_style)
+    if include_source and source:
+        text.append(f" ({source})", style=DNS_CONTEXT_SOURCE_STYLE)
+    return text
+
+
+def current_view_context_text(
+    status: dict[str, Any] | None = None,
+    include_source: bool = True,
+) -> Text:
+    context = status or dns_context_status()
+    view_name = context["view"]
     view_style = (
         "bold magenta on #0f172a" if view_name != "not configured" else "bold yellow on #0f172a"
     )
-    zone_style = "bold green on #0f172a" if zone_name else "bold yellow on #0f172a"
+    return dns_context_value_text(view_name, context["view_source"], view_style, include_source)
 
-    context = Text()
-    context.append("View: ", style=label_style)
-    context.append(view_name, style=view_style)
-    context.append(f" ({view_source})", style=source_style)
-    context.append("  |  ", style=background_style)
-    context.append("Active zone: ", style=label_style)
-    context.append(active_zone, style=zone_style)
-    context.append(f" ({zone_source})", style=source_style)
 
+def active_zone_context_text(
+    status: dict[str, Any] | None = None,
+    include_source: bool = True,
+) -> Text:
+    context = status or dns_context_status()
+    zone_style = (
+        "bold green on #0f172a" if context["has_active_zone"] else "bold yellow on #0f172a"
+    )
+    return dns_context_value_text(
+        context["active_zone"],
+        context["active_zone_source"] if context["has_active_zone"] else None,
+        zone_style,
+        include_source,
+    )
+
+
+def dns_context_line_text(status: dict[str, Any] | None = None) -> Text:
+    context = status or dns_context_status()
+    text = Text(no_wrap=True, overflow="ellipsis")
+    text.append("Current view: ", style=DNS_CONTEXT_LABEL_STYLE)
+    text.append_text(current_view_context_text(context, include_source=False))
+    text.append("  |  ", style=DNS_CONTEXT_BACKGROUND_STYLE)
+    text.append("Active zone: ", style=DNS_CONTEXT_LABEL_STYLE)
+    text.append_text(active_zone_context_text(context, include_source=False))
+    return text
+
+
+def add_dns_context_row(
+    table: Table,
+    status: dict[str, Any] | None = None,
+) -> None:
+    context = status or dns_context_status()
+    table.add_row("Context", dns_context_line_text(context))
+
+
+def dns_create_example_text(zone_name: str | None) -> Text:
+    produced_name = f"app.{zone_name}" if zone_name else "app.<active-zone>"
+    return Text.assemble(
+        ("Command: ", "bold yellow"),
+        ("ib dns create a ", "bold white"),
+        ("-n app", "bold cyan"),
+        (" 192.0.2.10 ", "bold blue"),
+        ("-t 300 ", "bold cyan"),
+        ("-c ", "bold cyan"),
+        ('"Application VIP"', "bold green"),
+        ("\nCreates: ", "bold green"),
+        ("A record ", "bold yellow"),
+        (produced_name, "bold green"),
+        (" -> ", "white"),
+        ("192.0.2.10", "bold blue"),
+        (" with TTL ", "white"),
+        ("300", "bold cyan"),
+        (" and comment ", "white"),
+        ('"Application VIP"', "bold green"),
+        (".", "white"),
+    )
+
+
+def dns_context_panel(title: str = "Current DNS Context") -> Panel:
     return Panel(
-        context,
+        dns_context_line_text(),
         title=title,
-        style=background_style,
+        style=DNS_CONTEXT_BACKGROUND_STYLE,
         border_style="bright_cyan",
         padding=(0, 1),
     )
 
 
-def usage_context_panel_text(ctx: click.Context) -> str:
+def dns_create_usage_panel() -> Panel:
+    context = dns_context_status()
+    zone_name = context["active_zone"] if context["has_active_zone"] else None
+
+    table = Table.grid(expand=True, padding=(0, 2))
+    table.add_column(style="bold cyan", no_wrap=True)
+    table.add_column(ratio=1)
+    table.add_row(
+        "Usage",
+        Text.assemble(
+            ("ib dns create ", "bold white"),
+            ("<type>", "bold yellow"),
+            (" -n|--name ", "white"),
+            ("<name>", "bold green"),
+            (" ", "white"),
+            ("<value>", "bold blue"),
+        ),
+    )
+    table.add_row(
+        "Optional",
+        Text.assemble(
+            ("-t TTL", "bold cyan"),
+            ("  ", "white"),
+            ("-c COMMENT", "bold cyan"),
+            ("  ", "white"),
+            ("--zone ZONE", "bold magenta"),
+        ),
+    )
+    add_dns_context_row(table, context)
+    if zone_name:
+        target_text = Text.assemble(
+            ("Without --zone, ", "white"),
+            ("-n app", "bold cyan"),
+            (" creates ", "white"),
+            (f"app.{zone_name}", "bold green"),
+            (".", "white"),
+        )
+    else:
+        target_text = Text.assemble(
+            ("Set a target with ", "white"),
+            ("--zone", "bold cyan"),
+            (", ", "white"),
+            ("ib dns zone use", "bold cyan"),
+            (", ", "white"),
+            (DEFAULT_ZONE_ENV, "bold cyan"),
+            (", or ", "white"),
+            ("ib configure", "bold cyan"),
+            (".", "white"),
+        )
+    table.add_row("Target", target_text)
+    table.add_row(
+        "Example",
+        dns_create_example_text(zone_name),
+    )
+    table.add_row(
+        "Options",
+        Text.assemble(
+            ("-t/--ttl", "bold cyan"),
+            (" expects an integer; ", "white"),
+            ("-c/--comment", "bold cyan"),
+            (" accepts plain ASCII comments.", "white"),
+        ),
+    )
+
+    return Panel(
+        table,
+        title="Create Record Usage",
+        border_style="bright_magenta",
+        style="white on #0f172a",
+        padding=(0, 1),
+    )
+
+
+def render_help_text(ctx: click.Context, renderable: Any, force_color: bool = False) -> str:
     width = min(ctx.terminal_width or console.width or 80, 100)
+    force_terminal = ctx.color if ctx.color is not None else console.is_terminal
     help_console = Console(
-        color_system=console.color_system,
-        force_terminal=ctx.color if ctx.color is not None else console.is_terminal,
+        color_system=console.color_system or ("standard" if force_terminal else None),
+        force_terminal=force_terminal,
+        no_color=False if force_color and force_terminal else None,
         width=width,
     )
     with help_console.capture() as capture:
-        help_console.print(dns_context_panel())
+        help_console.print(renderable)
     return capture.get()
+
+
+def usage_context_panel_text(ctx: click.Context) -> str:
+    return render_help_text(ctx, dns_context_panel())
 
 
 class UsageContextHelpMixin:
@@ -621,9 +842,73 @@ class UsageContextCommand(UsageContextHelpMixin, click.Command):
     pass
 
 
+class DnsCreateCommand(UsageContextCommand):
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        self.format_usage(ctx, formatter)
+        formatter.write("\n")
+        formatter.write(render_help_text(ctx, dns_create_usage_panel(), force_color=True))
+        formatter.write("\n")
+        self.format_help_text(ctx, formatter)
+        self.format_options(ctx, formatter)
+        self.format_epilog(ctx, formatter)
+
+
+def dns_create_click_error_help(exc: click.ClickException) -> str | None:
+    ctx = getattr(exc, "ctx", None)
+    if not ctx or not isinstance(ctx.command, DnsCreateCommand):
+        return None
+    return ctx.get_help()
+
+
+def print_dns_create_click_error_help(exc: click.ClickException) -> None:
+    help_text = dns_create_click_error_help(exc)
+    if not help_text:
+        return
+    err_console.print()
+    err_console.print(Text("Full ib dns create options:", style="bold yellow"))
+    click.echo(help_text, err=True)
+
+
+def click_error_usage_text(exc: click.ClickException) -> str:
+    if not isinstance(exc, click.UsageError) or exc.ctx is None:
+        return ""
+
+    text = exc.ctx.get_usage()
+    if exc.ctx.command.get_help_option(exc.ctx) is not None:
+        text = f"{text}\nTry '{exc.ctx.command_path} {exc.ctx.help_option_names[0]}' for help."
+    return text
+
+
+def styled_click_usage_text(usage_text: str) -> Text:
+    text = Text()
+    if usage_text.startswith("Usage: "):
+        text.append("Usage: ", style="cyan")
+        text.append(usage_text[len("Usage: ") :], style="white")
+    else:
+        text.append(usage_text, style="white")
+    return text
+
+
+def print_click_exception(exc: click.ClickException) -> None:
+    usage_text = click_error_usage_text(exc)
+    if usage_text:
+        err_console.print(styled_click_usage_text(usage_text))
+        err_console.print()
+    err_console.print(Text(f"Error: {exc.format_message()}", style="white"))
+
+
 class UsageContextGroup(UsageContextHelpMixin, click.Group):
     command_class = UsageContextCommand
     group_class = type
+
+
+def print_click_error_dns_context(exc: click.ClickException) -> None:
+    ctx = getattr(exc, "ctx", None)
+    if not ctx or isinstance(ctx.command, DnsCreateCommand):
+        return
+    if isinstance(ctx.command, (UsageContextCommand, UsageContextGroup)):
+        err_console.print()
+        err_console.print(dns_context_panel())
 
 
 def is_bash_completion() -> bool:
@@ -660,12 +945,62 @@ class RootGroup(UsageContextGroup):
         return items
 
 
-def ttl_payload(ttl: int | None) -> dict[str, Any]:
+def normalize_ttl(ttl: int | None) -> int | None:
     if ttl is None:
-        return {}
+        return None
+    if isinstance(ttl, bool) or not isinstance(ttl, int):
+        raise CliError("ERROR: ttl must be an integer.")
     if ttl < 0:
         raise CliError("ERROR: ttl must be 0 or greater.")
-    return {"ttl": ttl, "use_ttl": True}
+    return ttl
+
+
+def ttl_payload(ttl: int | None) -> dict[str, Any]:
+    normalized = normalize_ttl(ttl)
+    if normalized is None:
+        return {}
+    return {"ttl": normalized, "use_ttl": True}
+
+
+def normalize_record_comment(comment: str | None) -> str | None:
+    if comment is None:
+        return None
+    normalized = comment.strip()
+    if not normalized:
+        return None
+    if not COMMENT_ALLOWED_RE.fullmatch(normalized):
+        raise CliError(
+            "ERROR: comment may only contain letters, numbers, spaces, and common punctuation "
+            ".,_-:;@#%+=/()[]'&"
+        )
+    return normalized
+
+
+def click_error_text(error: CliError) -> str:
+    message = str(error)
+    return message[7:] if message.startswith("ERROR: ") else message
+
+
+def validate_ttl_option(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: int | None,
+) -> int | None:
+    try:
+        return normalize_ttl(value)
+    except CliError as exc:
+        raise click.BadParameter(click_error_text(exc), ctx=ctx, param=param) from exc
+
+
+def validate_record_comment_option(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> str | None:
+    try:
+        return normalize_record_comment(value)
+    except CliError as exc:
+        raise click.BadParameter(click_error_text(exc), ctx=ctx, param=param) from exc
 
 
 def mx_payload(value: str) -> dict[str, Any]:
@@ -678,6 +1013,17 @@ def mx_payload(value: str) -> dict[str, Any]:
 def ptr_payload(name: str, value: str) -> dict[str, Any]:
     field = "ipv6addr" if ":" in name else "ipv4addr"
     return {field: name, "ptrdname": value.rstrip(".")}
+
+
+def host_payload(value: str) -> dict[str, Any]:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise CliError("ERROR: host value must be an IPv4 or IPv6 address.")
+
+    if address.version == 4:
+        return {"ipv4addrs": [{"ipv4addr": str(address)}]}
+    return {"ipv6addrs": [{"ipv6addr": str(address)}]}
 
 
 def create_payload(
@@ -697,29 +1043,152 @@ def create_payload(
 
     object_type = spec["object"]
     fqdn_name = fqdn(name, zone)
+    record_comment = normalize_record_comment(comment)
     payload: dict[str, Any] = {
         "name": fqdn_name,
         "view": client.view,
         **ttl_payload(ttl),
     }
-    if comment:
-        payload["comment"] = comment
+    if record_comment:
+        payload["comment"] = record_comment
 
     if record_type == "mx":
         payload.update(mx_payload(value))
+    elif record_type == "host":
+        payload.update(host_payload(value))
     elif record_type == "ptr":
         payload = {
             **ptr_payload(name, value),
             "view": client.view,
             **ttl_payload(ttl),
         }
-        if comment:
-            payload["comment"] = comment
+        if record_comment:
+            payload["comment"] = record_comment
     else:
         value_field = spec["value_field"]
         payload[value_field] = value.rstrip(".") if record_type == "cname" else value
 
     return object_type, payload
+
+
+def dns_create_target_name(name: str, resolved_zone: str | None) -> str | None:
+    if not resolved_zone:
+        return None
+    try:
+        return fqdn(name, resolved_zone)
+    except CliError:
+        return None
+
+
+def dns_create_error_hint(error_message: str | None, context: dict[str, Any]) -> str | None:
+    if not error_message:
+        return None
+
+    network_match = re.search(
+        r"The IP address (?P<ip>\S+) cannot be used for the zone (?P<zone>.+?)\. "
+        r"Verify the network association",
+        error_message,
+        flags=re.IGNORECASE,
+    )
+    if network_match:
+        ip_address = network_match.group("ip")
+        zone_name = network_match.group("zone")
+        record_type = str(context.get("record_type") or "record").upper()
+        return (
+            f"Infoblox rejected the {record_type} record because IP address {ip_address} is not "
+            f"allowed for DNS zone {zone_name}. Use an IP associated with that zone, choose the "
+            "correct zone with --zone or a fully qualified -n name, or update the zone network "
+            "association in Infoblox."
+        )
+
+    return None
+
+
+def dns_create_error_context(
+    record_type: str,
+    value: str,
+    name: str,
+    zone: str | None,
+    ttl: int | None,
+    noptr: bool,
+    comment: str | None,
+    resolved_zone: str | None = None,
+    view: str | None = None,
+    object_type: str | None = None,
+    error_message: str | None = None,
+) -> dict[str, Any]:
+    context_status = dns_context_status()
+    if view:
+        context_status["view"] = view
+        context_status["view_source"] = "configured"
+    context = {
+        "record_type": record_type,
+        "value": value,
+        "--name": name,
+        "--zone": zone,
+        "target_record": dns_create_target_name(name, resolved_zone),
+        "view": context_status["view"],
+        "view_source": context_status["view_source"],
+        "active_zone": context_status["active_zone"],
+        "active_zone_source": context_status["active_zone_source"],
+        "has_active_zone": context_status["has_active_zone"],
+        "resolved_zone": resolved_zone,
+        "-t/--ttl": ttl,
+        "--noptr": noptr,
+        "-c/--comment": comment,
+        "wapi_object": object_type,
+    }
+    hint = dns_create_error_hint(error_message, context)
+    if hint:
+        context["hint"] = hint
+    return context
+
+
+def dns_create_error_value(value: Any) -> Text:
+    if value is None or value == "":
+        return Text("not set", style="yellow")
+    if isinstance(value, bool):
+        return Text("true" if value else "false", style="green" if value else "dim")
+    return Text(str(value).replace("\n", "\\n"), style="white")
+
+
+def dns_create_error_context_panel(context: dict[str, Any]) -> Panel:
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Field", style="bold cyan", no_wrap=True)
+    table.add_column("Value", overflow="fold")
+
+    rows = (
+        ("record type", "record_type"),
+        ("value", "value"),
+        ("-n/--name", "--name"),
+        ("--zone", "--zone"),
+        ("target record", "target_record"),
+        ("Context", "dns_context"),
+        ("resolved zone", "resolved_zone"),
+        ("-t/--ttl", "-t/--ttl"),
+        ("--noptr", "--noptr"),
+        ("-c/--comment", "-c/--comment"),
+        ("WAPI object", "wapi_object"),
+    )
+    for label, key in rows:
+        if key == "dns_context":
+            table.add_row(label, dns_context_line_text(context))
+        else:
+            table.add_row(label, dns_create_error_value(context.get(key)))
+    if context.get("hint"):
+        table.add_row("Hint", dns_create_error_value(context.get("hint")))
+
+    return Panel(
+        table,
+        title="DNS Create Error Details",
+        border_style="red",
+        style="white on #0f172a",
+        padding=(0, 1),
+    )
+
+
+def print_dns_create_error_context(context: dict[str, Any]) -> None:
+    err_console.print(dns_create_error_context_panel(context))
 
 
 def run_dns_create(
@@ -731,11 +1200,32 @@ def run_dns_create(
     noptr: bool,
     comment: str | None,
 ) -> None:
-    config = load_config()
-    client = InfobloxClient(config)
-    resolved_zone = resolve_dns_zone(config, zone)
-    object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
-    ref = client.request("POST", object_type, payload=payload)
+    resolved_zone = None
+    view = None
+    object_type = None
+    try:
+        config = load_config()
+        client = InfobloxClient(config)
+        view = getattr(client, "view", config.get("dns_view", "default"))
+        resolved_zone = resolve_dns_create_zone(config, client, record_type, name, zone)
+        object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
+        ref = client.request("POST", object_type, payload=payload)
+    except CliError as exc:
+        error_message = str(exc)
+        context = dns_create_error_context(
+            record_type,
+            value,
+            name,
+            zone,
+            ttl,
+            noptr,
+            comment,
+            resolved_zone=resolved_zone,
+            view=view,
+            object_type=object_type,
+            error_message=error_message,
+        )
+        raise DnsCreateError(error_message, context) from exc
     if noptr and record_type.lower() not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
     print_success(f"SUCCESS: created {record_type.upper()} record")
@@ -1979,6 +2469,23 @@ def complete_zone_names(
     return filter_zone_names(names, incomplete)
 
 
+def complete_dns_create_value(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[CompletionItem]:
+    if ctx.params.get("name"):
+        return []
+
+    name_options = (
+        CompletionItem("-n", help="Record name, relative to --zone unless already FQDN."),
+        CompletionItem("--name", help="Record name, relative to --zone unless already FQDN."),
+    )
+    if incomplete:
+        return [item for item in name_options if item.value.startswith(incomplete)]
+    return list(name_options)
+
+
 def format_record(record_type: str, item: dict[str, Any]) -> str:
     value_keys = ("ipv4addr", "ipv6addr", "canonical", "text", "mail_exchanger", "ptrdname")
     value = next((str(item[key]) for key in value_keys if key in item), "")
@@ -2142,7 +2649,7 @@ def cli() -> None:
       ib dns zone list
       ib dns zone use example.com
       ib dns search app
-      ib dns create a --name app 192.0.2.10 --ttl 300
+      ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
       ib dns delete app
 
     Use `ib dns --help`, `ib dns create --help`, and `ib dns zone --help` for
@@ -2162,6 +2669,10 @@ def configure() -> None:
 
     Prompts for the Infoblox server, username, password, WAPI version, DNS view,
     default DNS zone, and SSL verification preference.
+
+    You can run this command multiple times. Existing values are shown as
+    defaults, so pressing Enter keeps the current value. Existing passwords are
+    kept when the password prompt is left blank.
     """
     save_config_interactive()
 
@@ -2240,8 +2751,9 @@ def dns() -> None:
     Examples:
       ib dns search app
       ib dns search -g app
-      ib dns create a --name app 192.0.2.10 --ttl 300
-      ib dns create cname --name www app.example.com
+      ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
+      ib dns create host -n app 192.0.2.10 -t 300
+      ib dns create cname -n www app.example.com
       ib dns delete app
     """
 
@@ -2335,17 +2847,17 @@ def zone_use(zone_name: str) -> None:
     run_dns_zone_use(zone_name)
 
 
-@dns.command()
+@dns.command(cls=DnsCreateCommand)
 @click.argument("record_type", type=click.Choice(sorted(RECORD_TYPES), case_sensitive=False))
-@click.option("--name", required=True, help="Record name, relative to --zone unless already FQDN.")
-@click.argument("value")
+@click.option("-n", "--name", required=True, help="Record name, relative to --zone unless already FQDN.")
+@click.argument("value", shell_complete=complete_dns_create_value)
 @click.option(
     "--zone",
     help=f"DNS zone. Defaults to the session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
 )
-@click.option("--ttl", type=int, help="Record TTL in seconds.")
+@click.option("-t", "--ttl", type=int, callback=validate_ttl_option, help="Record TTL in seconds.")
 @click.option("--noptr", is_flag=True, help="Do not manage PTR records for A/AAAA workflows.")
-@click.option("--comment", help="Record comment.")
+@click.option("-c", "--comment", callback=validate_record_comment_option, help="Record comment.")
 def create(
     record_type: str,
     value: str,
@@ -2359,16 +2871,24 @@ def create(
 
     Record names are relative to the active zone unless already fully qualified.
     Use `@` as the name for the zone apex. Supported record types are A, AAAA,
-    CNAME, TXT, MX, and PTR.
+    CNAME, TXT, MX, PTR, and HOST.
 
     \b
     Examples:
-      ib dns create a --name app 192.0.2.10 --ttl 300
-      ib dns create a --name app 192.0.2.10 --zone example.com
-      ib dns create cname --name www app.example.com
-      ib dns create txt --name _spf "v=spf1 include:example.net -all"
-      ib dns create mx --name @ "10 mail.example.com"
-      ib dns create ptr --name 192.0.2.10 host.example.com
+      Command: ib dns create a -n app 192.0.2.10 -t 300 -c "Application VIP"
+      Creates: A app.<active-zone> -> 192.0.2.10 with TTL 300 and comment "Application VIP"
+      Command: ib dns create a -n host1.example-dns.com 192.0.2.10
+      Creates: A host1.example-dns.com -> 192.0.2.10 in zone example-dns.com when that forward zone exists
+      Command: ib dns create host -n app 192.0.2.10 -t 300 -c "Application host"
+      Creates: HOST app.<active-zone> with IPv4 address 192.0.2.10, TTL 300, and comment "Application host"
+      Command: ib dns create cname -n www app.example.com
+      Creates: CNAME www.<active-zone> -> app.example.com
+      Command: ib dns create txt -n _spf "v=spf1 include:example.net -all"
+      Creates: TXT _spf.<active-zone> = "v=spf1 include:example.net -all"
+      Command: ib dns create mx -n @ "10 mail.example.com"
+      Creates: MX <active-zone> -> mail.example.com with preference 10
+      Command: ib dns create ptr -n 192.0.2.10 host.example.com
+      Creates: PTR 192.0.2.10 -> host.example.com
     """
     run_dns_create(record_type, value, name, zone, ttl, noptr, comment)
 
@@ -2410,8 +2930,14 @@ def main() -> int:
     except (KeyboardInterrupt, EOFError, click.Abort):
         return 130
     except click.ClickException as exc:
-        exc.show()
+        print_click_exception(exc)
+        print_dns_create_click_error_help(exc)
+        print_click_error_dns_context(exc)
         return exc.exit_code
+    except DnsCreateError as exc:
+        print_error(str(exc))
+        print_dns_create_error_context(exc.context)
+        return 1
     except CliError as exc:
         print_error(str(exc))
         return 1
