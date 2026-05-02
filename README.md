@@ -9,7 +9,7 @@ readable terminal output.
 ## Features
 
 - Configure server, credentials, DNS view, and default zone with `ib configure`.
-- Create A, AAAA, CNAME, TXT, MX, PTR, and HOST records.
+- Create and edit A, AAAA, CNAME, TXT, MX, PTR, and HOST records.
 - Search DNS records by name, value, or comment.
 - Search the active zone plus child authoritative zones, or search globally with `-g`.
 - Cache `allrecords` data in SQLite and refresh by SOA serial number.
@@ -69,8 +69,10 @@ Common workflow:
 ib configure
 ib dns zone list
 ib dns zone use example.com
+ib dns list
 ib dns search app
-ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"
+ib dns create host app 192.0.2.10 -t 300 -c "Application host"
+ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
 ib dns delete app
 ```
 
@@ -78,8 +80,11 @@ Command overview:
 
 - `ib configure` creates or updates Infoblox connection settings.
 - `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
+- `ib dns list [zone]` lists all DNS records in the active or specified zone.
 - `ib dns create <a|aaaa|cname|host|mx|ptr|txt> <name> <value>` creates DNS
   records.
+- `ib dns edit <name> <a|aaaa|cname|host|mx|ptr|txt> <value>` updates one
+  existing DNS record.
 - `ib dns search [-i] [-g] <keyword>` searches records by name, value, or comment.
 - `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
   CNAME, TXT, MX, or HOST record.
@@ -91,9 +96,9 @@ Command overview:
 - `ib dns zone delete <zone>` deletes a zone.
 - `ib dns zone use <zone>` sets the active zone for the current shell session.
 
-Most commands use the configured DNS view. Create commands resolve the target
-zone from `--zone`, then the current shell session, then `IB_ZONE`, then the
-default zone saved by `ib configure`. Delete commands accept an optional
+Most commands use the configured DNS view. Create and edit commands resolve the
+target zone from `--zone`, then the current shell session, then `IB_ZONE`, then
+the default zone saved by `ib configure`. Delete commands accept an optional
 positional zone, such as `ib dns delete app example.com`; when that is omitted,
 they try a fully qualified record name first, then the same active/default zone
 fallback.
@@ -105,7 +110,7 @@ scoped search output show a compact `Current DNS Context` line.
 
 Active zone precedence is:
 
-1. Explicit command target, such as `--zone example.com` for create or
+1. Explicit command target, such as `--zone example.com` for create/edit or
    `ib dns delete app example.com` for delete
 2. Current shell session from `ib dns zone use <zone>`
 3. Environment variable `IB_ZONE`
@@ -141,9 +146,8 @@ Assuming the active zone is `example.com`, these commands produce:
 
 | Command | Record produced |
 | --- | --- |
-| `ib dns create a app 192.0.2.10 -t 300 -c "Application VIP"` | `A app.example.com -> 192.0.2.10`, TTL `300`, comment `Application VIP` |
-| `ib dns create a host1.example-dns.com 192.0.2.10` | `A host1.example-dns.com -> 192.0.2.10` in zone `example-dns.com` when that forward zone exists |
 | `ib dns create host app 192.0.2.10 -t 300 -c "Application host"` | `HOST app.example.com` with IPv4 address `192.0.2.10`, TTL `300`, comment `Application host` |
+| `ib dns create host host1.example-dns.com 192.0.2.10` | `HOST host1.example-dns.com` with IPv4 address `192.0.2.10` in zone `example-dns.com` when that forward zone exists |
 | `ib dns create aaaa app 2001:db8::10 --ttl 300` | `AAAA app.example.com -> 2001:db8::10`, TTL `300` |
 | `ib dns create cname www app.example.com` | `CNAME www.example.com -> app.example.com` |
 | `ib dns create txt _spf "v=spf1 include:example.net -all"` | `TXT _spf.example.com = "v=spf1 include:example.net -all"` |
@@ -164,14 +168,30 @@ in Infoblox. The error details instruct the client to run
 Use `--zone` to bypass the active zone for one command:
 
 ```bash
-ib dns create a app 192.0.2.10 --zone example.com
+ib dns create host app 192.0.2.10 --zone example.com
 ```
 
 For A/AAAA workflows, add `--noptr` when you do not want PTR handling:
 
 ```bash
-ib dns create a app 192.0.2.10 --noptr
+ib dns create aaaa app 2001:db8::10 --noptr
 ```
+
+## Edit Records
+
+The command shape is `ib dns edit NAME {a|aaaa|cname|host|mx|ptr|txt} VALUE`.
+The `NAME` argument supports shell completion when completion is enabled. Edit
+uses the same value format, `--zone`, `-t/--ttl`, `--noptr`, and `-c/--comment`
+options as create, but updates the matched record by its Infoblox `_ref`.
+
+```bash
+ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
+ib dns edit www cname app.example.com
+ib dns edit app.example.com a 192.0.2.20
+```
+
+If a name and type match multiple records, `ib` prints the ambiguous matches
+instead of updating the wrong record.
 
 ## Search Records
 
@@ -209,6 +229,24 @@ Search performance notes:
 - Cold or refreshed searches process zones with 8 workers by default.
 - Successful DNS record or zone updates clear the DNS caches and start a silent
   background cache warm.
+
+## List Records
+
+List every record in the active zone:
+
+```bash
+ib dns list
+```
+
+List every record in a specific zone:
+
+```bash
+ib dns list example.com
+```
+
+The optional zone argument supports shell completion when completion is enabled.
+The command retrieves `allrecords` with WAPI paging and refreshes cached zone
+records when the SOA serial number changes.
 
 ## Delete Records
 
@@ -301,6 +339,8 @@ Verify:
 ```bash
 ib <TAB><TAB>
 ib dns create <TAB><TAB>
+ib dns edit <TAB><TAB>
+ib dns list <TAB><TAB>
 ib dns delete <TAB><TAB>
 ib dns zone view <TAB><TAB>
 ```

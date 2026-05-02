@@ -379,6 +379,92 @@ class DefaultZoneTests(unittest.TestCase):
             None,
         )
 
+    def test_dns_edit_accepts_name_first_and_create_style_options(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_edit") as run_dns_edit:
+            result = runner.invoke(
+                ib.cli,
+                [
+                    "dns",
+                    "edit",
+                    "app",
+                    "host",
+                    "192.0.2.20",
+                    "--zone",
+                    "example.com",
+                    "-t",
+                    "300",
+                    "--noptr",
+                    "-c",
+                    "Application host",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_edit.assert_called_once_with(
+            "app",
+            "host",
+            "192.0.2.20",
+            "example.com",
+            300,
+            True,
+            "Application host",
+        )
+
+    def test_dns_edit_updates_existing_record_by_ref(self):
+        seen = {}
+
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                seen["request"] = (method, object_type, payload)
+                return "record:a/app"
+
+        def fake_safe_query(client, object_type, params):
+            seen["query"] = (object_type, params)
+            return [
+                {
+                    "_ref": "record:a/app",
+                    "name": "app.example.com",
+                    "zone": "example.com",
+                    "ipv4addr": "192.0.2.10",
+                }
+            ]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                ib.run_dns_edit(
+                                    "app",
+                                    "a",
+                                    "192.0.2.20",
+                                    None,
+                                    300,
+                                    False,
+                                    "Application host",
+                                )
+
+        self.assertEqual(seen["query"][0], "record:a")
+        self.assertEqual(seen["query"][1]["name"], "app.example.com")
+        self.assertEqual(seen["request"][0], "PUT")
+        self.assertEqual(seen["request"][1], "record:a/app")
+        self.assertEqual(
+            seen["request"][2],
+            {
+                "ipv4addr": "192.0.2.20",
+                "ttl": 300,
+                "use_ttl": True,
+                "comment": "Application host",
+            },
+        )
+        self.cache_refresh.assert_called_once_with()
+
     def test_dns_create_bash_completion_no_longer_suggests_name_option_after_type(self):
         runner = CliRunner()
 
@@ -419,6 +505,92 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("run this command multiple times", result.output)
         self.assertIn("pressing Enter keeps the current value", result.output)
         self.assertIn("password prompt is left blank", result.output)
+
+    def test_infoblox_client_reuses_https_connection(self):
+        class FakeResponse:
+            status = 200
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+        class FakeHTTPSConnection:
+            instances = []
+
+            def __init__(self, host, port=None, timeout=None, context=None):
+                self.host = host
+                self.port = port
+                self.timeout = timeout
+                self.context = context
+                self.requests = []
+                self.closed = False
+                FakeHTTPSConnection.instances.append(self)
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "body": body,
+                        "headers": headers,
+                    }
+                )
+
+            def getresponse(self):
+                return FakeResponse(json.dumps({"request_count": len(self.requests)}).encode("utf-8"))
+
+            def close(self):
+                self.closed = True
+
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+        with patch.object(ib.http.client, "HTTPSConnection", FakeHTTPSConnection):
+            client = ib.InfobloxClient(config)
+            first = client.request("GET", "record:a", params={"view": "corp"})
+            second = client.request("GET", "record:host")
+
+        self.assertEqual(first, {"request_count": 1})
+        self.assertEqual(second, {"request_count": 2})
+        self.assertEqual(len(FakeHTTPSConnection.instances), 1)
+        connection = FakeHTTPSConnection.instances[0]
+        self.assertEqual(connection.host, "infoblox.example.com")
+        self.assertEqual(connection.timeout, 17)
+        self.assertEqual(
+            [request["path"] for request in connection.requests],
+            ["/wapi/v2.12.3/record:a?view=corp", "/wapi/v2.12.3/record:host"],
+        )
+        self.assertIn("Authorization", connection.requests[0]["headers"])
+
+    def test_cloned_infoblox_client_does_not_share_connection(self):
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "false",
+            "timeout": "17",
+        }
+        client = ib.InfobloxClient(config)
+        client._connection = object()
+
+        clone = ib.clone_infoblox_client(client)
+
+        self.assertIsInstance(clone, ib.InfobloxClient)
+        self.assertIsNone(clone._connection)
+        self.assertEqual(clone.server, client.server)
+        self.assertEqual(clone.view, client.view)
+        self.assertEqual(clone.timeout, client.timeout)
+        self.assertEqual(clone.verify_ssl, client.verify_ssl)
 
     def test_dns_create_rejects_negative_ttl_option(self):
         runner = CliRunner()
@@ -854,6 +1026,16 @@ class DefaultZoneTests(unittest.TestCase):
 
             self.assertFalse(cache_dir.exists())
             self.assertFalse(zone_cache.exists())
+
+    def test_search_cache_db_uses_wal_journal_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with ib.connect_search_cache_db() as conn:
+                    journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+                    synchronous = conn.execute("PRAGMA synchronous").fetchone()[0]
+
+        self.assertEqual(str(journal_mode).lower(), "wal")
+        self.assertEqual(synchronous, 1)
 
     def test_refresh_dns_cache_after_update_clears_then_warms_in_background(self):
         with patch.object(ib, "clear_dns_cache") as clear_cache:
@@ -1330,12 +1512,13 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("Example", result.output)
         self.assertIn("Setup:", result.output)
         self.assertIn("ib dns zone use example.com", result.output)
+        self.assertIn("ib dns create host", result.output)
         self.assertIn("app 192.0.2.10", result.output)
         self.assertIn("Command:", result.output)
         self.assertIn("Creates:", result.output)
-        self.assertIn("A record", result.output)
+        self.assertIn("HOST record", result.output)
         self.assertIn("app.example.com", result.output)
-        self.assertIn("Application VIP", result.output)
+        self.assertIn("Application host", result.output)
         self.assertIn("-n/--name", result.output)
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
             with patch.object(ib, "default_config_values", return_value={"dns_view": "corp"}):
@@ -1427,6 +1610,94 @@ class DefaultZoneTests(unittest.TestCase):
 
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "zones"])
+
+    def test_dns_list_uses_active_zone_and_paged_allrecords(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        zone_matches = [
+            {
+                "fqdn": "example.com",
+                "view": "corp",
+                "zone_format": "FORWARD",
+                "primary_type": "Grid",
+                "soa_serial_number": 10,
+            }
+        ]
+        allrecords = [
+            {
+                "_ref": "allrecords/app",
+                "type": "record:a",
+                "name": "app.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.10",
+                "ttl": 300,
+                "comment": "Application VIP",
+            }
+        ]
+        table_records = []
+
+        def fake_safe_query(client, object_type, params):
+            self.assertEqual(object_type, ib.ZONE_OBJECT)
+            self.assertEqual(params["fqdn"], "example.com")
+            self.assertIn("soa_serial_number", params["_return_fields"])
+            return zone_matches
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            self.assertEqual(object_type, ib.ALLRECORDS_OBJECT)
+            self.assertEqual(params["view"], "corp")
+            self.assertEqual(params["zone"], "example.com")
+            return allrecords
+
+        def fake_record_table(records):
+            table_records.extend(records)
+            return "records"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                    with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                        with patch.object(ib, "read_session_zone", return_value=None):
+                            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                                with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                                    with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                                        with patch.object(ib, "record_table", side_effect=fake_record_table):
+                                            with patch.object(ib, "dns_context_panel", return_value="context"):
+                                                with patch.object(ib.console, "print") as print_mock:
+                                                    ib.run_dns_list()
+
+        self.assertEqual(table_records, [("a", allrecords[0])])
+        printed = [call.args[0] for call in print_mock.call_args_list]
+        self.assertEqual(printed, ["context", "records"])
+
+    def test_dns_list_accepts_explicit_zone_argument(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        seen = {}
+
+        def fake_safe_query(client, object_type, params):
+            seen["fqdn"] = params["fqdn"]
+            return [{"fqdn": "example.net", "view": "corp", "soa_serial_number": 1}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            with patch.object(ib, "paged_query", return_value=[]):
+                                with patch.object(ib, "dns_context_panel", return_value="context"):
+                                    with patch.object(ib, "print_warning") as print_warning:
+                                        with patch.object(ib.console, "print"):
+                                            ib.run_dns_list("example.net")
+
+        self.assertEqual(seen["fqdn"], "example.net")
+        print_warning.assert_called_once_with("No records found in zone example.net.")
 
     def test_dns_search_searches_active_zone_and_child_zones(self):
         class FakeClient:
@@ -2247,6 +2518,16 @@ class DefaultZoneTests(unittest.TestCase):
         zone_view = ib.zone.commands["view"]
 
         self.assertIs(zone_view.params[0]._custom_shell_complete, ib.complete_zone_names)
+
+    def test_dns_list_uses_zone_name_completion(self):
+        dns_list = ib.dns.commands["list"]
+
+        self.assertIs(dns_list.params[0]._custom_shell_complete, ib.complete_zone_names)
+
+    def test_dns_edit_uses_record_name_completion(self):
+        dns_edit = ib.dns.commands["edit"]
+
+        self.assertIs(dns_edit.params[0]._custom_shell_complete, ib.complete_dns_edit_records)
 
 
 if __name__ == "__main__":
