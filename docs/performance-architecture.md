@@ -140,7 +140,7 @@ Record cache rows are stored as normalized search entries:
 - record type
 - zone
 - display name
-- display value
+- searchable value
 - comment
 - original record JSON
 
@@ -149,6 +149,9 @@ checks exact substring matches. When the user passes `-f`, search also checks
 typo-tolerant fuzzy matches. The original record JSON remains available so
 table, JSON, and CSV output can use the same rendering path as live WAPI
 results.
+For PTR records, the searchable value includes both the target hostname and IP
+address so `ib dns search -g <ip-address>` can find reverse records while output
+still displays the PTR target hostname.
 
 For a zone, cached records are trusted only when the stored `zone_record_cache`
 serial matches the current serial metadata for that zone. If the serial matches,

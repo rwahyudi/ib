@@ -4353,7 +4353,7 @@ class DefaultZoneTests(unittest.TestCase):
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "records"])
 
-    def test_dns_search_uses_allrecords_cache_when_serial_matches(self):
+    def test_dns_search_uses_old_allrecords_cache_when_serial_matches(self):
         class FakeClient:
             server = "https://infoblox.example.com"
             wapi_version = "v2.12.3"
@@ -4385,6 +4385,17 @@ class DefaultZoneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
                 ib.write_allrecords_cache(client, "example.com", "99", cached_records)
+                cache_key = ib.allrecords_cache_key(client, "example.com")
+                with ib.connect_search_cache_db() as conn:
+                    conn.execute(
+                        "UPDATE zone_record_cache SET updated_at = ? WHERE cache_key = ?",
+                        (1.0, cache_key),
+                    )
+                    row = conn.execute(
+                        "SELECT updated_at FROM zone_record_cache WHERE cache_key = ?",
+                        (cache_key,),
+                    ).fetchone()
+                self.assertEqual(float(row["updated_at"]), 1.0)
                 with patch.dict(os.environ, {}, clear=False):
                     os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
                     with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
@@ -4726,7 +4737,77 @@ class DefaultZoneTests(unittest.TestCase):
             ib.allrecord_search_entry_matches_any_keyword(entry, ("prnter",), False)
         )
 
-    def test_dns_search_upgrades_legacy_allrecords_cache_to_search_entries(self):
+    def test_dns_search_indexes_ptr_target_and_ip_address(self):
+        ptr_record = {
+            "_ref": "allrecords/ptr",
+            "type": "record:ptr",
+            "name": "10.2.0.192.in-addr.arpa",
+            "zone": "2.0.192.in-addr.arpa",
+            "address": "192.0.2.10",
+            "record": {
+                "ptrdname": "host.example.com",
+                "address": "192.0.2.10",
+            },
+        }
+
+        entry = ib.allrecord_search_entry(ptr_record, "2.0.192.in-addr.arpa")
+
+        self.assertEqual(entry["type"], "ptr")
+        self.assertEqual(entry["value"], "host.example.com 192.0.2.10")
+        self.assertTrue(ib.allrecord_search_entry_matches_keyword(entry, "192.0.2.10", False))
+        self.assertTrue(ib.allrecord_search_entry_matches_keyword(entry, "host.example.com", False))
+        self.assertEqual(ib.record_name(ptr_record), "192.0.2.10")
+        self.assertEqual(ib.record_value("ptr", ptr_record), "host.example.com")
+
+    def test_dns_search_displays_ptr_names_as_ip_addresses(self):
+        explicit_address = {
+            "name": "21",
+            "zone": "10.0.0.0/24",
+            "address": "10.0.0.21",
+            "ptrdname": "host.example.com",
+        }
+        cidr_zone = {
+            "name": "21",
+            "zone": "10.0.0.0/24",
+            "ptrdname": "host.example.com",
+        }
+        wide_cidr_zone = {
+            "name": "21.5",
+            "zone": "10.0.0.0/16",
+            "ptrdname": "host.example.com",
+        }
+        arpa_zone = {
+            "name": "10",
+            "zone": "2.0.192.in-addr.arpa",
+            "ptrdname": "host.example.com",
+        }
+        full_arpa_name = {
+            "name": "10.2.0.192.in-addr.arpa",
+            "zone": "2.0.192.in-addr.arpa",
+            "ptrdname": "host.example.com",
+        }
+        non_octet_zone = {
+            "name": "21",
+            "zone": "10.0.0.0/23",
+            "ptrdname": "host.example.com",
+        }
+        malformed_name = {
+            "name": "host",
+            "zone": "10.0.0.0/24",
+            "ptrdname": "host.example.com",
+        }
+
+        self.assertEqual(ib.record_name(explicit_address, "ptr"), "10.0.0.21")
+        self.assertEqual(ib.record_name(cidr_zone, "ptr"), "10.0.0.21")
+        self.assertEqual(ib.record_name(wide_cidr_zone, "ptr"), "10.0.5.21")
+        self.assertEqual(ib.record_name(arpa_zone, "ptr"), "192.0.2.10")
+        self.assertEqual(ib.record_name(full_arpa_name, "ptr"), "192.0.2.10")
+        self.assertEqual(ib.record_name(non_octet_zone, "ptr"), "21")
+        self.assertEqual(ib.record_name(malformed_name, "ptr"), "host")
+        self.assertEqual(ib.record_value("ptr", explicit_address), "host.example.com")
+        self.assertEqual(ib.record_output_row("ptr", cidr_zone)["name"], "10.0.0.21")
+
+    def test_dns_search_upgrades_old_legacy_allrecords_cache_when_serial_matches(self):
         class FakeClient:
             server = "https://infoblox.example.com"
             wapi_version = "v2.12.3"
@@ -4953,6 +5034,78 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result_refs, {"allrecords/example.com", "allrecords/other.example.net"})
         dns_context_panel.assert_not_called()
         print_mock.assert_called_once_with("records")
+
+    def test_dns_search_global_matches_legacy_cached_ptr_by_ip_address(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        ptr_record = {
+            "_ref": "allrecords/ptr",
+            "type": "record:ptr",
+            "name": "10",
+            "zone": "192.0.2.0/24",
+            "address": "192.0.2.10",
+            "record": {
+                "ptrdname": "host.example.com",
+                "address": "192.0.2.10",
+            },
+        }
+        table_records = []
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            if object_type == ib.ZONE_OBJECT:
+                return [
+                    {"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 10},
+                    {
+                        "fqdn": "192.0.2.0/24",
+                        "primary_type": "Grid",
+                        "zone_format": "IPV4",
+                        "soa_serial_number": 11,
+                    },
+                ]
+            if object_type == ib.ALLRECORDS_OBJECT:
+                raise AssertionError("cached PTR search should not query allrecords")
+            raise AssertionError(f"unexpected object type: {object_type}")
+
+        def fake_record_table(records):
+            table_records.extend(records)
+            return "records"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_allrecords_cache(client, "example.com", "10", [])
+                ib.write_allrecords_cache(
+                    client,
+                    "192.0.2.0/24",
+                    "11",
+                    [ptr_record],
+                    [
+                        {
+                            "type": "ptr",
+                            "zone": "192.0.2.0/24",
+                            "name": "10",
+                            "value": "host.example.com",
+                            "comment": "",
+                            "record": ptr_record,
+                        }
+                    ],
+                )
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                    with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                        with patch.object(ib, "read_session_zone", return_value=None):
+                            with patch.object(ib, "InfobloxClient", return_value=client):
+                                with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                                    with patch.object(ib, "record_table", side_effect=fake_record_table):
+                                        with patch.object(ib.console, "print"):
+                                            ib.run_dns_search("192.0.2.10", global_search=True)
+
+        self.assertEqual(table_records, [("ptr", ptr_record)])
+        self.assertEqual(ib.record_output_row("ptr", table_records[0][1])["name"], "192.0.2.10")
+        self.assertEqual(ib.record_value("ptr", table_records[0][1]), "host.example.com")
 
     def test_dns_search_returns_deterministic_order_after_parallel_zone_work(self):
         class FakeClient:

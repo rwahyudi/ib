@@ -287,6 +287,10 @@ authoritative zones. Use `-z/--zone` to search a different zone scope for one
 command, and `-v/--view` to search a different DNS view. If no active/default
 zone is set, search uses all non-secondary zones in the selected DNS view.
 Search uses exact substring matching by default.
+PTR entries index both the target hostname and IP address, so a global search
+can find reverse records by normal IP address when the reverse zone is in scope.
+PTR results display the normal IP address in the Name column even when Infoblox
+returns a relative reverse name such as `21` under `10.0.0.0/24`.
 
 Search a specific zone and its child authoritative zones:
 
@@ -307,6 +311,7 @@ Search across the whole selected view explicitly:
 
 ```bash
 ib dns search -g app
+ib dns search -g 192.0.2.10
 ```
 
 Combine `-g` with `-v/--view` to search the whole selected view:
@@ -354,7 +359,8 @@ keyword. They follow `-i` when case-sensitive matching is enabled.
 Search and record completion use a local cache so repeated DNS operations do not
 need to query Infoblox for every request. Results are based on Infoblox
 `allrecords`, normalized into searchable `name`, `value`, and `comment` fields,
-and stored in SQLite.
+and stored in SQLite. PTR search values include both the target hostname and IP
+address while table and structured output still display the target hostname.
 
 | Cache | Location | Freshness rule |
 | --- | --- | --- |
@@ -495,6 +501,7 @@ Use `--zone` with `ib dns create`, or pass the optional positional zone to
 Use `ib dns search -g <keyword>` when you need to search outside the active zone
 and its child zones. Use `ib dns search -z <zone> <keyword>` or
 `ib dns search -v <view> <keyword>` for one-off search scope changes.
+Use `ib dns search -g <ip-address>` to find cached PTR entries by address.
 
 If search results look stale, confirm the zone SOA serial changed:
 

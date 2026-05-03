@@ -3753,11 +3753,16 @@ def sqlite_search_entry_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
     if not isinstance(record, dict):
         return None
 
+    record_type = str(row["type"])
+    value = str(row["value"])
+    if record_type == "ptr":
+        value = allrecord_search_value(record_type, record) or value
+
     return {
-        "type": str(row["type"]),
+        "type": record_type,
         "zone": str(row["zone"]),
         "name": str(row["name"]),
-        "value": str(row["value"]),
+        "value": value,
         "comment": str(row["comment"]),
         "record": record,
     }
@@ -3807,23 +3812,25 @@ def sqlite_search_entries_from_rows(
 def sqlite_exact_search_condition(
     keyword: str,
     case_sensitive: bool,
-) -> tuple[str, tuple[str, str, str]]:
+) -> tuple[str, tuple[str, ...]]:
     """Build the SQL predicate for the normal exact search path."""
     if case_sensitive:
         condition = (
             "instr(name, ?) > 0 OR "
             "instr(value, ?) > 0 OR "
-            "instr(comment, ?) > 0"
+            "instr(comment, ?) > 0 OR "
+            "(type = 'ptr' AND instr(record_json, ?) > 0)"
         )
-        return condition, (keyword, keyword, keyword)
+        return condition, (keyword, keyword, keyword, keyword)
 
     needle = keyword.lower()
     condition = (
         "instr(lower(name), ?) > 0 OR "
         "instr(lower(value), ?) > 0 OR "
-        "instr(lower(comment), ?) > 0"
+        "instr(lower(comment), ?) > 0 OR "
+        "(type = 'ptr' AND instr(lower(record_json), ?) > 0)"
     )
-    return condition, (needle, needle, needle)
+    return condition, (needle, needle, needle, needle)
 
 
 def matching_allrecord_search_entries(
@@ -3969,7 +3976,7 @@ def allrecord_search_entry(item: dict[str, Any], zone_name: str | None = None) -
         "type": record_type,
         "zone": str(item.get("zone", "") or zone_name or ""),
         "name": allrecord_display_name(item),
-        "value": allrecord_display_value(record_type, item),
+        "value": allrecord_search_value(record_type, item),
         "comment": str(item.get("comment", "")),
         "record": item,
     }
@@ -4330,11 +4337,143 @@ def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
     return str(record)
 
 
+def unique_record_field_values(item: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    """Collect unique scalar values from allrecords top-level and nested record payloads."""
+    values: list[str] = []
+    seen: set[str] = set()
+    record = nested_record(item)
+    for key in keys:
+        for source in (record, item):
+            value = source.get(key)
+            if value in (None, "") or isinstance(value, (dict, list, tuple)):
+                continue
+            text = str(value).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            values.append(text)
+    return values
+
+
+def normalized_ip_address_text(value: str) -> str:
+    """Return a normalized IP address string, or empty text when the value is not an IP address."""
+    try:
+        return str(ipaddress.ip_address(value.strip()))
+    except ValueError:
+        return ""
+
+
+def ptr_address_value(item: dict[str, Any]) -> str:
+    """Prefer explicit PTR address fields when Infoblox includes them in the record payload."""
+    for value in unique_record_field_values(item, ("address", "ipv4addr", "ipv6addr")):
+        address = normalized_ip_address_text(value)
+        if address:
+            return address
+    return ""
+
+
+def ptr_ipv4_from_cidr_zone(name: str, zone: str) -> str:
+    """Rebuild an IPv4 PTR name from Infoblox CIDR-style reverse zones."""
+    try:
+        network = ipaddress.ip_network(zone.strip().rstrip("."), strict=False)
+    except ValueError:
+        return ""
+    if network.version != 4 or network.prefixlen % 8 != 0:
+        return ""
+
+    prefix_octets = network.prefixlen // 8
+    labels = [label for label in name.strip().rstrip(".").split(".") if label]
+    if len(labels) != 4 - prefix_octets:
+        return ""
+
+    host_octets: list[str] = []
+    for label in reversed(labels):
+        if not label.isdigit():
+            return ""
+        value = int(label)
+        if value < 0 or value > 255:
+            return ""
+        host_octets.append(str(value))
+
+    base_octets = str(network.network_address).split(".")[:prefix_octets]
+    try:
+        return str(ipaddress.IPv4Address(".".join([*base_octets, *host_octets])))
+    except ipaddress.AddressValueError:
+        return ""
+
+
+def ptr_ipv4_from_in_addr(name: str, zone: str) -> str:
+    """Rebuild an IPv4 PTR name from in-addr.arpa labels."""
+    suffix = "in-addr.arpa"
+    name_text = name.strip().rstrip(".").lower()
+    zone_text = zone.strip().rstrip(".").lower()
+
+    if name_text.endswith(suffix):
+        reverse_text = name_text[: -len(suffix)].rstrip(".")
+    elif zone_text.endswith(suffix):
+        zone_reverse = zone_text[: -len(suffix)].rstrip(".")
+        if name_text == zone_reverse or name_text.endswith(f".{zone_reverse}"):
+            reverse_text = name_text
+        elif name_text:
+            reverse_text = f"{name_text}.{zone_reverse}"
+        else:
+            reverse_text = zone_reverse
+    else:
+        return ""
+
+    labels = [label for label in reverse_text.split(".") if label]
+    if len(labels) != 4:
+        return ""
+    for label in labels:
+        if not label.isdigit():
+            return ""
+        value = int(label)
+        if value < 0 or value > 255:
+            return ""
+
+    return str(ipaddress.IPv4Address(".".join(reversed(labels))))
+
+
+def ptr_display_name(item: dict[str, Any]) -> str:
+    """Display PTR names as normal IP addresses when enough reverse-zone context exists."""
+    fallback_name = allrecord_display_name(item)
+    address = ptr_address_value(item)
+    if address:
+        return address
+
+    name_address = normalized_ip_address_text(fallback_name)
+    if name_address:
+        return name_address
+
+    zone_name = first_record_value(item, ("zone",))
+    return (
+        ptr_ipv4_from_cidr_zone(fallback_name, zone_name)
+        or ptr_ipv4_from_in_addr(fallback_name, zone_name)
+        or fallback_name
+    )
+
+
+def ptr_search_value(item: dict[str, Any]) -> str:
+    """Index PTR target and address data so normal IP searches find reverse records."""
+    values = unique_record_field_values(
+        item,
+        ("ptrdname", "ipv4addr", "ipv6addr", "address"),
+    )
+    return " ".join(values)
+
+
+def allrecord_search_value(record_type: str, item: dict[str, Any]) -> str:
+    """Return indexed search value text while keeping display formatting separate."""
+    if record_type == "ptr":
+        return ptr_search_value(item)
+    return allrecord_display_value(record_type, item)
+
+
 def allrecord_search_values(record_type: str, item: dict[str, Any]) -> list[str]:
     """Collect searchable text for one allrecords entry so search covers name, value, and comment."""
     return [
         allrecord_display_name(item),
-        allrecord_display_value(record_type, item),
+        allrecord_search_value(record_type, item),
         str(item.get("comment", "")),
     ]
 
@@ -6170,6 +6309,14 @@ def record_value(record_type: str, item: dict[str, Any]) -> str:
     if item.get("type"):
         return allrecord_display_value(record_type, item)
 
+    normalized_type = str(record_type).strip().lower()
+    if normalized_type.startswith("shared-"):
+        normalized_type = normalized_type.removeprefix("shared-")
+    if normalized_type == "ptr":
+        ptr_target = first_record_value(item, ("ptrdname",))
+        if ptr_target:
+            return ptr_target
+
     if item.get("address"):
         return str(item["address"])
     if item.get("record"):
@@ -6200,8 +6347,16 @@ def record_value(record_type: str, item: dict[str, Any]) -> str:
     return value
 
 
-def record_name(item: dict[str, Any]) -> str:
+def record_name(item: dict[str, Any], record_type: str | None = None) -> str:
     """Return the display name for a record across direct and allrecords response shapes."""
+    normalized_type = str(record_type or "").strip().lower()
+    if not normalized_type and item.get("type"):
+        normalized_type = allrecord_type(item)
+    if normalized_type.startswith("shared-"):
+        normalized_type = normalized_type.removeprefix("shared-")
+
+    if normalized_type == "ptr":
+        return ptr_display_name(item)
     if item.get("type"):
         return allrecord_display_name(item)
     return str(item.get("name", ""))
@@ -6244,7 +6399,7 @@ def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = 
     for record_type, item in records:
         row = [
             Text(record_type.upper(), style=record_type_style(record_type)),
-            record_name(item),
+            record_name(item, record_type),
             record_value(record_type, item),
             str(item.get("zone", "")),
             str(item.get("ttl", "")),
@@ -6280,7 +6435,7 @@ def record_output_row(record_type: str, item: dict[str, Any]) -> dict[str, Any]:
     """Convert one record into the structured output schema used by JSON and CSV modes."""
     return {
         "type": record_type.upper(),
-        "name": record_name(item),
+        "name": record_name(item, record_type),
         "value": record_value(record_type, item),
         "zone": str(item.get("zone", "")),
         "ttl": item.get("ttl", ""),
