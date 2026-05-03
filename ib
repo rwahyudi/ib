@@ -6738,9 +6738,20 @@ def record_type_style(record_type: str) -> str:
     return RECORD_TYPE_STYLES.get(normalized_type, "dim white")
 
 
+def result_count_caption(count: int, singular: str, plural: str | None = None) -> str:
+    """Return a compact count caption for result tables."""
+    label = singular if count == 1 else plural or f"{singular}s"
+    return f"Total {label}: {count}"
+
+
 def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = False) -> Table:
     """Build the Rich DNS record table with color-coded types and optional ambiguity refs."""
-    table = Table(title=f"DNS Records ({len(records)})", header_style="bold cyan")
+    table = Table(
+        title=f"DNS Records ({len(records)})",
+        header_style="bold cyan",
+        caption=result_count_caption(len(records), "record"),
+        caption_style="bold cyan",
+    )
     table.add_column("Type", no_wrap=True)
     table.add_column("Name", overflow="fold")
     table.add_column("Value", overflow="fold")
@@ -7093,7 +7104,12 @@ def complete_dns_edit_record_types(
 
 def zone_table(zones: list[dict[str, Any]], include_ref: bool = False) -> Table:
     """Build the Rich zone table, showing refs only when ambiguity resolution requires them."""
-    table = Table(title=f"DNS Zones ({len(zones)})", header_style="bold cyan")
+    table = Table(
+        title=f"DNS Zones ({len(zones)})",
+        header_style="bold cyan",
+        caption=result_count_caption(len(zones), "zone"),
+        caption_style="bold cyan",
+    )
     table.add_column("Zone", overflow="fold")
     table.add_column("View", overflow="fold")
     table.add_column("Format", no_wrap=True)

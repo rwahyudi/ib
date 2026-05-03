@@ -6096,6 +6096,18 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(type_cell.plain, "A")
         self.assertEqual(str(type_cell.style), ib.LIGHT_GREEN_TEXT_STYLE)
         self.assertEqual(name_cell, "app.example.com")
+        self.assertEqual(table.caption, "Total record: 1")
+        self.assertEqual(str(table.caption_style), "bold cyan")
+
+    def test_record_table_caption_counts_multiple_records(self):
+        table = ib.record_table(
+            [
+                ("a", {"name": "app1.example.com", "zone": "example.com"}),
+                ("cname", {"name": "app2.example.com", "zone": "example.com"}),
+            ]
+        )
+
+        self.assertEqual(table.caption, "Total records: 2")
 
     def test_dns_search_formats_nested_ns_nameserver_value(self):
         ns_item = {
@@ -6279,6 +6291,17 @@ class DefaultZoneTests(unittest.TestCase):
 
         print_mock.assert_called_once_with("details")
         self.assertIn("Unavailable: Infoblox WAPI 500", table_inputs[0]["network_associations"])
+
+    def test_zone_table_caption_counts_zones(self):
+        table = ib.zone_table(
+            [
+                {"fqdn": "example.com", "view": "corp", "zone_format": "FORWARD"},
+                {"fqdn": "dev.example.com", "view": "corp", "zone_format": "FORWARD"},
+            ]
+        )
+
+        self.assertEqual(table.caption, "Total zones: 2")
+        self.assertEqual(str(table.caption_style), "bold cyan")
 
     def test_zone_completion_cache_is_fresh_for_300_seconds(self):
         with tempfile.TemporaryDirectory() as tmpdir:
