@@ -1,0 +1,248 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920" role="img" aria-labelledby="title desc">
+  <title id="title">ib zone serial freshness flow</title>
+  <desc id="desc">A fixed-layout flow diagram showing the 30 second fresh window, 90 second stale-while-revalidate window, synchronous refresh after 120 seconds, and hidden serial refresh lock behavior.</desc>
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="5" flood-color="#020617" flood-opacity="0.45"/>
+    </filter>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="panel-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#101827"/>
+    </linearGradient>
+    <linearGradient id="card-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#182235"/>
+      <stop offset="100%" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="blue-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#12304f"/>
+      <stop offset="100%" stop-color="#0b2440"/>
+    </linearGradient>
+    <linearGradient id="purple-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#35205d"/>
+      <stop offset="100%" stop-color="#24163f"/>
+    </linearGradient>
+    <linearGradient id="green-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#123624"/>
+      <stop offset="100%" stop-color="#0f2a1c"/>
+    </linearGradient>
+    <linearGradient id="orange-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4a220f"/>
+      <stop offset="100%" stop-color="#33160a"/>
+    </linearGradient>
+    <linearGradient id="red-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#4c1d1d"/>
+      <stop offset="100%" stop-color="#2f1111"/>
+    </linearGradient>
+    <marker id="arrow-blue" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#a78bfa"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#4ade80"/>
+    </marker>
+    <marker id="arrow-orange" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#fb923c"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#f87171"/>
+    </marker>
+    <symbol id="icon-terminal" viewBox="0 0 24 24">
+      <path class="icon-line" d="M3 5 H21 V19 H3 Z M6 9 L9 12 L6 15 M11 15 H17"/>
+    </symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 7 C5 4.8 19 4.8 19 7 V17 C19 19.2 5 19.2 5 17 Z M5 7 C5 9.2 19 9.2 19 7 M5 12 C5 14.2 19 14.2 19 12"/>
+    </symbol>
+    <symbol id="icon-clock" viewBox="0 0 24 24">
+      <path class="icon-line" d="M12 3 A9 9 0 1 0 12 21 A9 9 0 0 0 12 3 M12 7 V12 L16 14"/>
+    </symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24">
+      <path class="icon-line" d="M4 12 L9 17 L20 6"/>
+    </symbol>
+    <symbol id="icon-bolt" viewBox="0 0 24 24">
+      <path class="icon-line" d="M13 2 L5 14 H12 L11 22 L19 10 H12 Z"/>
+    </symbol>
+    <symbol id="icon-cloud" viewBox="0 0 24 24">
+      <path class="icon-line" d="M7 18 H18 A4 4 0 0 0 18 10 A6 6 0 0 0 6.5 12 A3 3 0 0 0 7 18 Z"/>
+    </symbol>
+    <symbol id="icon-lock" viewBox="0 0 24 24">
+      <path class="icon-line" d="M6 10 H18 V21 H6 Z M9 10 V7 A3 3 0 0 1 15 7 V10 M12 14 V17"/>
+    </symbol>
+    <symbol id="icon-list" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 6 H19 M5 12 H19 M5 18 H19 M3 6 H3.5 M3 12 H3.5 M3 18 H3.5"/>
+    </symbol>
+    <symbol id="icon-write" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 19 H19 M7 16 L8 12 L16 4 L20 8 L12 16 Z"/>
+    </symbol>
+    <symbol id="icon-return" viewBox="0 0 24 24">
+      <path class="icon-line" d="M20 6 V13 H7 M7 13 L11 9 M7 13 L11 17"/>
+    </symbol>
+    <symbol id="icon-alert" viewBox="0 0 24 24">
+      <path class="icon-line" d="M12 3 L21 20 H3 Z M12 9 V14 M12 17 H12.5"/>
+    </symbol>
+    <style>
+      .bg { fill: url(#bg-grad); }
+      .panel { fill: url(#panel-grad); stroke: #334155; stroke-width: 1.5; filter: url(#shadow); shape-rendering: crispEdges; }
+      .card, .card-blue, .card-purple, .card-green, .card-orange, .card-red {
+        transform-box: fill-box;
+        transform-origin: center;
+        transform: scale(1);
+        shape-rendering: crispEdges;
+      }
+      .card { fill: url(#card-grad); stroke: #475569; stroke-width: 1.5; }
+      .card-blue { fill: url(#blue-grad); stroke: #38bdf8; stroke-width: 1.5; }
+      .card-purple { fill: url(#purple-grad); stroke: #a78bfa; stroke-width: 1.5; }
+      .card-green { fill: url(#green-grad); stroke: #4ade80; stroke-width: 1.5; }
+      .card-orange { fill: url(#orange-grad); stroke: #fb923c; stroke-width: 1.5; }
+      .card-red { fill: url(#red-grad); stroke: #f87171; stroke-width: 1.5; }
+      .pill-blue { fill: #12304f; stroke: #38bdf8; stroke-width: 1; }
+      .pill-purple { fill: #35205d; stroke: #c4b5fd; stroke-width: 1; }
+      .pill-green { fill: #113624; stroke: #4ade80; stroke-width: 1; }
+      .pill-orange { fill: #4a220f; stroke: #fb923c; stroke-width: 1; }
+      .pill-red { fill: #4c1d1d; stroke: #f87171; stroke-width: 1; }
+      .title { fill: #f8fafc; font: 700 36px Arial, sans-serif; letter-spacing: 0; }
+      .subtitle { fill: #cbd5e1; font: 400 18px Arial, sans-serif; letter-spacing: 0; }
+      .lane { fill: #67e8f9; font: 700 14px Arial, sans-serif; letter-spacing: 1.2px; }
+      .label { fill: #f8fafc; font: 700 17px Arial, sans-serif; letter-spacing: 0; }
+      .body { fill: #cbd5e1; font: 400 14px Arial, sans-serif; letter-spacing: 0; }
+      .small { fill: #94a3b8; font: 400 12px Arial, sans-serif; letter-spacing: 0; }
+      .badge { fill: #f8fafc; font: 700 11px Arial, sans-serif; letter-spacing: 0.4px; }
+      .icon { opacity: 0.9; }
+      .icon-line { fill: none; stroke: #e2e8f0; stroke-width: 1.8; stroke-linecap: square; stroke-linejoin: miter; }
+      .blue-line { fill: none; stroke: #38bdf8; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-blue); }
+      .purple-line { fill: none; stroke: #a78bfa; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-purple); }
+      .green-line { fill: none; stroke: #4ade80; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-green); }
+      .orange-line { fill: none; stroke: #fb923c; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-orange); }
+      .red-line { fill: none; stroke: #f87171; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-red); }
+      .muted-line { fill: none; stroke: #334155; stroke-width: 2; stroke-linecap: square; stroke-linejoin: miter; stroke-dasharray: 6 8; }
+    </style>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1440" height="920"/>
+  <rect class="panel" x="40" y="36" width="1360" height="848" rx="4"/>
+
+  <text class="title" x="80" y="92">Zone Serial Freshness</text>
+  <text class="subtitle" x="80" y="124">Serial metadata uses a short fresh window, then stale-while-revalidate, before falling back to a foreground WAPI refresh.</text>
+
+  <line class="muted-line" x1="80" y1="160" x2="1360" y2="160"/>
+  <text class="lane" x="80" y="194">FOREGROUND DECISION</text>
+
+  <rect class="card-blue" x="80" y="220" width="224" height="112" rx="2"/>
+  <use href="#icon-terminal" class="icon" x="268" y="238" width="24" height="24"/>
+  <text class="label" x="104" y="254">Command needs zones</text>
+  <text class="body" x="104" y="282">dns search or dns list</text>
+  <text class="body" x="104" y="304">calls query_zone_serials</text>
+
+  <rect class="card-purple" x="352" y="220" width="246" height="112" rx="2"/>
+  <use href="#icon-database" class="icon" x="562" y="238" width="24" height="24"/>
+  <text class="label" x="376" y="254">Read serial row</text>
+  <text class="body" x="376" y="282">zone_serial_cache</text>
+  <text class="body" x="376" y="304">scoped by server, WAPI, view</text>
+
+  <rect class="card" x="646" y="220" width="242" height="112" rx="2"/>
+  <use href="#icon-clock" class="icon" x="852" y="238" width="24" height="24"/>
+  <text class="label" x="670" y="254">Classify cache age</text>
+  <text class="body" x="670" y="282">created_at to now</text>
+  <text class="body" x="670" y="304">bad JSON is a miss</text>
+
+  <rect class="card-green" x="936" y="200" width="250" height="90" rx="2"/>
+  <use href="#icon-check" class="icon" x="1150" y="216" width="24" height="24"/>
+  <text class="label" x="960" y="234">Fresh</text>
+  <text class="body" x="960" y="262">age is 0 through 30 sec</text>
+  <rect class="pill-green" x="1030" y="216" width="78" height="24" rx="2"/>
+  <text class="badge" x="1047" y="232">HOT HIT</text>
+
+  <rect class="card-orange" x="936" y="320" width="250" height="90" rx="2"/>
+  <use href="#icon-bolt" class="icon" x="1150" y="336" width="24" height="24"/>
+  <text class="label" x="960" y="354">SWR</text>
+  <text class="body" x="960" y="382">age is 31 through 120 sec</text>
+  <rect class="pill-orange" x="1024" y="336" width="92" height="24" rx="2"/>
+  <text class="badge" x="1038" y="352">STALE OK</text>
+
+  <rect class="card-red" x="936" y="440" width="250" height="90" rx="2"/>
+  <use href="#icon-alert" class="icon" x="1150" y="456" width="24" height="24"/>
+  <text class="label" x="960" y="474">Miss or expired</text>
+  <text class="body" x="960" y="502">missing, corrupt, or &gt;120 sec</text>
+  <rect class="pill-red" x="1054" y="456" width="70" height="24" rx="2"/>
+  <text class="badge" x="1073" y="472">STOP</text>
+
+  <rect class="card-green" x="1234" y="260" width="126" height="112" rx="2"/>
+  <use href="#icon-return" class="icon" x="1324" y="278" width="24" height="24"/>
+  <text class="label" x="1258" y="294">Return</text>
+  <text class="body" x="1258" y="322">cached</text>
+  <text class="body" x="1258" y="344">zone list</text>
+
+  <path class="blue-line" d="M 304 276 L 352 276"/>
+  <path class="purple-line" d="M 598 276 L 646 276"/>
+  <path class="green-line" d="M 888 254 L 936 245"/>
+  <path class="orange-line" d="M 888 276 L 936 365"/>
+  <path class="red-line" d="M 888 298 L 936 485"/>
+  <path class="green-line" d="M 1186 245 C 1220 245 1220 316 1234 316"/>
+  <path class="orange-line" d="M 1186 365 L 1234 316"/>
+
+  <text class="small" x="902" y="226">use immediately</text>
+  <text class="small" x="1196" y="396">foreground does not wait</text>
+
+  <text class="lane" x="80" y="590">REVALIDATION PATHS</text>
+
+  <rect class="card-orange" x="80" y="616" width="274" height="112" rx="2"/>
+  <use href="#icon-bolt" class="icon" x="318" y="634" width="24" height="24"/>
+  <text class="label" x="104" y="650">Start hidden refresh</text>
+  <text class="body" x="104" y="678">subprocess runs</text>
+  <text class="body" x="104" y="700">_refresh-zone-serial-cache</text>
+
+  <rect class="card-purple" x="402" y="616" width="268" height="112" rx="2"/>
+  <use href="#icon-lock" class="icon" x="634" y="634" width="24" height="24"/>
+  <text class="label" x="426" y="650">Acquire serial lock</text>
+  <text class="body" x="426" y="678">zone-serial-{context}.lock</text>
+  <text class="body" x="426" y="700">fresh lock means skip</text>
+
+  <rect class="card-orange" x="718" y="616" width="250" height="112" rx="2"/>
+  <use href="#icon-cloud" class="icon" x="932" y="634" width="24" height="24"/>
+  <text class="label" x="742" y="650">Fetch zone serials</text>
+  <text class="body" x="742" y="678">single zone_auth query</text>
+  <text class="body" x="742" y="700">no record cache rebuild</text>
+
+  <rect class="card-purple" x="1016" y="616" width="222" height="112" rx="2"/>
+  <use href="#icon-write" class="icon" x="1202" y="634" width="24" height="24"/>
+  <text class="label" x="1040" y="650">Write serial cache</text>
+  <text class="body" x="1040" y="678">replace zone list JSON</text>
+  <text class="body" x="1040" y="700">reset created_at</text>
+
+  <rect class="card-green" x="1286" y="616" width="74" height="112" rx="2"/>
+  <use href="#icon-check" class="icon" x="1312" y="634" width="24" height="24"/>
+  <text class="label" x="1306" y="678">Done</text>
+
+  <path class="orange-line" d="M 936 382 C 722 552 244 552 217 616"/>
+  <path class="orange-line" d="M 354 672 L 402 672"/>
+  <path class="purple-line" d="M 670 672 L 718 672"/>
+  <path class="orange-line" d="M 968 672 L 1016 672"/>
+  <path class="purple-line" d="M 1238 672 L 1286 672"/>
+
+  <rect class="card-red" x="402" y="768" width="266" height="72" rx="2"/>
+  <use href="#icon-cloud" class="icon" x="632" y="784" width="24" height="24"/>
+  <text class="label" x="426" y="802">Synchronous refresh</text>
+  <text class="body" x="426" y="824">foreground waits for WAPI</text>
+
+  <rect class="card-purple" x="716" y="768" width="242" height="72" rx="2"/>
+  <use href="#icon-write" class="icon" x="922" y="784" width="24" height="24"/>
+  <text class="label" x="740" y="802">Persist new serials</text>
+  <text class="body" x="740" y="824">then return fresh zones</text>
+
+  <rect class="card-green" x="1006" y="768" width="232" height="72" rx="2"/>
+  <use href="#icon-list" class="icon" x="1202" y="784" width="24" height="24"/>
+  <text class="label" x="1030" y="802">Search can continue</text>
+  <text class="body" x="1030" y="824">records still serial-checked</text>
+
+  <path class="red-line" d="M 936 485 C 700 584 535 660 535 768"/>
+  <path class="red-line" d="M 668 804 L 716 804"/>
+  <path class="green-line" d="M 958 804 L 1006 804"/>
+  <path class="green-line" d="M 1238 804 C 1308 804 1308 372 1297 372"/>
+
+  <text class="small" x="80" y="866">The SWR refresh updates only zone serial metadata. Per-zone record rows are still trusted only when their stored serial matches the current serial metadata.</text>
+</svg>

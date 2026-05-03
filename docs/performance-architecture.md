@@ -77,6 +77,8 @@ views, or zones.
 
 ## Serial Freshness
 
+![ib zone serial freshness flow](assets/serial-freshness.svg)
+
 Zone serial metadata is fresh for 30 seconds. During that fresh window, `ib`
 avoids querying the full zone list again.
 
