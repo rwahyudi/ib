@@ -8,7 +8,7 @@ readable terminal output.
 
 ## Features
 
-- Configure server, credentials, DNS view, and default zone with `ib configure`.
+- Configure multiple Infoblox profiles with one default profile.
 - Create and edit A, AAAA, CNAME, TXT, MX, PTR, and HOST records.
 - Search DNS records by name, value, or comment.
 - Search the active zone plus child authoritative zones, or search globally with `-g`.
@@ -20,7 +20,59 @@ readable terminal output.
 
 ## Install
 
-Run from the repository root:
+Install with `pipx` so `ib` and its Python dependencies stay isolated from the
+system Python packages. Python 3.9 or newer is required:
+
+```bash
+pipx install git+https://github.com/rwahyudi/ib.git
+pipx ensurepath
+```
+
+Upgrade later with:
+
+```bash
+# Linux / macOS
+(cd /tmp && pipx upgrade ib)
+```
+
+```powershell
+# Windows PowerShell
+Push-Location $env:TEMP; pipx upgrade ib; Pop-Location
+```
+
+Running the upgrade from a neutral directory avoids `pipx` treating a local
+`./ib` checkout or executable as a path instead of the installed package name.
+
+If `pipx` is not installed, install it with your OS package manager first:
+
+```bash
+# Debian / Ubuntu
+sudo apt install pipx
+
+# Fedora / RHEL-like systems
+sudo dnf install pipx
+
+# Arch
+sudo pacman -S python-pipx
+
+# macOS with Homebrew
+brew install pipx
+
+# Windows PowerShell
+py -m pip install --user pipx
+py -m pipx ensurepath
+```
+
+Without `pipx`, use the Python user install path:
+
+```bash
+python3 -m pip install --user git+https://github.com/rwahyudi/ib.git
+python3 -m pip install --user --upgrade git+https://github.com/rwahyudi/ib.git
+```
+
+On Windows, use `py -m pip` in place of `python3 -m pip`.
+
+For development from a local checkout, run from the repository root:
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -35,7 +87,7 @@ Then configure Infoblox access:
 ib configure
 ```
 
-`ib configure` prompts for:
+`ib configure` edits the current default profile and prompts for:
 
 - Infoblox server
 - Username and password
@@ -44,13 +96,36 @@ ib configure
 - Default DNS zone
 - SSL verification preference
 
+When a new profile is created, `ib configure` connects to Infoblox with the
+entered credentials and lists available DNS views so you can select one. If the
+DNS view lookup fails, the command falls back to manual DNS view entry and still
+saves the profile.
+
+New profile setup also asks whether to configure a default DNS zone, with yes
+as the default answer. If you choose yes, it loads forward zones from the
+selected DNS view, including subdomain zones, and shows a live search box where
+the zone list filters as you type. Reverse zones are excluded from selection.
+
+Manage multiple profiles with:
+
+```bash
+ib configure new prod --default
+ib configure new lab
+ib configure list
+ib configure use prod
+ib configure edit lab
+ib configure delete lab
+```
+
 You can run `ib configure` multiple times. It will not wipe existing values just
 because you rerun it: saved values are shown as defaults, pressing Enter keeps
 the current value, and leaving the password prompt blank keeps the current
 password.
 
-Private files are written under `~/.ib/`. The config directory is kept at
-`0700`; the config and key files are kept at `0600`.
+Private files are written under `~/.ib/`. Profiles are stored in
+`~/.ib/config` as `[profile:<name>]` sections with `[meta] default_profile`
+selecting the default. The config directory is kept at `0700`; the config and
+key files are kept at `0600`.
 
 ## Usage
 
@@ -67,6 +142,8 @@ Common workflow:
 
 ```bash
 ib configure
+ib dns view list
+ib dns view use "DNS Zone View"
 ib dns zone list
 ib dns zone use example.com
 ib dns list
@@ -78,7 +155,15 @@ ib dns delete app
 
 Command overview:
 
-- `ib configure` creates or updates Infoblox connection settings.
+- `ib configure` edits the current default Infoblox profile.
+- `ib configure new <profile> [--default]` creates a new profile and lets you
+  choose from the DNS views returned by Infoblox.
+- `ib configure edit [profile] [--default]` edits an existing profile.
+- `ib configure delete <profile>` deletes a non-default profile.
+- `ib configure use <profile>` selects the default profile.
+- `ib configure list` lists configured profiles.
+- Profile names complete in shells with completion enabled; `delete` suggests
+  only non-default profiles, while `new` suggests unused common names.
 - `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
 - `ib dns list [zone]` lists all DNS records in the active or specified zone.
 - `ib dns create <a|aaaa|cname|host|mx|ptr|txt> <name> <value>` creates DNS
@@ -89,7 +174,9 @@ Command overview:
 - `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
   CNAME, TXT, MX, or HOST record.
 - `ib dns delete ptr <ip-address>` deletes a reverse DNS PTR record by full IP address.
-- `ib dns zone list [search]` lists authoritative zones in the configured view.
+- `ib dns view list` lists DNS views available to the configured Infoblox profile.
+- `ib dns view use <view>` sets the active DNS view for the current shell session.
+- `ib dns zone list [search]` lists authoritative zones in the active view.
 - `ib dns zone view <zone>` shows zone details, network associations, and SOA settings.
 - `ib dns zone create <zone> [--format forward|ipv4|ipv6] [--comment TEXT]
   [--ns-group TEXT]` creates a zone.
@@ -106,6 +193,7 @@ reference IDs:
 ib -o jq dns search app
 ib dns -o jq search app
 ib dns search app -o jq
+ib -o csv dns view list
 ib -o csv dns zone list
 ```
 
@@ -115,25 +203,52 @@ Help always stays in normal help format, even when `-o/--output` is present:
 ib -o jq dns edit -h
 ```
 
-Most commands use the configured DNS view. Create and edit commands resolve the
-target zone from `--zone`, then the current shell session, then `IB_ZONE`, then
-the default zone saved by `ib configure`. Delete commands accept an optional
-positional zone, such as `ib dns delete app example.com`; when that is omitted,
-they try a fully qualified record name first, then the same active/default zone
-fallback.
+Most commands use the configured default profile and the active DNS view.
+The active view comes from `ib dns view use`, then `IB_VIEW`, then the DNS view
+saved in the selected profile. Create and edit commands resolve the target zone
+from `--zone`, then the current profile's shell session, then `IB_ZONE`, then
+the default zone saved in the selected profile. Delete commands accept an
+optional positional zone, such as `ib dns delete app example.com`; when that is
+omitted, they try a fully qualified record name first, then the same
+active/default zone fallback.
 
 ## DNS Context
 
-Most DNS commands use the current DNS view and active zone. Help output and
-scoped search output show a compact `Current DNS Context` line.
+Most DNS commands use the current default profile, DNS view, and active zone.
+Help output and scoped search output show a compact `Current DNS Context` line.
+
+Profile selection is persistent:
+
+```bash
+ib configure list
+ib configure use prod
+```
+
+Active view precedence is:
+
+1. Current shell session from `ib dns view use <view>`
+2. Environment variable `IB_VIEW`
+3. Configured DNS view from the selected profile
+
+Set a view only for the current shell session:
+
+```bash
+ib dns view use "DNS Zone View"
+```
+
+Set an environment override:
+
+```bash
+export IB_VIEW="DNS Zone View"
+```
 
 Active zone precedence is:
 
 1. Explicit command target, such as `--zone example.com` for create/edit or
    `ib dns delete app example.com` for delete
-2. Current shell session from `ib dns zone use <zone>`
+2. Current profile's shell session from `ib dns zone use <zone>`
 3. Environment variable `IB_ZONE`
-4. Configured default zone from `ib configure`
+4. Configured default zone from the selected profile
 
 Set a zone only for the current shell session:
 
@@ -142,6 +257,8 @@ ib dns zone use test.local
 ```
 
 A new shell session falls back to `IB_ZONE` or the configured default zone.
+Switching profiles also falls back to that profile's default zone unless you
+set an active zone for that profile.
 
 Set an environment override:
 
@@ -228,9 +345,9 @@ ib dns search app
 
 Normal search uses the active/default zone as the root and includes child
 authoritative zones. If no active/default zone is set, search uses all
-non-secondary zones in the configured DNS view.
+non-secondary zones in the active DNS view.
 
-Search across the whole configured view explicitly:
+Search across the whole active view explicitly:
 
 ```bash
 ib dns search -g app
@@ -302,7 +419,7 @@ deleting the wrong record.
 
 ## Zone Commands
 
-List zones in the configured view:
+List zones in the active view:
 
 ```bash
 ib dns zone list
@@ -372,7 +489,9 @@ ib dns zone view <TAB><TAB>
 
 ## Troubleshooting
 
-Run `ib configure` if you see a missing configuration or credential error.
+Run `ib configure` if you see a missing configuration or credential error. Use
+`ib configure list` and `ib configure use <profile>` to inspect or switch the
+default profile.
 
 Check the active context:
 

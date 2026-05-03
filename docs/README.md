@@ -1,6 +1,7 @@
 # Docs
 
-This repo is intentionally tiny: one executable, one requirements file, one job.
+This repo is intentionally tiny: one executable, one requirements file, package
+metadata for installation, and one job.
 
 `ib` wraps Infoblox DNS tasks with friendly prompts, Rich tables, tab completion,
 encrypted local config, and clear errors when setup is missing.

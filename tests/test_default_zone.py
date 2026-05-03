@@ -1,8 +1,11 @@
 import importlib.machinery
 import importlib.util
+import configparser
+import io
 import json
 import os
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +32,40 @@ class DefaultZoneTests(unittest.TestCase):
         self.cache_refresh_patcher = patch.object(ib, "refresh_dns_cache_after_update")
         self.cache_refresh = self.cache_refresh_patcher.start()
         self.addCleanup(self.cache_refresh_patcher.stop)
+
+    def config_path_patch(self, tmpdir):
+        config_dir = Path(tmpdir) / ".ib"
+        return patch.multiple(
+            ib,
+            CONFIG_DIR=config_dir,
+            CONFIG_FILE=config_dir / "config",
+            CONFIG_KEY_FILE=config_dir / "key",
+        )
+
+    def assert_command_tree_has_output_option(self, command, path="ib"):
+        option_names = set()
+        for param in command.params:
+            option_names.update(getattr(param, "opts", ()))
+        self.assertIn("--output", option_names, path)
+        self.assertIn("-o", option_names, path)
+
+        for name, subcommand in getattr(command, "commands", {}).items():
+            self.assert_command_tree_has_output_option(subcommand, f"{path} {name}")
+
+    def test_pyproject_installs_existing_ib_script(self):
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+
+        with pyproject_path.open("rb") as handle:
+            pyproject = tomllib.load(handle)
+
+        self.assertEqual(pyproject["project"]["name"], "ib")
+        self.assertEqual(pyproject["project"]["requires-python"], ">=3.9")
+        self.assertEqual(
+            set(pyproject["project"]["dependencies"]),
+            {"click>=8.1", "cryptography>=42", "rich>=13.7"},
+        )
+        self.assertEqual(pyproject["tool"]["setuptools"]["py-modules"], [])
+        self.assertEqual(pyproject["tool"]["setuptools"]["script-files"], ["ib"])
 
     def test_dns_create_uses_configured_default_zone_when_zone_is_omitted(self):
         seen = {}
@@ -643,6 +680,65 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("not a valid integer", result.output)
         run_dns_create.assert_not_called()
 
+    def test_read_masked_password_echoes_stars_and_handles_backspace(self):
+        class FakeConsole:
+            is_terminal = True
+
+            def __init__(self):
+                self.file = io.StringIO()
+
+            def print(self, *objects, end="\n", **kwargs):
+                self.file.write(" ".join(str(item) for item in objects))
+                self.file.write(end)
+
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"ab\x7fc\n")
+            os.close(write_fd)
+            write_fd = -1
+            fake_console = FakeConsole()
+            with patch.object(ib, "console", fake_console):
+                with patch.object(ib.sys.stdin, "fileno", return_value=read_fd):
+                    with patch("termios.tcgetattr", return_value="settings"):
+                        with patch("termios.tcsetattr") as tcsetattr:
+                            with patch("tty.setcbreak") as setcbreak:
+                                password = ib.read_masked_password("Password")
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+        self.assertEqual(password, "ac")
+        self.assertEqual(fake_console.file.getvalue(), "Password: **\b \b*\n")
+        setcbreak.assert_called_once_with(read_fd)
+        tcsetattr.assert_called_once()
+        self.assertEqual(tcsetattr.call_args.args[0], read_fd)
+        self.assertEqual(tcsetattr.call_args.args[2], "settings")
+
+    def test_prompt_password_uses_rich_password_fallback_without_terminal(self):
+        with patch.object(ib, "terminal_supports_masked_password", return_value=False):
+            with patch.object(ib.Prompt, "ask", return_value="secret") as prompt_ask:
+                password = ib.prompt_password("Password")
+
+        self.assertEqual(password, "secret")
+        prompt_ask.assert_called_once_with("Password", password=True)
+
+    def test_prompt_password_allows_blank_fallback_for_existing_password(self):
+        with patch.object(ib, "terminal_supports_masked_password", return_value=False):
+            with patch.object(ib.Prompt, "ask", return_value="") as prompt_ask:
+                password = ib.prompt_password(
+                    "Password (leave blank to keep current)",
+                    allow_blank=True,
+                )
+
+        self.assertEqual(password, "")
+        prompt_ask.assert_called_once_with(
+            "Password (leave blank to keep current)",
+            default="",
+            password=True,
+            show_default=False,
+        )
+
     def test_configure_help_explains_repeated_runs_keep_existing_values(self):
         runner = CliRunner()
 
@@ -650,8 +746,733 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("run this command multiple times", result.output)
-        self.assertIn("pressing Enter keeps the current value", result.output)
-        self.assertIn("password prompt is left blank", result.output)
+        self.assertIn("pressing", result.output)
+        self.assertIn("Enter keeps the current value", result.output)
+        self.assertIn("password", result.output)
+        self.assertIn("prompt is left blank", result.output)
+        self.assertIn("new", result.output)
+        self.assertIn("edit", result.output)
+        self.assertIn("delete", result.output)
+
+    def test_command_help_smoke_surfaces_registered_groups_and_output_option(self):
+        runner = CliRunner()
+        help_cases = [
+            (["--help"], ["Infoblox command line client", "configure", "dns", "--output"]),
+            (["dns", "--help"], ["Manage Infoblox DNS records", "create", "view", "zone", "--output"]),
+            (["configure", "--help"], ["new", "edit", "delete", "use", "--output"]),
+            (["dns", "view", "--help"], ["DNS views", "list", "use", "--output"]),
+            (["dns", "zone", "--help"], ["DNS zones", "create", "list", "delete", "use", "--output"]),
+        ]
+
+        for args, expected_fragments in help_cases:
+            with self.subTest(args=args):
+                result = runner.invoke(ib.cli, args)
+
+                self.assertEqual(result.exit_code, 0, result.output)
+                for fragment in expected_fragments:
+                    self.assertIn(fragment, result.output)
+
+    def test_output_option_is_registered_on_all_commands(self):
+        self.assert_command_tree_has_output_option(ib.cli)
+
+    def test_structured_output_data_excludes_ref_fields_recursively(self):
+        data = {
+            "_ref": "record:a/app",
+            "ref": "record:a/app",
+            "name": "app.example.com",
+            "nested": [{"_ref": "record:cname/www", "name": "www.example.com"}],
+        }
+
+        self.assertEqual(
+            ib.structured_output_data(data),
+            {"name": "app.example.com", "nested": [{"name": "www.example.com"}]},
+        )
+
+    def test_legacy_default_config_loads_as_default_profile_and_migrates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.CONFIG_DIR.mkdir(mode=0o700)
+                ib.CONFIG_FILE.write_text(
+                    "\n".join(
+                        [
+                            "[default]",
+                            "server = infoblox.example.com",
+                            "username = admin",
+                            "password = secret",
+                            "wapi_version = v2.12.3",
+                            "dns_view = corp",
+                            "default_zone = example.com",
+                            "verify_ssl = false",
+                            "timeout = 17",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+                cfg = ib.load_config()
+                parser = configparser.ConfigParser()
+                parser.read(ib.CONFIG_FILE)
+
+        self.assertEqual(cfg["profile"], "default")
+        self.assertEqual(cfg["server"], "https://infoblox.example.com")
+        self.assertEqual(cfg["password"], "secret")
+        self.assertEqual(cfg["dns_view"], "corp")
+        self.assertIn(ib.CONFIG_META_SECTION, parser)
+        self.assertIn("profile:default", parser)
+        self.assertNotIn("default", parser)
+        self.assertTrue(parser["profile:default"]["password"].startswith(ib.ENCRYPTED_PASSWORD_PREFIX))
+
+    def test_multi_profile_config_loads_selected_default_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "lab",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "dns_view": "prod-view",
+                            "default_zone": "prod.example.com",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                            "dns_view": "lab-view",
+                            "default_zone": "lab.example.com",
+                        },
+                    },
+                )
+
+                cfg = ib.load_config()
+
+        self.assertEqual(cfg["profile"], "lab")
+        self.assertEqual(cfg["server"], "https://lab.example.com")
+        self.assertEqual(cfg["username"], "lab-user")
+        self.assertEqual(cfg["password"], "lab-secret")
+        self.assertEqual(cfg["dns_view"], "lab-view")
+        self.assertEqual(cfg["default_zone"], "lab.example.com")
+
+    def test_configure_use_changes_default_profile(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                        },
+                    },
+                )
+
+                result = runner.invoke(ib.cli, ["configure", "use", "lab"])
+                default_profile, _profiles, _legacy = ib.read_config_profiles()
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "lab")
+        self.assertIn("SUCCESS", result.output)
+
+    def test_configure_delete_rejects_current_default_profile(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                        },
+                    },
+                )
+
+                with self.assertRaisesRegex(ib.CliError, "cannot delete default profile"):
+                    ib.delete_config_profile("prod")
+                default_profile, profiles, _legacy = ib.read_config_profiles()
+
+        self.assertEqual(default_profile, "prod")
+        self.assertIn("prod", profiles)
+
+    def test_configure_new_default_creates_profile_and_sets_default(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=["new-secret", "v2.12.3", "new-view"],
+                    ):
+                        with patch.object(ib.Confirm, "ask", side_effect=[True, False]):
+                            with patch.object(
+                                ib,
+                                "query_dns_view_names_for_config",
+                                return_value=["default", "new-view"],
+                            ) as query_views:
+                                result = runner.invoke(
+                                    ib.cli,
+                                    ["configure", "new", "new-prof", "--default"],
+                                )
+
+                default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "new-prof")
+        self.assertEqual(profiles["new-prof"]["server"], "https://new.example.com")
+        self.assertEqual(profiles["new-prof"]["username"], "new-user")
+        self.assertEqual(profiles["new-prof"]["password"], "new-secret")
+        self.assertEqual(profiles["new-prof"]["dns_view"], "new-view")
+        query_config = query_views.call_args.args[0]
+        self.assertEqual(query_config["server"], "https://new.example.com")
+        self.assertEqual(query_config["username"], "new-user")
+        self.assertEqual(query_config["password"], "new-secret")
+        self.assertEqual(query_config["wapi_version"], "v2.12.3")
+        self.assertEqual(query_config["verify_ssl"], "true")
+
+    def test_configure_new_falls_back_to_manual_dns_view_when_lookup_fails(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=["new-secret", "v2.12.3", "manual-view"],
+                    ):
+                        with patch.object(ib.Confirm, "ask", side_effect=[True, False]):
+                            with patch.object(
+                                ib,
+                                "query_dns_view_names_for_config",
+                                side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
+                            ):
+                                result = runner.invoke(
+                                    ib.cli,
+                                    ["configure", "new", "new-prof"],
+                                )
+
+                _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(profiles["new-prof"]["dns_view"], "manual-view")
+        self.assertIn("could not load DNS views", result.output)
+
+    def test_first_configure_fetches_dns_views_for_default_profile(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=["new-secret", "v2.12.3", "corp", "new.example.com"],
+                    ):
+                        with patch.object(ib.Confirm, "ask", return_value=False):
+                            with patch.object(
+                                ib,
+                                "query_dns_view_names_for_config",
+                                return_value=["corp", "default"],
+                            ) as query_views:
+                                result = runner.invoke(ib.cli, ["configure"])
+
+                default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "default")
+        self.assertEqual(profiles["default"]["dns_view"], "corp")
+        query_config = query_views.call_args.args[0]
+        self.assertEqual(query_config["verify_ssl"], "false")
+
+    def test_configure_new_can_choose_default_zone_from_search_results(self):
+        runner = CliRunner()
+        zones = [
+            {"fqdn": "zebra.example.com", "zone_format": "FORWARD", "comment": ""},
+            {"fqdn": "app.example.com", "zone_format": "FORWARD", "comment": "Apps"},
+            {"fqdn": "1.168.192.in-addr.arpa", "zone_format": "IPV4", "comment": ""},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=["new-secret", "v2.12.3", "corp", "example", "1"],
+                    ):
+                        with patch.object(ib.Confirm, "ask", side_effect=[True, True]) as confirm_ask:
+                            with patch.object(
+                                ib,
+                                "query_dns_view_names_for_config",
+                                return_value=["corp"],
+                            ):
+                                with patch.object(
+                                    ib,
+                                    "query_default_zone_candidates_for_config",
+                                    return_value=ib.selectable_zone_records(zones),
+                                ) as query_zones:
+                                    result = runner.invoke(
+                                        ib.cli,
+                                        ["configure", "new", "new-prof"],
+                                    )
+
+                _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(profiles["new-prof"]["dns_view"], "corp")
+        self.assertEqual(profiles["new-prof"]["default_zone"], "app.example.com")
+        query_config = query_zones.call_args.args[0]
+        self.assertEqual(query_config["dns_view"], "corp")
+        self.assertTrue(confirm_ask.call_args_list[1].kwargs["default"])
+
+    def test_configure_new_default_zone_falls_back_to_manual_when_zone_lookup_fails(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=[
+                            "new-secret",
+                            "v2.12.3",
+                            "corp",
+                            "manual.example.com",
+                        ],
+                    ):
+                        with patch.object(ib.Confirm, "ask", side_effect=[True, True]):
+                            with patch.object(
+                                ib,
+                                "query_dns_view_names_for_config",
+                                return_value=["corp"],
+                            ):
+                                with patch.object(
+                                    ib,
+                                    "query_default_zone_candidates_for_config",
+                                    side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
+                                ):
+                                    result = runner.invoke(
+                                        ib.cli,
+                                        ["configure", "new", "new-prof"],
+                                    )
+
+                _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(profiles["new-prof"]["default_zone"], "manual.example.com")
+        self.assertIn("could not load DNS zones", result.output)
+
+    def test_query_default_zone_candidates_uses_selected_view_and_keeps_only_forward_zones(self):
+        class FakeClient:
+            view = "corp"
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        client = FakeClient()
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+        }
+        zones = [
+            {"fqdn": "zebra.example.com"},
+            {"fqdn": "dev.example.com", "zone_format": "FORWARD"},
+            {"fqdn": "1.168.192.in-addr.arpa", "zone_format": "FORWARD"},
+            {"fqdn": "168.192.in-addr.arpa", "zone_format": "IPV4"},
+            {"fqdn": ""},
+            {"fqdn": "app.example.com"},
+        ]
+
+        with patch.object(ib, "InfobloxClient", return_value=client) as client_factory:
+            with patch.object(ib, "query_zones", return_value=zones) as query_zones:
+                candidates = ib.query_default_zone_candidates_for_config(config)
+
+        self.assertEqual(
+            [zone["fqdn"] for zone in candidates],
+            ["app.example.com", "dev.example.com", "zebra.example.com"],
+        )
+        self.assertTrue(client.closed)
+        client_factory.assert_called_once_with(config)
+        query_zones.assert_called_once_with(client)
+
+    def test_filter_default_zone_candidates_matches_names_and_comments(self):
+        zones = ib.selectable_zone_records(
+            [
+                {"fqdn": "app.example.com", "zone_format": "FORWARD", "comment": "Production apps"},
+                {"fqdn": "dev.example.com", "zone_format": "FORWARD", "comment": "Sandbox"},
+                {"fqdn": "prod.example.com", "zone_format": "FORWARD", "comment": ""},
+                {"fqdn": "1.168.192.in-addr.arpa", "zone_format": "IPV4", "comment": "Reverse"},
+            ]
+        )
+
+        self.assertEqual(
+            [zone["fqdn"] for zone in ib.filter_default_zone_candidates(zones, "prod")],
+            ["prod.example.com", "app.example.com"],
+        )
+        self.assertEqual(
+            [zone["fqdn"] for zone in ib.filter_default_zone_candidates(zones, "dev example")],
+            ["dev.example.com"],
+        )
+
+    def test_zone_picker_key_normalizes_down_arrow_variants(self):
+        self.assertEqual(ib.normalize_zone_picker_key("\x1b[B"), "\x1b[B")
+        self.assertEqual(ib.normalize_zone_picker_key("\x1bOB"), "\x1b[B")
+        self.assertEqual(ib.normalize_zone_picker_key("\x1b[1;2B"), "\x1b[B")
+        self.assertEqual(ib.normalize_zone_picker_key("\x1b[A"), "\x1b[A")
+        self.assertEqual(ib.normalize_zone_picker_key("\x1bOA"), "\x1b[A")
+
+    def test_zone_picker_key_reads_full_down_arrow_sequence(self):
+        read_fd, write_fd = os.pipe()
+        try:
+            os.write(write_fd, b"\x1b[B")
+            os.close(write_fd)
+            write_fd = -1
+            with patch.object(ib.sys.stdin, "fileno", return_value=read_fd):
+                self.assertEqual(ib.read_zone_picker_key(), "\x1b[B")
+        finally:
+            os.close(read_fd)
+            if write_fd != -1:
+                os.close(write_fd)
+
+    def test_realtime_zone_picker_down_arrow_selects_next_zone(self):
+        class FakeLive:
+            def __init__(self, *args, **kwargs):
+                self.updates = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def update(self, renderable):
+                self.updates.append(renderable)
+
+        zones = ib.selectable_zone_records(
+            [
+                {"fqdn": "app.example.com", "zone_format": "FORWARD"},
+                {"fqdn": "dev.example.com", "zone_format": "FORWARD"},
+            ]
+        )
+
+        with patch.object(ib.sys.stdin, "fileno", return_value=0):
+            with patch("termios.tcgetattr", return_value="settings"):
+                with patch("termios.tcsetattr"):
+                    with patch("tty.setcbreak"):
+                        with patch.object(ib, "Live", FakeLive):
+                            with patch.object(ib, "read_zone_picker_key", side_effect=["\x1b", "\x1b[B", "\n"]):
+                                with patch.object(ib.console, "print"):
+                                    selected = ib.prompt_default_zone_realtime(zones)
+
+        self.assertEqual(selected, "dev.example.com")
+
+    def test_query_dns_view_names_for_config_uses_view_object_and_closes_client(self):
+        class FakeClient:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        client = FakeClient()
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "default",
+        }
+        records = [{"name": "corp"}, {"name": "default"}, {"name": "corp"}, {"name": ""}]
+
+        with patch.object(ib, "InfobloxClient", return_value=client) as client_factory:
+            with patch.object(ib, "paged_query", return_value=records) as paged_query:
+                names = ib.query_dns_view_names_for_config(config)
+
+        self.assertEqual(names, ["corp", "default"])
+        self.assertTrue(client.closed)
+        client_factory.assert_called_once_with(config)
+        paged_query.assert_called_once_with(
+            client,
+            ib.DNS_VIEW_OBJECT,
+            ib.dns_view_query_params(),
+            warn_on_skip=False,
+        )
+
+    def test_configure_edit_updates_existing_profile_and_keeps_blank_password(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://old.example.com",
+                            "username": "old-user",
+                            "password": "old-secret",
+                            "wapi_version": "v2.12.3",
+                            "dns_view": "old-view",
+                            "default_zone": "old.example.com",
+                            "verify_ssl": "true",
+                        }
+                    },
+                )
+
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=["", "v2.13", "new-view", "new.example.com"],
+                    ):
+                        with patch.object(ib.Confirm, "ask", return_value=False):
+                            result = runner.invoke(ib.cli, ["configure", "edit", "prod"])
+
+                default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "prod")
+        self.assertEqual(profiles["prod"]["server"], "https://new.example.com")
+        self.assertEqual(profiles["prod"]["username"], "new-user")
+        self.assertEqual(profiles["prod"]["password"], "old-secret")
+        self.assertEqual(profiles["prod"]["wapi_version"], "v2.13")
+        self.assertEqual(profiles["prod"]["dns_view"], "new-view")
+        self.assertEqual(profiles["prod"]["default_zone"], "new.example.com")
+        self.assertEqual(profiles["prod"]["verify_ssl"], "false")
+
+    def test_configure_list_outputs_profiles_without_passwords(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "dns_view": "corp",
+                            "default_zone": "example.com",
+                        }
+                    },
+                )
+
+                result = runner.invoke(ib.cli, ["configure", "list", "-o", "csv"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            result.output.splitlines(),
+            ["profile,default,server,dns_view,default_zone", "prod,True,https://prod.example.com,corp,example.com"],
+        )
+        self.assertNotIn("secret", result.output)
+
+    def test_configure_list_outputs_empty_json_when_no_profiles_configured(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                result = runner.invoke(ib.cli, ["-o", "jq", "configure", "list"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(json.loads(result.output), [])
+
+    def test_configure_list_outputs_json_without_passwords(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "lab",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "dns_view": "prod-view",
+                            "default_zone": "prod.example.com",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                            "dns_view": "lab-view",
+                            "default_zone": "lab.example.com",
+                        },
+                    },
+                )
+
+                result = runner.invoke(ib.cli, ["configure", "list", "-o", "jq"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(
+            data,
+            [
+                {
+                    "profile": "lab",
+                    "default": True,
+                    "server": "https://lab.example.com",
+                    "dns_view": "lab-view",
+                    "default_zone": "lab.example.com",
+                },
+                {
+                    "profile": "prod",
+                    "default": False,
+                    "server": "https://prod.example.com",
+                    "dns_view": "prod-view",
+                    "default_zone": "prod.example.com",
+                },
+            ],
+        )
+        self.assertNotIn("secret", result.output)
+        self.assertNotIn("password", result.output)
+
+    def test_configure_use_outputs_json_and_updates_default_profile(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                        },
+                    },
+                )
+
+                result = runner.invoke(ib.cli, ["configure", "use", "lab", "-o", "jq"])
+                default_profile, _profiles, _legacy = ib.read_config_profiles()
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "lab")
+        self.assertEqual(
+            json.loads(result.output),
+            {
+                "status": "success",
+                "action": "use",
+                "profile": "lab",
+                "default": True,
+                "message": "default profile set to 'lab'",
+            },
+        )
+
+    def test_configure_delete_outputs_csv_and_removes_profile(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                        },
+                    },
+                )
+
+                result = runner.invoke(ib.cli, ["configure", "-o", "csv", "delete", "lab"])
+                default_profile, profiles, _legacy = ib.read_config_profiles()
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "prod")
+        self.assertNotIn("lab", profiles)
+        self.assertEqual(
+            result.output.splitlines(),
+            [
+                "status,action,profile,default,message",
+                "success,delete,lab,False,profile 'lab' deleted",
+            ],
+        )
+
+    def test_configure_delete_completion_suggests_only_non_default_profiles(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                        },
+                        "dev": {
+                            "server": "https://dev.example.com",
+                            "username": "dev-user",
+                            "password": "dev-secret",
+                        },
+                    },
+                )
+
+                items = ib.complete_deletable_profile_names(None, None, "")
+
+        self.assertEqual(items, ["dev", "lab"])
+
+    def test_configure_new_completion_suggests_unused_common_profile_names(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                        },
+                    },
+                )
+
+                items = ib.complete_new_profile_names(None, None, "p")
+
+        self.assertEqual(items, ["production"])
+
+    def test_configure_profile_completion_fails_quietly_without_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                existing_items = ib.complete_existing_profile_names(None, None, "")
+                delete_items = ib.complete_deletable_profile_names(None, None, "")
+                new_items = ib.complete_new_profile_names(None, None, "l")
+
+        self.assertEqual(existing_items, [])
+        self.assertEqual(delete_items, [])
+        self.assertEqual(new_items, ["lab"])
 
     def test_infoblox_client_reuses_https_connection(self):
         class FakeResponse:
@@ -805,6 +1626,16 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(error_lines[0].spans[0].end, len("Error:"))
         self.assertEqual(str(error_lines[0].spans[0].style), "bold red")
         err_print.assert_any_call("context")
+
+    def test_dns_command_missing_config_guides_to_configure(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                result = runner.invoke(ib.cli, ["dns", "search", "app"])
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIsInstance(result.exception, ib.CliError)
+        self.assertIn("Run: ib configure", str(result.exception))
 
     def test_dns_delete_missing_record_name_error_prints_ptr_hint(self):
         with patch.object(ib.sys, "argv", ["ib", "dns", "delete"]):
@@ -1069,29 +1900,156 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(zone, "session.example.com")
 
+    def test_environment_view_overrides_configured_view(self):
+        with patch.dict(os.environ, {ib.DEFAULT_VIEW_ENV: "env-view"}, clear=False):
+            with patch.object(ib, "read_session_view", return_value=None):
+                view = ib.resolve_dns_view({"dns_view": "configured-view"})
+
+        self.assertEqual(view, "env-view")
+
+    def test_session_view_overrides_environment_and_configured_view(self):
+        with patch.dict(os.environ, {ib.DEFAULT_VIEW_ENV: "env-view"}, clear=False):
+            with patch.object(ib, "read_session_view", return_value="session-view"):
+                view = ib.resolve_dns_view({"dns_view": "configured-view"})
+
+        self.assertEqual(view, "session-view")
+
+    def test_load_config_applies_session_view_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "dns_view": "configured-view",
+                        }
+                    },
+                )
+                with patch.object(ib, "read_session_view", return_value="session-view"):
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop(ib.DEFAULT_VIEW_ENV, None)
+                        cfg = ib.load_config()
+
+        self.assertEqual(cfg["dns_view"], "session-view")
+
     def test_session_zone_is_scoped_to_parent_shell_pid(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(ib, "session_zone_dir", return_value=Path(tmpdir)):
                 with patch.object(ib.os, "getppid", return_value=111):
-                    ib.write_session_zone("test.local")
-                    self.assertEqual(ib.read_session_zone(), "test.local")
+                    ib.write_session_zone("test.local", "prod")
+                    self.assertEqual(ib.read_session_zone("prod"), "test.local")
                 with patch.object(ib.os, "getppid", return_value=222):
-                    self.assertIsNone(ib.read_session_zone())
+                    self.assertIsNone(ib.read_session_zone("prod"))
                     with patch.dict(os.environ, {}, clear=False):
                         os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
-                        zone = ib.resolve_dns_zone({"default_zone": "configured.example.com"})
+                        zone = ib.resolve_dns_zone(
+                            {"profile": "prod", "default_zone": "configured.example.com"}
+                        )
 
         self.assertEqual(zone, "configured.example.com")
 
+    def test_session_zone_is_scoped_to_selected_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "session_zone_dir", return_value=Path(tmpdir)):
+                with patch.object(ib.os, "getppid", return_value=111):
+                    ib.write_session_zone("prod.example.com", "prod")
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                        prod_zone = ib.resolve_dns_zone(
+                            {"profile": "prod", "default_zone": "prod-default.example.com"}
+                        )
+                        lab_zone = ib.resolve_dns_zone(
+                            {"profile": "lab", "default_zone": "lab.example.com"}
+                        )
+
+        self.assertEqual(prod_zone, "prod.example.com")
+        self.assertEqual(lab_zone, "lab.example.com")
+
+    def test_active_zone_status_ignores_session_zone_from_other_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "lab",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "default_zone": "prod.example.com",
+                        },
+                        "lab": {
+                            "server": "https://lab.example.com",
+                            "username": "lab-user",
+                            "password": "lab-secret",
+                            "default_zone": "lab.example.com",
+                        },
+                    },
+                )
+                with patch.object(ib, "session_zone_dir", return_value=Path(tmpdir) / "sessions"):
+                    ib.write_session_zone("prod-session.example.com", "prod")
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                        zone, source = ib.active_zone_status()
+
+        self.assertEqual(zone, "lab.example.com")
+        self.assertEqual(source, "configured default")
+
+    def test_session_view_is_scoped_to_parent_shell_pid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "session_view_dir", return_value=Path(tmpdir)):
+                with patch.object(ib.os, "getppid", return_value=111):
+                    ib.write_session_view("session-view")
+                    self.assertEqual(ib.read_session_view(), "session-view")
+                with patch.object(ib.os, "getppid", return_value=222):
+                    self.assertIsNone(ib.read_session_view())
+                    with patch.dict(os.environ, {}, clear=False):
+                        os.environ.pop(ib.DEFAULT_VIEW_ENV, None)
+                        view = ib.resolve_dns_view({"dns_view": "configured-view"})
+
+        self.assertEqual(view, "configured-view")
+
     def test_zone_use_writes_session_zone(self):
         with patch.object(ib, "write_session_zone") as write_session_zone:
-            with patch.object(ib, "print_success") as print_success:
-                with patch.object(ib, "print_note") as print_note:
-                    ib.run_dns_zone_use("test.local.")
+            with patch.object(ib, "session_profile_name", return_value="prod"):
+                with patch.object(ib, "print_success") as print_success:
+                    with patch.object(ib, "print_note") as print_note:
+                        ib.run_dns_zone_use("test.local.")
 
-        write_session_zone.assert_called_once_with("test.local")
+        write_session_zone.assert_called_once_with("test.local", "prod")
         print_success.assert_called_once()
         print_note.assert_called_once()
+
+    def test_dns_view_use_writes_session_view_after_validating(self):
+        class FakeClient:
+            def close(self):
+                pass
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "query_dns_view_names", return_value=["corp", "Lab View"]):
+                    with patch.object(ib, "write_session_view") as write_session_view:
+                        with patch.object(ib, "print_success") as print_success:
+                            with patch.object(ib, "print_note") as print_note:
+                                ib.run_dns_view_use("lab view")
+
+        write_session_view.assert_called_once_with("Lab View")
+        print_success.assert_called_once()
+        self.assertEqual(print_note.call_count, 2)
+        self.assertIn(ib.DEFAULT_VIEW_ENV, print_note.call_args_list[1].args[0])
+
+    def test_dns_view_use_rejects_unknown_view(self):
+        class FakeClient:
+            def close(self):
+                pass
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "query_dns_view_names", return_value=["corp"]):
+                    with self.assertRaisesRegex(ib.CliError, "was not found"):
+                        ib.run_dns_view_use("missing")
 
     def test_bash_dns_completion_includes_active_zone_status_item(self):
         with patch.dict(
@@ -1747,26 +2705,28 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("PTR form for reverse entries", result.output)
 
     def test_dns_context_panel_uses_one_shared_borderless_line(self):
-        with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
-            with patch.object(ib, "active_zone_status", return_value=("example.com", "shell session")):
-                context_line = ib.dns_context_panel("Current DNS Context")
+        with patch.object(ib, "active_profile_status", return_value=("prod", "default profile")):
+            with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
+                with patch.object(ib, "active_zone_status", return_value=("example.com", "shell session")):
+                    context_line = ib.dns_context_panel("Current DNS Context")
 
         self.assertIsInstance(context_line, ib.Text)
         self.assertEqual(
             context_line.plain,
-            "Current DNS Context: View=corp | Zone=example.com",
+            "Current DNS Context: Profile=prod | View=corp | Zone=example.com",
         )
         self.assertNotIn("\n", context_line.plain)
         self.assertFalse(any(span.style and "on " in str(span.style) for span in context_line.spans))
 
     def test_dns_context_omits_redundant_missing_active_zone_source(self):
-        with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
-            with patch.object(ib, "active_zone_status", return_value=(None, "not set")):
-                context_line = ib.dns_context_panel("Current DNS Context")
+        with patch.object(ib, "active_profile_status", return_value=("default", "default profile")):
+            with patch.object(ib, "current_view_status", return_value=("corp", "configured")):
+                with patch.object(ib, "active_zone_status", return_value=(None, "not set")):
+                    context_line = ib.dns_context_panel("Current DNS Context")
 
         self.assertEqual(
             context_line.plain,
-            "Current DNS Context: View=corp | Zone=not set",
+            "Current DNS Context: Profile=default | View=corp | Zone=not set",
         )
         self.assertNotIn("not set (not set)", context_line.plain)
 
@@ -1785,6 +2745,39 @@ class DefaultZoneTests(unittest.TestCase):
 
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "zones"])
+
+    def test_dns_view_list_prints_context_before_view_table(self):
+        class FakeClient:
+            def close(self):
+                pass
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "query_dns_view_names", return_value=["corp", "lab"]):
+                    with patch.object(ib, "dns_context_panel", return_value="context"):
+                        with patch.object(ib, "dns_view_table", return_value="views"):
+                            with patch.object(ib.console, "print") as print_mock:
+                                ib.run_dns_view_list()
+
+        printed = [call.args[0] for call in print_mock.call_args_list]
+        self.assertEqual(printed, ["context", "views"])
+
+    def test_dns_view_list_structured_output_marks_active_view(self):
+        class FakeClient:
+            def close(self):
+                pass
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "lab"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "query_dns_view_names", return_value=["corp", "lab"]):
+                    with patch.object(ib, "current_output_format", return_value="jq"):
+                        with patch.object(ib, "emit_structured") as emit_structured:
+                            ib.run_dns_view_list()
+
+        emit_structured.assert_called_once_with(
+            [{"view": "corp", "active": False}, {"view": "lab", "active": True}],
+            ["view", "active"],
+        )
 
     def test_dns_zone_list_outputs_csv_with_global_output_option(self):
         class FakeClient:
@@ -1820,7 +2813,8 @@ class DefaultZoneTests(unittest.TestCase):
         runner = CliRunner()
 
         with patch.object(ib, "write_session_zone") as write_session_zone:
-            result = runner.invoke(ib.cli, ["-o", "jq", "dns", "zone", "use", "example.com"])
+            with patch.object(ib, "session_profile_name", return_value="prod"):
+                result = runner.invoke(ib.cli, ["-o", "jq", "dns", "zone", "use", "example.com"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         data = json.loads(result.output)
@@ -1829,7 +2823,189 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(data["type"], "ZONE")
         self.assertEqual(data["zone"], "example.com")
         self.assertNotIn("ref", data)
-        write_session_zone.assert_called_once_with("example.com")
+        write_session_zone.assert_called_once_with("example.com", "prod")
+
+    def test_dns_view_use_outputs_json_with_global_output_option(self):
+        class FakeClient:
+            def close(self):
+                pass
+
+        runner = CliRunner()
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "query_dns_view_names", return_value=["corp", "Lab View"]):
+                    with patch.object(ib, "write_session_view") as write_session_view:
+                        result = runner.invoke(
+                            ib.cli,
+                            ["-o", "jq", "dns", "view", "use", "lab view"],
+                        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["action"], "use")
+        self.assertEqual(data["type"], "VIEW")
+        self.assertEqual(data["view"], "Lab View")
+        write_session_view.assert_called_once_with("Lab View")
+
+    def test_dns_create_outputs_json_without_ref(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                self.request_seen = (method, object_type, payload)
+                return "record:a/app"
+
+        runner = CliRunner()
+        client = FakeClient()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        result = runner.invoke(
+                            ib.cli,
+                            ["dns", "create", "a", "app", "192.0.2.10", "-o", "jq"],
+                        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["action"], "create")
+        self.assertEqual(data["type"], "A")
+        self.assertEqual(data["name"], "app.example.com")
+        self.assertEqual(data["zone"], "example.com")
+        self.assertEqual(data["view"], "corp")
+        self.assertNotIn("ref", data)
+        self.assertNotIn("_ref", data)
+        self.assertEqual(client.request_seen[0], "POST")
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_edit_outputs_csv_without_ref(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                self.request_seen = (method, object_type, payload)
+                return "record:a/app-updated"
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:a":
+                return [
+                    {
+                        "_ref": "record:a/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addr": "192.0.2.10",
+                    }
+                ]
+            return []
+
+        runner = CliRunner()
+        client = FakeClient()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            result = runner.invoke(
+                                ib.cli,
+                                ["-o", "csv", "dns", "edit", "app", "a", "192.0.2.20"],
+                            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            result.output.splitlines(),
+            [
+                "status,action,type,name,zone,view,message",
+                "success,edit,A,app.example.com,example.com,corp,updated A record",
+            ],
+        )
+        self.assertEqual(client.request_seen[0], "PUT")
+        self.assertEqual(client.request_seen[1], "record:a/app")
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_delete_outputs_json_without_ref(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None, params=None):
+                self.request_seen = (method, object_type)
+                return None
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:a" and params.get("name") == "app.example.com":
+                return [
+                    {
+                        "_ref": "record:a/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addr": "192.0.2.10",
+                    }
+                ]
+            return []
+
+        runner = CliRunner()
+        client = FakeClient()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                            result = runner.invoke(
+                                ib.cli,
+                                ["dns", "delete", "app", "-o", "jq"],
+                            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data["status"], "success")
+        self.assertEqual(data["action"], "delete")
+        self.assertEqual(data["type"], "A")
+        self.assertEqual(data["name"], "app.example.com")
+        self.assertEqual(data["zone"], "example.com")
+        self.assertEqual(data["view"], "corp")
+        self.assertNotIn("ref", data)
+        self.assertEqual(client.request_seen, ("DELETE", "record:a/app"))
+        self.cache_refresh.assert_called_once_with()
+
+    def test_dns_list_outputs_json_without_ref_or_context(self):
+        class FakeClient:
+            view = "corp"
+
+        records = [
+            (
+                "a",
+                {
+                    "_ref": "record:a/app",
+                    "name": "app.example.com",
+                    "zone": "example.com",
+                    "ipv4addr": "192.0.2.10",
+                    "ttl": 300,
+                    "comment": "Application VIP",
+                },
+            )
+        ]
+        runner = CliRunner()
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                        with patch.object(ib, "dns_list_zone_info", return_value={"fqdn": "example.com"}):
+                            with patch.object(ib, "dns_list_records_for_zone", return_value=records):
+                                result = runner.invoke(ib.cli, ["-o", "jq", "dns", "list"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        data = json.loads(result.output)
+        self.assertEqual(data[0]["type"], "A")
+        self.assertEqual(data[0]["name"], "app.example.com")
+        self.assertEqual(data[0]["value"], "192.0.2.10")
+        self.assertNotIn("ref", data[0])
+        self.assertNotIn("_ref", data[0])
+        self.assertNotIn("Current DNS Context", result.output)
 
     def test_dns_list_uses_active_zone_and_paged_allrecords(self):
         class FakeClient:
@@ -2550,6 +3726,54 @@ class DefaultZoneTests(unittest.TestCase):
             "ns",
         )
 
+    def test_dns_search_categorizes_unsupported_bind_ns_as_ns_without_ref_value(self):
+        def allrecords_ref(decoded: str) -> str:
+            token = (
+                ib.base64.urlsafe_b64encode(decoded.encode("utf-8"))
+                .decode("ascii")
+                .rstrip("=")
+            )
+            return f"allrecords/{token}:suffix"
+
+        ns_item = {
+            "_ref": allrecords_ref("dns.zone_search_index$dns.bind_ns$._default.example"),
+            "type": "UNSUPPORTED",
+            "name": "child.example.com",
+            "zone": "example.com",
+            "record": "record:ns/ZG5zLmJpbmRfbnMkLmNoaWxkLmV4YW1wbGUuY29t:child/default",
+        }
+
+        self.assertEqual(ib.allrecord_type(ns_item), "ns")
+        self.assertEqual(ib.allrecord_search_entry(ns_item)["type"], "ns")
+        self.assertEqual(ib.record_value("ns", ns_item), "")
+
+        test_console = ib.Console(width=160, force_terminal=False)
+        with test_console.capture() as capture:
+            test_console.print(ib.record_table([("ns", ns_item)]))
+
+        output = capture.get()
+        self.assertIn("NS", output)
+        self.assertNotIn("UNSUPPORTED", output)
+        self.assertNotIn("record:ns/", output)
+        self.assertNotIn(ns_item["_ref"], output)
+
+    def test_dns_search_formats_nested_ns_nameserver_value(self):
+        ns_item = {
+            "_ref": "allrecords/ns",
+            "type": "UNSUPPORTED",
+            "name": "example.com",
+            "zone": "example.com",
+            "record": {
+                "_ref": "record:ns/example",
+                "name": "example.com",
+                "nameserver": "ns1.example.net",
+            },
+        }
+
+        self.assertEqual(ib.allrecord_type(ns_item), "ns")
+        self.assertEqual(ib.record_name(ns_item), "example.com")
+        self.assertEqual(ib.record_value("ns", ns_item), "ns1.example.net")
+
     def test_dns_search_matches_allrecords_name_value_or_comment_only(self):
         txt = {
             "_ref": "allrecords/internal-token",
@@ -2817,6 +4041,22 @@ class DefaultZoneTests(unittest.TestCase):
         dns_list = ib.dns.commands["list"]
 
         self.assertIs(dns_list.params[0]._custom_shell_complete, ib.complete_zone_names)
+
+    def test_dns_view_use_uses_view_name_completion(self):
+        view_use = ib.view.commands["use"]
+
+        self.assertIs(view_use.params[0]._custom_shell_complete, ib.complete_dns_view_names)
+
+    def test_configure_commands_use_profile_name_completion(self):
+        configure_new = ib.configure.commands["new"]
+        configure_edit = ib.configure.commands["edit"]
+        configure_delete = ib.configure.commands["delete"]
+        configure_use = ib.configure.commands["use"]
+
+        self.assertIs(configure_new.params[0]._custom_shell_complete, ib.complete_new_profile_names)
+        self.assertIs(configure_edit.params[0]._custom_shell_complete, ib.complete_existing_profile_names)
+        self.assertIs(configure_delete.params[0]._custom_shell_complete, ib.complete_deletable_profile_names)
+        self.assertIs(configure_use.params[0]._custom_shell_complete, ib.complete_existing_profile_names)
 
     def test_dns_edit_uses_record_name_completion(self):
         dns_edit = ib.dns.commands["edit"]

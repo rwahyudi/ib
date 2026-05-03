@@ -2,11 +2,16 @@
 """Infoblox DNS command line workflow.
 
 Script logic:
-1. Load local configuration from ~/.ib, decrypt stored credentials, and create
-   an Infoblox WAPI client for the configured DNS view.
-2. Resolve DNS context before touching records. Commands prefer explicit
-   options, then the current shell/session zone, then IB_ZONE, then the
-   configured default zone so unattended commands behave predictably.
+1. Create or load profiles from ~/.ib/config. New profile setup connects with
+   the entered credentials to list DNS views and, by default, offers a live
+   forward-zone picker for default-zone selection before saving. Normal command
+   execution decrypts the selected default profile and creates an Infoblox WAPI
+   client for that profile's DNS view.
+2. Resolve DNS context before touching records. Commands prefer an active
+   session/IB_VIEW DNS view over the configured view, and explicit zone options
+   over the current profile's shell/session zone, IB_ZONE, then the default
+   zone saved in the selected profile so unattended commands behave
+   predictably.
 3. Convert CLI input into WAPI payloads or query parameters. Validation stays
    local where possible so operators get actionable errors before WAPI calls.
 4. Use WAPI paging for list/search operations and cache allrecords data in
@@ -40,6 +45,8 @@ import ipaddress
 import json
 import os
 import re
+import select
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -57,7 +64,8 @@ try:
     import click
     from cryptography.fernet import Fernet, InvalidToken
     from click.shell_completion import CompletionItem
-    from rich.console import Console
+    from rich.console import Console, Group
+    from rich.live import Live
     from rich.panel import Panel
     from rich.prompt import Confirm, Prompt
     from rich.table import Table
@@ -77,6 +85,22 @@ CONFIG_KEY_FILE = CONFIG_DIR / "key"
 DEFAULT_WAPI_VERSION = "v2.12.3"
 DEFAULT_TIMEOUT = 30
 DEFAULT_ZONE_ENV = "IB_ZONE"
+DEFAULT_VIEW_ENV = "IB_VIEW"
+CONFIG_META_SECTION = "meta"
+PROFILE_SECTION_PREFIX = "profile:"
+DEFAULT_PROFILE_NAME = "default"
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+PROFILE_NAME_COMPLETION_SUGGESTIONS = (
+    "default",
+    "prod",
+    "production",
+    "dev",
+    "development",
+    "test",
+    "stage",
+    "staging",
+    "lab",
+)
 ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
 COMMENT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9 .,_:;@#%+=/()[\]'&-]*$")
 WAPI_PAGE_SIZE = 2000
@@ -84,17 +108,21 @@ DNS_SEARCH_WORKERS = 8
 ZONE_SERIAL_CACHE_TTL = 30
 PREWARM_LOCK_STALE_SECONDS = 600
 SESSION_ZONE_FILE_PREFIX = "active-zone-session"
+SESSION_VIEW_FILE_PREFIX = "active-view-session"
 ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
 ZONE_COMPLETION_CACHE_TTL = 300
 ALLRECORDS_CACHE_DIR = CONFIG_DIR / "allrecords-cache"
 DNS_DELETE_COMPLETION_LIMIT = 100
 DNS_EDIT_COMPLETION_LIMIT = 100
+DEFAULT_ZONE_PICKER_LIMIT = 15
 REVERSE_ZONE_SUFFIXES = ("in-addr.arpa", "ip6.arpa")
 COMPLETION_SHELLS = ("bash", "zsh", "fish")
 ALLRECORDS_OBJECT = "allrecords"
 ALLRECORDS_RETURN_FIELDS = "name,type,view,zone,ttl,comment,address,record"
 ZONE_OBJECT = "zone_auth"
 ZONE_RETURN_FIELDS = "fqdn,view,zone_format,comment,ns_group"
+DNS_VIEW_OBJECT = "view"
+DNS_VIEW_RETURN_FIELDS = "name"
 BASE_ZONE_DETAIL_RETURN_FIELDS = (
     f"{ZONE_RETURN_FIELDS},member_soa_mnames,soa_email,soa_expire,soa_negative_ttl,"
     "soa_refresh,soa_retry,soa_serial_number"
@@ -175,12 +203,12 @@ def emit_csv(rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
 
 
 def structured_output_data(data: Any) -> Any:
-    """Remove top-level structured-output-only fields so JSON and CSV avoid exposing Infoblox refs."""
+    """Remove structured-output-only fields recursively so JSON and CSV avoid exposing Infoblox refs."""
     if isinstance(data, list):
         return [structured_output_data(item) for item in data]
     if isinstance(data, dict):
         return {
-            key: value
+            key: structured_output_data(value)
             for key, value in data.items()
             if str(key) not in STRUCTURED_EXCLUDED_FIELDS
         }
@@ -376,6 +404,65 @@ def prompt_text(label: str, default: str | None = None) -> str:
     return Prompt.ask(label, default=default)
 
 
+def terminal_supports_masked_password() -> bool:
+    """Return whether password input can use raw terminal reads with visible mask feedback."""
+    if not sys.stdin.isatty() or not console.is_terminal:
+        return False
+    try:
+        import termios  # noqa: F401
+        import tty  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def read_masked_password(label: str) -> str:
+    """Read a password from a real terminal while echoing stars instead of the typed characters."""
+    import termios
+    import tty
+
+    stdin_fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(stdin_fd)
+    password_chars: list[str] = []
+    console.print(f"{label}: ", end="")
+    try:
+        tty.setcbreak(stdin_fd)
+        while True:
+            raw = os.read(stdin_fd, 1)
+            if not raw:
+                raise EOFError
+            char = raw.decode(errors="ignore")
+            if char in {"\r", "\n"}:
+                return "".join(password_chars)
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char == "\x04" and not password_chars:
+                raise EOFError
+            if char in {"\x7f", "\b"}:
+                if password_chars:
+                    password_chars.pop()
+                    console.file.write("\b \b")
+                    console.file.flush()
+                continue
+            if len(char) == 1 and char.isprintable():
+                password_chars.append(char)
+                console.file.write("*")
+                console.file.flush()
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+        console.file.write("\n")
+        console.file.flush()
+
+
+def prompt_password(label: str, allow_blank: bool = False) -> str:
+    """Prompt for a password with masked feedback when possible and quiet fallback otherwise."""
+    if terminal_supports_masked_password():
+        return read_masked_password(label)
+    if allow_blank:
+        return Prompt.ask(label, default="", password=True, show_default=False)
+    return Prompt.ask(label, password=True)
+
+
 def ensure_config_dir() -> None:
     """Create the private config directory with strict permissions before secrets are written."""
     CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
@@ -437,30 +524,129 @@ def is_encrypted_password(password: str) -> bool:
     return password.startswith(ENCRYPTED_PASSWORD_PREFIX)
 
 
-def write_config_values(config_values: dict[str, str]) -> None:
-    """Persist config through one path so file permissions and password encryption stay consistent."""
+def normalize_profile_name(profile_name: str) -> str:
+    """Normalize profile names so config sections and CLI arguments share one safe identifier format."""
+    normalized = profile_name.strip()
+    if not normalized:
+        raise CliError("ERROR: profile name is required.")
+    if not PROFILE_NAME_RE.fullmatch(normalized):
+        raise CliError(
+            "ERROR: profile name may only contain letters, numbers, dots, underscores, and dashes."
+        )
+    return normalized
+
+
+def profile_section_name(profile_name: str) -> str:
+    """Return the config section name for a profile so storage naming stays centralized."""
+    return f"{PROFILE_SECTION_PREFIX}{normalize_profile_name(profile_name)}"
+
+
+def profile_name_from_section(section_name: str) -> str:
+    """Extract a profile name from a profile config section."""
+    return section_name[len(PROFILE_SECTION_PREFIX) :]
+
+
+def read_config_profiles(
+    decrypt_passwords: bool = False,
+) -> tuple[str, dict[str, dict[str, str]], bool]:
+    """Read configured profiles, treating legacy [default] config as profile 'default'."""
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(CONFIG_FILE)
+    except (OSError, configparser.Error) as exc:
+        raise CliError(f"ERROR: cannot read {CONFIG_FILE}: {exc}") from exc
+
+    profile_sections = [
+        section for section in parser.sections() if section.startswith(PROFILE_SECTION_PREFIX)
+    ]
+    if profile_sections:
+        profiles = {
+            normalize_profile_name(profile_name_from_section(section)): dict(parser[section])
+            for section in profile_sections
+        }
+        if CONFIG_META_SECTION not in parser:
+            raise CliError(f"ERROR: missing [{CONFIG_META_SECTION}] section in {CONFIG_FILE}")
+        default_profile = normalize_profile_name(
+            parser[CONFIG_META_SECTION].get("default_profile", "")
+        )
+        if default_profile not in profiles:
+            raise CliError(
+                f"ERROR: default profile '{default_profile}' does not exist in {CONFIG_FILE}"
+            )
+        legacy = False
+    elif "default" in parser:
+        default_profile = DEFAULT_PROFILE_NAME
+        profiles = {DEFAULT_PROFILE_NAME: dict(parser["default"])}
+        legacy = True
+    else:
+        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib configure")
+
+    if decrypt_passwords:
+        for profile_values in profiles.values():
+            if profile_values.get("password"):
+                profile_values["password"] = decrypt_password(profile_values["password"])
+    return default_profile, profiles, legacy
+
+
+def profile_config_values(config_values: dict[str, str]) -> dict[str, str]:
+    """Return a complete profile config dict with defaults for optional fields."""
+    return {
+        "server": config_values.get("server", ""),
+        "username": config_values.get("username", ""),
+        "password": config_values.get("password", ""),
+        "wapi_version": config_values.get("wapi_version", DEFAULT_WAPI_VERSION),
+        "dns_view": config_values.get("dns_view", "default"),
+        "default_zone": config_values.get("default_zone", ""),
+        "verify_ssl": config_values.get("verify_ssl", "true"),
+        "timeout": str(config_values.get("timeout", DEFAULT_TIMEOUT)),
+    }
+
+
+def write_config_profiles(
+    default_profile: str,
+    profiles: dict[str, dict[str, str]],
+) -> None:
+    """Persist all profiles with one default while preserving strict config permissions."""
+    normalized_profiles = {
+        normalize_profile_name(name): profile_config_values(values)
+        for name, values in profiles.items()
+    }
+    normalized_default = normalize_profile_name(default_profile)
+    if normalized_default not in normalized_profiles:
+        raise CliError(f"ERROR: default profile '{normalized_default}' does not exist.")
+
     ensure_config_dir()
     config = configparser.ConfigParser()
-    config["default"] = {
-        **config_values,
-        "password": encrypt_password(config_values["password"]),
-    }
+    config[CONFIG_META_SECTION] = {"default_profile": normalized_default}
+    for profile_name in sorted(normalized_profiles):
+        values = dict(normalized_profiles[profile_name])
+        password = values.get("password", "")
+        values["password"] = password if is_encrypted_password(password) else encrypt_password(password)
+        config[profile_section_name(profile_name)] = values
+
     with CONFIG_FILE.open("w", encoding="utf-8") as handle:
         config.write(handle)
     os.chmod(CONFIG_FILE, 0o600)
 
 
-def load_config_for_prompt() -> dict[str, str]:
-    """Load existing config values for interactive defaults without requiring a complete config."""
+def write_config_values(config_values: dict[str, str]) -> None:
+    """Persist one profile through the multi-profile writer for backward-compatible callers."""
+    profile_name = normalize_profile_name(config_values.get("profile", DEFAULT_PROFILE_NAME))
+    write_config_profiles(profile_name, {profile_name: config_values})
+
+
+def load_config_for_prompt(profile_name: str | None = None) -> dict[str, str]:
+    """Load one profile with decrypted password for interactive editing defaults."""
     if not CONFIG_FILE.exists():
         return {}
 
-    parser = configparser.ConfigParser()
-    parser.read(CONFIG_FILE)
-    if "default" not in parser:
-        raise CliError(f"ERROR: missing [default] section in {CONFIG_FILE}")
+    default_profile, profiles, _legacy = read_config_profiles()
+    selected_profile = normalize_profile_name(profile_name or default_profile)
+    if selected_profile not in profiles:
+        raise CliError(f"ERROR: profile '{selected_profile}' does not exist.")
 
-    cfg = dict(parser["default"])
+    cfg = dict(profiles[selected_profile])
+    cfg["profile"] = selected_profile
     if cfg.get("server"):
         cfg["server"] = normalize_server(cfg["server"])
     if cfg.get("password"):
@@ -472,12 +658,367 @@ def load_config_for_prompt() -> dict[str, str]:
     return cfg
 
 
-def save_config_interactive() -> None:
-    """Collect and save configuration interactively so first-run setup is guided and repeatable."""
-    current = load_config_for_prompt()
+def dns_view_query_params() -> dict[str, Any]:
+    """Build the unscoped WAPI query for DNS views used during profile creation."""
+    return {"_return_fields": DNS_VIEW_RETURN_FIELDS}
+
+
+def dns_view_names_from_records(view_records: list[dict[str, Any]]) -> list[str]:
+    """Extract sorted unique DNS view names so the interactive prompt has stable choices."""
+    names = {
+        str(record.get("name", "")).strip()
+        for record in view_records
+        if str(record.get("name", "")).strip()
+    }
+    return sorted(names, key=str.lower)
+
+
+def query_dns_view_records(client: InfobloxClient) -> list[dict[str, Any]]:
+    """Query all DNS views through WAPI so configure and dns view commands share retrieval behavior."""
+    return paged_query(
+        client,
+        DNS_VIEW_OBJECT,
+        dns_view_query_params(),
+        warn_on_skip=False,
+    )
+
+
+def query_dns_view_names(client: InfobloxClient) -> list[str]:
+    """Return sorted DNS view names from Infoblox for listing, validation, and completion."""
+    return dns_view_names_from_records(query_dns_view_records(client))
+
+
+def query_dns_view_names_for_config(config_values: dict[str, str]) -> list[str]:
+    """Connect with unsaved profile values and return DNS view names before the profile is persisted."""
+    client = InfobloxClient(config_values)
+    try:
+        return query_dns_view_names(client)
+    finally:
+        client.close()
+
+
+def render_dns_view_choices(view_names: list[str]) -> None:
+    """Show fetched DNS views in a compact table so users can choose from real Infoblox data."""
+    table = Table(title="Available DNS Views", show_header=True)
+    table.add_column("#", justify="right")
+    table.add_column("DNS View")
+    for index, view_name in enumerate(view_names, start=1):
+        table.add_row(str(index), view_name)
+    console.print(table)
+
+
+def prompt_dns_view_from_infoblox(
+    config_values: dict[str, str],
+    default_view: str = "default",
+) -> str:
+    """Prompt for a DNS view, preferring live Infoblox choices while keeping manual setup possible."""
+    try:
+        view_names = query_dns_view_names_for_config(config_values)
+    except (CliError, OSError, ValueError) as exc:
+        print_warning(f"WARNING: could not load DNS views from Infoblox: {exc}")
+        return Prompt.ask("DNS view", default=default_view)
+
+    if not view_names:
+        print_warning("WARNING: Infoblox returned no DNS views. Enter the DNS view manually.")
+        return Prompt.ask("DNS view", default=default_view)
+
+    render_dns_view_choices(view_names)
+    # The temporary config's view is only a bootstrap default. The saved value is
+    # whichever live view the user selects here.
+    default_choice = default_view if default_view in view_names else view_names[0]
+    return Prompt.ask("DNS view", choices=view_names, default=default_choice)
+
+
+def prompt_manual_default_zone(default_zone: str = "") -> str:
+    """Prompt for a default zone manually and normalize it only when the user entered a value."""
+    value = Prompt.ask("Default DNS zone (optional)", default=default_zone).strip()
+    return normalize_zone_name(value) if value else ""
+
+
+def default_zone_name(zone: dict[str, Any]) -> str:
+    """Return the zone fqdn as normalized display text for filtering, sorting, and saving."""
+    return str(zone.get("fqdn", "")).strip()
+
+
+def default_zone_sort_key(zone: dict[str, Any], search: str = "") -> tuple[int, str]:
+    """Sort zone matches by starts-with priority first, then alphabetically by zone name."""
+    name = default_zone_name(zone).lower()
+    terms = [term for term in search.strip().lower().split() if term]
+    prefix = terms[0] if terms else ""
+    starts_with_rank = 0 if prefix and name.startswith(prefix) else 1
+    if not prefix:
+        starts_with_rank = 0
+    return starts_with_rank, name
+
+
+def selectable_zone_records(zones: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only forward zones with names, sorted so subdomains stay visible in stable order."""
+    candidates = [
+        zone
+        for zone in zones
+        if default_zone_name(zone) and is_forward_zone(zone)
+    ]
+    return sorted(candidates, key=default_zone_sort_key)
+
+
+def filter_default_zone_candidates(
+    zones: list[dict[str, Any]],
+    search: str,
+) -> list[dict[str, Any]]:
+    """Filter already-fetched forward zones locally so live search avoids WAPI calls per keystroke."""
+    terms = [term for term in search.strip().lower().split() if term]
+    if not terms:
+        return zones
+
+    matches = []
+    for zone in zones:
+        searchable = " ".join(
+            [
+                str(zone.get("fqdn", "")),
+                str(zone.get("comment", "")),
+            ]
+        ).lower()
+        if all(term in searchable for term in terms):
+            matches.append(zone)
+    return sorted(matches, key=lambda zone: default_zone_sort_key(zone, search))
+
+
+def query_default_zone_candidates_for_config(config_values: dict[str, str]) -> list[dict[str, Any]]:
+    """Connect with unsaved profile values and fetch forward authoritative zones for local live filtering."""
+    client = InfobloxClient(config_values)
+    try:
+        return selectable_zone_records(query_zones(client))
+    finally:
+        client.close()
+
+
+def render_default_zone_choices(zones: list[dict[str, Any]]) -> None:
+    """Show default-zone candidates with numeric selectors so long zone names stay readable."""
+    table = Table(title="Available DNS Zones", header_style="bold cyan")
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("Zone", overflow="fold")
+    table.add_column("Format", no_wrap=True)
+    table.add_column("Comment", overflow="fold")
+    for index, zone in enumerate(zones, start=1):
+        table.add_row(
+            str(index),
+            default_zone_name(zone),
+            str(zone.get("zone_format", "")),
+            str(zone.get("comment", "")),
+        )
+    console.print(table)
+
+
+def default_zone_picker_renderable(
+    zones: list[dict[str, Any]],
+    search: str,
+    selected_index: int,
+) -> Group:
+    """Build the live search box and filtered zone list shown by the terminal picker."""
+    matches = filter_default_zone_candidates(zones, search)
+    selected_index = max(0, min(selected_index, max(len(matches) - 1, 0)))
+    start = max(0, selected_index - DEFAULT_ZONE_PICKER_LIMIT + 1)
+    visible = matches[start : start + DEFAULT_ZONE_PICKER_LIMIT]
+
+    search_text = Text()
+    search_text.append("Search DNS zone: ", style="bold cyan")
+    search_text.append(search or "<type to filter>", style=None if search else "dim")
+    search_panel = Panel(search_text, title="Default DNS Zone")
+
+    table = Table(
+        title=f"Forward DNS Zones ({len(matches)} match{'es' if len(matches) != 1 else ''})",
+        header_style="bold cyan",
+    )
+    table.add_column("", no_wrap=True)
+    table.add_column("#", justify="right", no_wrap=True)
+    table.add_column("Zone", overflow="fold")
+    table.add_column("Comment", overflow="fold")
+
+    if visible:
+        for offset, zone in enumerate(visible, start=start):
+            marker = ">" if offset == selected_index else ""
+            table.add_row(
+                marker,
+                str(offset + 1),
+                default_zone_name(zone),
+                str(zone.get("comment", "")),
+            )
+    else:
+        table.add_row("", "", "No matching forward zones", "")
+
+    help_text = Text(
+        "Type to filter; Up/Down selects; Enter saves the highlighted zone; Ctrl-D skips default zone.",
+        style="dim",
+    )
+    return Group(search_panel, table, help_text)
+
+
+def read_zone_picker_key() -> str:
+    """Read one terminal key, folding arrow-key escape sequences into single logical values."""
+    stdin_fd = sys.stdin.fileno()
+    first = os.read(stdin_fd, 1)
+    if not first:
+        return ""
+    char = first.decode(errors="ignore")
+    if char != "\x1b":
+        return char
+
+    sequence = char
+    deadline = time.monotonic() + 0.20
+    while len(sequence) < 16:
+        timeout = max(0.0, deadline - time.monotonic())
+        if timeout <= 0 or not select.select([stdin_fd], [], [], timeout)[0]:
+            break
+        chunk = os.read(stdin_fd, 1)
+        if not chunk:
+            break
+        sequence += chunk.decode(errors="ignore")
+        if len(sequence) >= 3 and (sequence[-1].isalpha() or sequence.endswith("~")):
+            break
+    return normalize_zone_picker_key(sequence)
+
+
+def normalize_zone_picker_key(sequence: str) -> str:
+    """Normalize common terminal arrow-key variants so selection works across shells and emulators."""
+    if not sequence.startswith("\x1b") or sequence == "\x1b":
+        return sequence
+    if sequence.endswith("A"):
+        return "\x1b[A"
+    if sequence.endswith("B"):
+        return "\x1b[B"
+    return sequence
+
+
+def prompt_default_zone_realtime(zones: list[dict[str, Any]]) -> str:
+    """Let users type-filter the forward-zone list with immediate updates before selecting a zone."""
+    import termios
+    import tty
+
+    search = ""
+    selected_index = 0
+    stdin_fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(stdin_fd)
+    try:
+        tty.setcbreak(stdin_fd)
+        with Live(
+            default_zone_picker_renderable(zones, search, selected_index),
+            console=console,
+            refresh_per_second=12,
+            transient=False,
+        ) as live:
+            while True:
+                key = read_zone_picker_key()
+                matches = filter_default_zone_candidates(zones, search)
+                if key in {"\r", "\n"}:
+                    if matches:
+                        zone_name = default_zone_name(matches[selected_index])
+                        return normalize_zone_name(zone_name)
+                    continue
+                if key == "\x03":
+                    raise KeyboardInterrupt
+                if key == "\x04":
+                    return ""
+                if key == "" or key == "\x1b":
+                    pass
+                elif key in {"\x7f", "\b"}:
+                    search = search[:-1]
+                    selected_index = 0
+                elif key == "\x1b[A":
+                    selected_index = max(0, selected_index - 1)
+                elif key == "\x1b[B":
+                    selected_index = min(max(len(matches) - 1, 0), selected_index + 1)
+                elif key.startswith("\x1b"):
+                    pass
+                elif len(key) == 1 and key.isprintable():
+                    search += key
+                    selected_index = 0
+
+                matches = filter_default_zone_candidates(zones, search)
+                if selected_index >= len(matches):
+                    selected_index = max(len(matches) - 1, 0)
+                live.update(default_zone_picker_renderable(zones, search, selected_index))
+    finally:
+        termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
+        console.print()
+
+
+def terminal_supports_realtime_zone_picker() -> bool:
+    """Return whether raw terminal input is available for the live default-zone picker."""
+    if not sys.stdin.isatty() or not console.is_terminal:
+        return False
+    try:
+        import termios  # noqa: F401
+        import tty  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def prompt_default_zone_from_list(zones: list[dict[str, Any]]) -> str:
+    """Fallback zone selector for non-terminal sessions where live key handling is unavailable."""
+    search = Prompt.ask("Search DNS zone (leave blank to list all)", default="").strip()
+    matches = filter_default_zone_candidates(zones, search)
+    if not matches:
+        print_warning("WARNING: no matching forward DNS zones. Enter the default zone manually.")
+        return prompt_manual_default_zone()
+
+    render_default_zone_choices(matches)
+    choices = [str(index) for index in range(1, len(matches) + 1)]
+    selected = Prompt.ask("Select default DNS zone", choices=choices, default=choices[0])
+    zone_name = default_zone_name(matches[int(selected) - 1])
+    return normalize_zone_name(zone_name)
+
+
+def prompt_default_zone_from_infoblox(config_values: dict[str, str]) -> str:
+    """Optionally fetch forward zones and select one as the new profile's default zone."""
+    if not Confirm.ask("Configure a default DNS zone for this profile", default=True):
+        return ""
+
+    try:
+        zones = query_default_zone_candidates_for_config(config_values)
+    except (CliError, OSError, ValueError) as exc:
+        print_warning(f"WARNING: could not load DNS zones from Infoblox: {exc}")
+        return prompt_manual_default_zone()
+
+    if not zones:
+        print_warning("WARNING: Infoblox returned no forward DNS zones. Enter the default zone manually.")
+        return prompt_manual_default_zone()
+
+    if terminal_supports_realtime_zone_picker():
+        return prompt_default_zone_realtime(zones)
+    return prompt_default_zone_from_list(zones)
+
+
+def save_config_interactive(
+    profile_name: str | None = None,
+    create: bool = False,
+    make_default: bool = False,
+) -> None:
+    """Collect and save one profile, probing views and optional zones for new profiles."""
+    if CONFIG_FILE.exists():
+        default_profile, profiles, _legacy = read_config_profiles()
+    else:
+        default_profile, profiles = DEFAULT_PROFILE_NAME, {}
+
+    selected_profile = normalize_profile_name(profile_name or default_profile)
+    is_new_profile = create or selected_profile not in profiles
+    if create and selected_profile in profiles:
+        raise CliError(f"ERROR: profile '{selected_profile}' already exists.")
+    if not create and selected_profile not in profiles and (profiles or profile_name is not None):
+        raise CliError(f"ERROR: profile '{selected_profile}' does not exist.")
+
+    had_profiles = bool(profiles)
+    current = {} if create else dict(profiles.get(selected_profile, {}))
+    if current.get("password"):
+        try:
+            current["password"] = decrypt_password(current["password"])
+        except CliError as exc:
+            print_warning(str(exc))
+            current.pop("password", None)
+    profile_action = "Create" if is_new_profile else "Edit"
     console.print(
         Panel.fit(
-            f"Configuration will be saved to [bold]{CONFIG_FILE}[/bold].\n"
+            f"{profile_action} profile [bold]{selected_profile}[/bold] in [bold]{CONFIG_FILE}[/bold].\n"
             "You can run this multiple times; existing values are shown as defaults.\n"
             "Press Enter to keep a value, or leave the password blank to keep it unchanged.",
             title="Infoblox Configuration",
@@ -488,31 +1029,46 @@ def save_config_interactive() -> None:
     server = normalize_server(prompt_text("Infoblox server", current.get("server")))
     username = prompt_text("Username", current.get("username"))
     if current.get("password"):
-        password = Prompt.ask(
-            "Password (leave blank to keep current)",
-            default="",
-            password=True,
-            show_default=False,
-        ) or current["password"]
+        password = (
+            prompt_password("Password (leave blank to keep current)", allow_blank=True)
+            or current["password"]
+        )
     else:
-        password = Prompt.ask("Password", password=True)
+        password = prompt_password("Password")
     if not username or not password:
         raise CliError("ERROR: username and password are required.")
 
     wapi_version = Prompt.ask(
         "WAPI version", default=current.get("wapi_version", DEFAULT_WAPI_VERSION)
     )
-    dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
-    default_zone = Prompt.ask(
-        "Default DNS zone (optional)",
-        default=current.get("default_zone", ""),
-    ).strip()
-    if default_zone:
-        default_zone = normalize_zone_name(default_zone)
-    verify_ssl = Confirm.ask(
-        "Verify SSL certificates",
-        default=parse_bool(current.get("verify_ssl", "true")),
-    )
+    if is_new_profile:
+        verify_ssl = Confirm.ask(
+            "Verify SSL certificates",
+            default=parse_bool(current.get("verify_ssl", "true")),
+        )
+        probe_config = {
+            "server": server,
+            "username": username,
+            "password": password,
+            "wapi_version": wapi_version,
+            "dns_view": current.get("dns_view", "default"),
+            "verify_ssl": "true" if verify_ssl else "false",
+            "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
+        }
+        dns_view = prompt_dns_view_from_infoblox(
+            probe_config,
+            current.get("dns_view", "default"),
+        )
+        probe_config["dns_view"] = dns_view
+        default_zone = prompt_default_zone_from_infoblox(probe_config)
+    else:
+        dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
+        default_zone = prompt_manual_default_zone(current.get("default_zone", ""))
+    if not is_new_profile:
+        verify_ssl = Confirm.ask(
+            "Verify SSL certificates",
+            default=parse_bool(current.get("verify_ssl", "true")),
+        )
 
     default_config = {
         "server": server,
@@ -524,9 +1080,117 @@ def save_config_interactive() -> None:
         "verify_ssl": "true" if verify_ssl else "false",
         "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
     }
-    write_config_values(default_config)
+    profiles[selected_profile] = default_config
+    if make_default or not had_profiles:
+        default_profile = selected_profile
+    write_config_profiles(default_profile, profiles)
 
-    print_success("SUCCESS: configuration saved.")
+    if default_profile == selected_profile:
+        print_success(f"SUCCESS: profile '{selected_profile}' saved and set as default.")
+    else:
+        print_success(f"SUCCESS: profile '{selected_profile}' saved.")
+
+
+def set_default_profile(profile_name: str) -> None:
+    """Set the default profile without editing profile values."""
+    selected_profile = normalize_profile_name(profile_name)
+    default_profile, profiles, _legacy = read_config_profiles()
+    if selected_profile not in profiles:
+        raise CliError(f"ERROR: profile '{selected_profile}' does not exist.")
+    write_config_profiles(selected_profile, profiles)
+    message = f"default profile set to '{selected_profile}'"
+    if output_is_table():
+        print_success(f"SUCCESS: {message}.")
+    else:
+        emit_structured(
+            {
+                "status": "success",
+                "action": "use",
+                "profile": selected_profile,
+                "default": True,
+                "message": message,
+            },
+            ["status", "action", "profile", "default", "message"],
+        )
+
+
+def delete_config_profile(profile_name: str) -> None:
+    """Delete a non-default profile while refusing to leave config without a default."""
+    selected_profile = normalize_profile_name(profile_name)
+    default_profile, profiles, _legacy = read_config_profiles()
+    if selected_profile not in profiles:
+        raise CliError(f"ERROR: profile '{selected_profile}' does not exist.")
+    if selected_profile == default_profile:
+        raise CliError(
+            f"ERROR: cannot delete default profile '{selected_profile}'. "
+            "Run: ib configure use OTHER_PROFILE"
+        )
+    del profiles[selected_profile]
+    write_config_profiles(default_profile, profiles)
+    message = f"profile '{selected_profile}' deleted"
+    if output_is_table():
+        print_success(f"SUCCESS: {message}.")
+    else:
+        emit_structured(
+            {
+                "status": "success",
+                "action": "delete",
+                "profile": selected_profile,
+                "default": False,
+                "message": message,
+            },
+            ["status", "action", "profile", "default", "message"],
+        )
+
+
+def profile_table(default_profile: str, profiles: dict[str, dict[str, str]]) -> Table:
+    """Build the profile list table without exposing passwords."""
+    table = Table(title=f"Infoblox Profiles ({len(profiles)})", header_style="bold cyan")
+    table.add_column("Profile", style="bold")
+    table.add_column("Default", no_wrap=True)
+    table.add_column("Server", overflow="fold")
+    table.add_column("DNS View", overflow="fold")
+    table.add_column("Default Zone", overflow="fold")
+    for profile_name in sorted(profiles):
+        values = profiles[profile_name]
+        table.add_row(
+            profile_name,
+            "yes" if profile_name == default_profile else "",
+            str(values.get("server", "")),
+            str(values.get("dns_view", "default")),
+            str(values.get("default_zone", "")),
+        )
+    return table
+
+
+def emit_profile_list(default_profile: str, profiles: dict[str, dict[str, str]]) -> None:
+    """Emit configured profiles as a table or structured output without password fields."""
+    if output_is_table():
+        console.print(profile_table(default_profile, profiles))
+        return
+    rows = [
+        {
+            "profile": profile_name,
+            "default": profile_name == default_profile,
+            "server": str(values.get("server", "")),
+            "dns_view": str(values.get("dns_view", "default")),
+            "default_zone": str(values.get("default_zone", "")),
+        }
+        for profile_name, values in sorted(profiles.items())
+    ]
+    emit_structured(rows, ["profile", "default", "server", "dns_view", "default_zone"])
+
+
+def list_config_profiles() -> None:
+    """List configured profiles and mark the default profile."""
+    if not CONFIG_FILE.exists():
+        if output_is_table():
+            print_warning("No profiles configured. Run: ib configure")
+        else:
+            emit_structured([], ["profile", "default", "server", "dns_view", "default_zone"])
+        return
+    default_profile, profiles, _legacy = read_config_profiles()
+    emit_profile_list(default_profile, profiles)
 
 
 def maybe_prompt_configure() -> None:
@@ -540,22 +1204,20 @@ def maybe_prompt_configure() -> None:
 
 
 def load_config(required: bool = True) -> dict[str, str] | None:
-    """Load validated config and decrypt credentials so command workflows start with usable settings."""
+    """Load the default profile and decrypt credentials so commands start with usable settings."""
     if not CONFIG_FILE.exists():
         if required:
             maybe_prompt_configure()
         else:
             return None
 
-    parser = configparser.ConfigParser()
-    parser.read(CONFIG_FILE)
-    if "default" not in parser:
-        raise CliError(f"ERROR: missing [default] section in {CONFIG_FILE}")
+    default_profile, profiles, legacy = read_config_profiles()
+    cfg = dict(profiles[default_profile])
+    cfg["profile"] = default_profile
 
-    cfg = dict(parser["default"])
     for key in ("server", "username", "password"):
         if not cfg.get(key):
-            raise CliError(f"ERROR: missing '{key}' in {CONFIG_FILE}")
+            raise CliError(f"ERROR: missing '{key}' in profile '{default_profile}' in {CONFIG_FILE}")
 
     raw_password = cfg["password"]
     cfg["password"] = decrypt_password(raw_password)
@@ -565,8 +1227,12 @@ def load_config(required: bool = True) -> dict[str, str] | None:
     cfg.setdefault("default_zone", "")
     cfg.setdefault("verify_ssl", "true")
     cfg.setdefault("timeout", str(DEFAULT_TIMEOUT))
-    if not is_encrypted_password(raw_password):
-        write_config_values(cfg)
+    cfg["dns_view"] = resolve_dns_view(cfg)
+    if legacy or any(
+        values.get("password") and not is_encrypted_password(values["password"])
+        for values in profiles.values()
+    ):
+        write_config_profiles(default_profile, profiles)
     return cfg
 
 
@@ -719,22 +1385,35 @@ def normalize_zone_name(zone_name: str) -> str:
     return normalized
 
 
+def normalize_dns_view(view_name: str) -> str:
+    """Normalize DNS view names while preserving spaces because Infoblox views can contain them."""
+    normalized = view_name.strip()
+    if not normalized:
+        raise CliError("ERROR: DNS view is required.")
+    return normalized
+
+
 def default_zone_from_env() -> str | None:
     """Read IB_ZONE as a normalized zone so shell-scoped overrides use the same validation as config."""
     zone_name = os.environ.get(DEFAULT_ZONE_ENV, "").strip()
     return normalize_zone_name(zone_name) if zone_name else None
 
 
+def default_view_from_env() -> str | None:
+    """Read IB_VIEW as a normalized DNS view so shell-scoped view overrides are explicit."""
+    view_name = os.environ.get(DEFAULT_VIEW_ENV, "").strip()
+    return normalize_dns_view(view_name) if view_name else None
+
+
 def default_config_values() -> dict[str, str]:
     """Read non-secret config values for help/completion without forcing a full command setup path."""
-    parser = configparser.ConfigParser()
     try:
-        parser.read(CONFIG_FILE)
-    except (OSError, configparser.Error):
+        default_profile, profiles, _legacy = read_config_profiles()
+    except (CliError, OSError, configparser.Error):
         return {}
-    if "default" not in parser:
-        return {}
-    return dict(parser["default"])
+    values = dict(profiles[default_profile])
+    values["profile"] = default_profile
+    return values
 
 
 def session_zone_dir() -> Path:
@@ -751,8 +1430,29 @@ def session_zone_file() -> Path:
     return session_zone_dir() / f"{SESSION_ZONE_FILE_PREFIX}-{os.getppid()}.json"
 
 
-def read_session_zone() -> str | None:
-    """Read the active session zone when present so commands can honor ib dns zone use."""
+def session_view_dir() -> Path:
+    """Return the session-view directory path so transient view state stays outside persistent config."""
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime_dir and os.access(runtime_dir, os.W_OK):
+        return Path(runtime_dir) / "ib" / "active-views"
+    user_id = str(os.getuid()) if hasattr(os, "getuid") else "user"
+    return Path(tempfile.gettempdir()) / f"ib-{user_id}" / "active-views"
+
+
+def session_view_file() -> Path:
+    """Return the session-view file for this shell so ib dns view use remains session scoped."""
+    return session_view_dir() / f"{SESSION_VIEW_FILE_PREFIX}-{os.getppid()}.json"
+
+
+def session_profile_name() -> str | None:
+    """Return the selected profile name for scoping transient session state when config exists."""
+    profile_name = str(default_config_values().get("profile", "")).strip()
+    return normalize_profile_name(profile_name) if profile_name else None
+
+
+def read_session_zone(profile_name: str | None = None) -> str | None:
+    """Read the active session zone, accepting only zones saved for the current profile."""
+    expected_profile = normalize_profile_name(profile_name) if profile_name else None
     try:
         with session_zone_file().open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -760,6 +1460,9 @@ def read_session_zone() -> str | None:
         return None
 
     if not isinstance(payload, dict) or payload.get("parent_pid") != os.getppid():
+        return None
+    stored_profile = str(payload.get("profile", "")).strip()
+    if expected_profile and stored_profile != expected_profile:
         return None
     zone_name = str(payload.get("zone", "")).strip()
     if not zone_name:
@@ -770,14 +1473,16 @@ def read_session_zone() -> str | None:
         return None
 
 
-def write_session_zone(zone_name: str) -> None:
-    """Write the active zone to session state instead of config so zone use remains transient."""
+def write_session_zone(zone_name: str, profile_name: str | None = None) -> None:
+    """Write the active zone to profile-scoped session state so zone use remains transient."""
     path = session_zone_file()
     payload = {
         "zone": normalize_zone_name(zone_name),
         "parent_pid": os.getppid(),
         "created_at": time.time(),
     }
+    if profile_name:
+        payload["profile"] = normalize_profile_name(profile_name)
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(path.parent, 0o700)
@@ -788,12 +1493,63 @@ def write_session_zone(zone_name: str) -> None:
         raise CliError(f"ERROR: cannot write session active zone at {path}")
 
 
+def read_session_view() -> str | None:
+    """Read the active session view when present so commands can honor ib dns view use."""
+    try:
+        with session_view_file().open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(payload, dict) or payload.get("parent_pid") != os.getppid():
+        return None
+    view_name = str(payload.get("view", "")).strip()
+    if not view_name:
+        return None
+    try:
+        return normalize_dns_view(view_name)
+    except CliError:
+        return None
+
+
+def write_session_view(view_name: str) -> None:
+    """Write the active DNS view to session state instead of changing the saved profile."""
+    path = session_view_file()
+    payload = {
+        "view": normalize_dns_view(view_name),
+        "parent_pid": os.getppid(),
+        "created_at": time.time(),
+    }
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(path.parent, 0o700)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.chmod(path, 0o600)
+    except OSError:
+        raise CliError(f"ERROR: cannot write session active DNS view at {path}")
+
+
+def resolve_dns_view(config: dict[str, str]) -> str:
+    """Resolve active DNS view through session, environment, then configured profile values."""
+    session_view = read_session_view()
+    if session_view:
+        return session_view
+
+    env_view = default_view_from_env()
+    if env_view:
+        return env_view
+
+    configured_view = str(config.get("dns_view", "")).strip()
+    return normalize_dns_view(configured_view) if configured_view else "default"
+
+
 def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> str:
-    """Resolve the target zone through CLI, session, environment, then config to keep precedence explicit."""
+    """Resolve the target zone through CLI, profile session, environment, then config."""
     if zone_name:
         return normalize_zone_name(zone_name)
 
-    session_zone = read_session_zone()
+    session_zone = read_session_zone(config.get("profile"))
     if session_zone:
         return session_zone
 
@@ -869,6 +1625,17 @@ def default_zone_from_config_file() -> str | None:
 
 def current_view_status() -> tuple[str, str]:
     """Return display text for the active DNS view so help can show useful context without full config loading."""
+    session_view = read_session_view()
+    if session_view:
+        return session_view, "shell session"
+
+    try:
+        env_view = default_view_from_env()
+    except CliError:
+        env_view = None
+    if env_view:
+        return env_view, DEFAULT_VIEW_ENV
+
     config_values = default_config_values()
     if not config_values:
         return "not configured", "run ib configure"
@@ -879,9 +1646,19 @@ def current_view_status() -> tuple[str, str]:
     return "default", "implicit default"
 
 
+def active_profile_status() -> tuple[str, str]:
+    """Return display text for the selected default profile."""
+    config_values = default_config_values()
+    if not config_values:
+        return "not configured", "run ib configure"
+    profile_name = config_values.get("profile", DEFAULT_PROFILE_NAME).strip()
+    return profile_name or DEFAULT_PROFILE_NAME, "default profile"
+
+
 def active_zone_status() -> tuple[str | None, str]:
     """Return the active zone and source so help and completion can explain command targeting."""
-    session_zone = read_session_zone()
+    config_values = default_config_values()
+    session_zone = read_session_zone(config_values.get("profile"))
     if session_zone:
         return session_zone, "shell session"
 
@@ -920,9 +1697,12 @@ DNS_CONTEXT_SOURCE_STYLE = "dim"
 
 def dns_context_status() -> dict[str, Any]:
     """Collect view and zone display state once so help renderers stay consistent."""
+    profile_name, profile_source = active_profile_status()
     view_name, view_source = current_view_status()
     zone_name, zone_source = active_zone_status()
     return {
+        "profile": profile_name,
+        "profile_source": profile_source,
         "view": view_name,
         "view_source": view_source,
         "active_zone": zone_name or "not set",
@@ -977,6 +1757,9 @@ def dns_context_line_text(status: dict[str, Any] | None = None) -> Text:
     context = status or dns_context_status()
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append("Current DNS Context: ", style=DNS_CONTEXT_TITLE_STYLE)
+    text.append("Profile=", style=DNS_CONTEXT_LABEL_STYLE)
+    text.append(str(context.get("profile", DEFAULT_PROFILE_NAME)), style="bold blue")
+    text.append(" | ")
     text.append("View=", style=DNS_CONTEXT_LABEL_STYLE)
     text.append_text(current_view_context_text(context, include_source=False))
     text.append(" | ")
@@ -1638,6 +2421,8 @@ def dns_create_error_context(
         "name": name,
         "--zone": zone,
         "target_record": dns_create_target_name(name, resolved_zone),
+        "profile": context_status.get("profile", DEFAULT_PROFILE_NAME),
+        "profile_source": context_status.get("profile_source", "default profile"),
         "view": context_status["view"],
         "view_source": context_status["view_source"],
         "active_zone": context_status["active_zone"],
@@ -2667,10 +3452,19 @@ def decoded_allrecords_ref(item: dict[str, Any]) -> str:
 
 def unsupported_allrecord_type(item: dict[str, Any]) -> str:
     """Infer display labels for known unsupported allrecords records so search output is clearer."""
-    decoded_ref = decoded_allrecords_ref(item)
-    if "fake_bind_ns" in decoded_ref:
+    reference_text = " ".join(
+        str(value)
+        for value in (
+            decoded_allrecords_ref(item),
+            item.get("_ref", ""),
+            item.get("record", ""),
+            nested_record(item).get("_ref", ""),
+        )
+        if value
+    ).lower()
+    if "fake_bind_ns" in reference_text or "bind_ns" in reference_text or "record:ns/" in reference_text:
         return "ns"
-    if "bind_soa" in decoded_ref:
+    if "bind_soa" in reference_text or "record:soa/" in reference_text:
         return "soa"
     return "unsupported"
 
@@ -2717,6 +3511,8 @@ def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
         return first_record_value(item, ("canonical",))
     if record_type in {"txt", "shared-txt"}:
         return first_record_value(item, ("text",))
+    if record_type in {"ns", "shared-ns"}:
+        return first_record_value(item, ("nameserver", "nsdname"))
     if record_type in {"mx", "shared-mx"}:
         exchanger = first_record_value(item, ("mail_exchanger",))
         preference = first_record_value(item, ("preference",))
@@ -2741,7 +3537,13 @@ def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
     if item.get("address"):
         return str(item["address"])
     record = item.get("record")
-    return str(record) if record not in (None, "") else ""
+    if record in (None, ""):
+        return ""
+    if isinstance(record, str) and record.startswith(("record:", "allrecords/")):
+        return ""
+    if isinstance(record, dict) and set(record) <= {"_ref"}:
+        return ""
+    return str(record)
 
 
 def allrecord_search_values(record_type: str, item: dict[str, Any]) -> list[str]:
@@ -3666,9 +4468,10 @@ def run_dns_zone_delete(zone_name: str) -> None:
 
 
 def run_dns_zone_use(zone_name: str) -> None:
-    """Record the active zone for this shell session and print export guidance for persistence."""
+    """Record the active zone for this shell session and selected profile."""
     default_zone = normalize_zone_name(zone_name)
-    write_session_zone(default_zone)
+    profile_name = session_profile_name()
+    write_session_zone(default_zone, profile_name)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -3682,7 +4485,86 @@ def run_dns_zone_use(zone_name: str) -> None:
         )
         return
     print_success(f"SUCCESS: active DNS zone set to {default_zone}")
+    print_note("This applies to the current shell session and selected profile only.")
+
+
+def dns_view_output_rows(view_names: list[str], active_view: str) -> list[dict[str, Any]]:
+    """Convert view names into rows that mark the active view consistently for table and structured output."""
+    return [
+        {
+            "view": view_name,
+            "active": view_name == active_view,
+        }
+        for view_name in view_names
+    ]
+
+
+def dns_view_table(view_names: list[str], active_view: str) -> Table:
+    """Build the Rich DNS view table with the current active view marked for quick scanning."""
+    table = Table(title=f"DNS Views ({len(view_names)})", header_style="bold cyan")
+    table.add_column("Active", no_wrap=True)
+    table.add_column("DNS View", overflow="fold")
+    for row in dns_view_output_rows(view_names, active_view):
+        table.add_row("*" if row["active"] else "", str(row["view"]))
+    return table
+
+
+def matching_dns_view_name(view_name: str, view_names: list[str]) -> str:
+    """Resolve a requested DNS view against available views, accepting case-insensitive user input."""
+    requested = normalize_dns_view(view_name)
+    if requested in view_names:
+        return requested
+
+    matches = [candidate for candidate in view_names if candidate.lower() == requested.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    raise CliError(f"ERROR: DNS view '{requested}' was not found.")
+
+
+def run_dns_view_list() -> None:
+    """List all available DNS views from Infoblox and mark the currently active view."""
+    config = load_config()
+    active_view = config.get("dns_view", "default")
+    client = InfobloxClient(config)
+    try:
+        view_names = query_dns_view_names(client)
+    finally:
+        client.close()
+
+    if output_is_table():
+        console.print(dns_context_panel("Current DNS Context"))
+        console.print(dns_view_table(view_names, active_view))
+    else:
+        emit_structured(dns_view_output_rows(view_names, active_view), ["view", "active"])
+
+
+def run_dns_view_use(view_name: str) -> None:
+    """Set the active DNS view for this shell session after validating it exists in Infoblox."""
+    config = load_config()
+    client = InfobloxClient(config)
+    try:
+        view_names = query_dns_view_names(client)
+    finally:
+        client.close()
+
+    selected_view = matching_dns_view_name(view_name, view_names)
+    write_session_view(selected_view)
+    if not output_is_table():
+        emit_action_result(
+            status="success",
+            action="use",
+            type="VIEW",
+            name=selected_view,
+            zone="",
+            view=selected_view,
+            message=f"active DNS view set to {selected_view}",
+        )
+        return
+
+    export_command = f"export {DEFAULT_VIEW_ENV}={shlex.quote(selected_view)}"
+    print_success(f"SUCCESS: active DNS view set to {selected_view}")
     print_note("This applies to the current shell session only.")
+    print_note(f"For a different shell, run: {export_command}")
 
 
 def parse_dns_create_name_value(
@@ -3810,6 +4692,81 @@ def complete_forward_zone_names(
         return []
 
     return filter_zone_names(names, incomplete)
+
+
+def complete_dns_view_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    """Return DNS view completion candidates, failing quietly like other network-backed completion."""
+    try:
+        config = load_config(required=False)
+        if not config:
+            return []
+        client = InfobloxClient(config)
+        try:
+            names = query_dns_view_names(client)
+        finally:
+            client.close()
+    except (CliError, OSError, ValueError):
+        return []
+
+    return filter_zone_names(names, incomplete)
+
+
+def profile_completion_state() -> tuple[str | None, list[str]]:
+    """Return profile names for shell completion without decrypting secrets or prompting for config."""
+    try:
+        default_profile, profiles, _legacy = read_config_profiles()
+    except (CliError, OSError, configparser.Error):
+        return None, []
+    return default_profile, sorted(profiles, key=str.lower)
+
+
+def filter_profile_names(names: list[str], incomplete: str) -> list[str]:
+    """Filter profile completion names by prefix so arbitrary profile arguments still work."""
+    normalized_incomplete = incomplete.lower()
+    if not normalized_incomplete:
+        return names
+    return [name for name in names if name.lower().startswith(normalized_incomplete)]
+
+
+def complete_existing_profile_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    """Complete configured profile names for commands that operate on an existing profile."""
+    _default_profile, names = profile_completion_state()
+    return filter_profile_names(names, incomplete)
+
+
+def complete_deletable_profile_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    """Complete only non-default profiles because the delete command refuses the active default."""
+    default_profile, names = profile_completion_state()
+    deletable_names = [name for name in names if name != default_profile]
+    return filter_profile_names(deletable_names, incomplete)
+
+
+def complete_new_profile_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    """Suggest common unused profile names while still allowing operators to type any valid new name."""
+    _default_profile, existing_names = profile_completion_state()
+    existing = {name.lower() for name in existing_names}
+    suggestions = [
+        name
+        for name in PROFILE_NAME_COMPLETION_SUGGESTIONS
+        if name.lower() not in existing
+    ]
+    return filter_profile_names(suggestions, incomplete)
 
 
 def format_record(record_type: str, item: dict[str, Any]) -> str:
@@ -4257,11 +5214,13 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
 def cli(ctx: click.Context, output_format: str | None) -> None:
     """Infoblox command line client.
 
-    Run `ib configure` first to save the Infoblox server, credentials, DNS view,
-    and default zone.
+    Run `ib configure` first to save an Infoblox profile with server,
+    credentials, DNS view, and default zone.
 
     \b
     Common usage:
+      ib dns view list
+      ib dns view use Internal
       ib dns zone list
       ib dns zone use example.com
       ib dns list
@@ -4270,8 +5229,8 @@ def cli(ctx: click.Context, output_format: str | None) -> None:
       ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
       ib dns delete app
 
-    Use `ib dns --help`, `ib dns create --help`, and `ib dns zone --help` for
-    command-specific options and examples.
+    Use `ib dns --help`, `ib dns create --help`, `ib dns view --help`, and
+    `ib dns zone --help` for command-specific options and examples.
     """
     ctx.ensure_object(dict)
     ctx.obj["output_format"] = (output_format or TABLE_OUTPUT).lower()
@@ -4283,18 +5242,61 @@ def prewarm_search_cache() -> None:
     run_search_cache_prewarm()
 
 
-@cli.command()
-def configure() -> None:
-    """Create or update ~/.ib/config.
+@cli.group(invoke_without_command=True)
+@click.pass_context
+def configure(ctx: click.Context) -> None:
+    """Create or update Infoblox connection profiles in ~/.ib/config.
 
     Prompts for the Infoblox server, username, password, WAPI version, DNS view,
     default DNS zone, and SSL verification preference.
+    New profile setup connects with the entered credentials and lists available
+    Infoblox DNS views so the saved view can be selected from live data. It can
+    also open a live forward-zone picker and save one DNS zone as the profile
+    default.
 
-    You can run this command multiple times. Existing values are shown as
-    defaults, so pressing Enter keeps the current value. Existing passwords are
-    kept when the password prompt is left blank.
+    You can run this command multiple times. Without a subcommand, it edits the
+    current default profile. Existing values are shown as defaults, so pressing
+    Enter keeps the current value. Existing passwords are kept when the password
+    prompt is left blank.
     """
-    save_config_interactive()
+    if ctx.invoked_subcommand is None:
+        save_config_interactive()
+
+
+@configure.command("new")
+@click.argument("profile_name", shell_complete=complete_new_profile_names)
+@click.option("--default", "make_default", is_flag=True, help="Make this profile the default.")
+def configure_new(profile_name: str, make_default: bool) -> None:
+    """Create a profile, choose a live DNS view, and pick an optional default zone."""
+    save_config_interactive(profile_name, create=True, make_default=make_default)
+
+
+@configure.command("edit")
+@click.argument("profile_name", required=False, shell_complete=complete_existing_profile_names)
+@click.option("--default", "make_default", is_flag=True, help="Make this profile the default.")
+def configure_edit(profile_name: str | None, make_default: bool) -> None:
+    """Edit an existing Infoblox profile."""
+    save_config_interactive(profile_name, create=False, make_default=make_default)
+
+
+@configure.command("delete")
+@click.argument("profile_name", shell_complete=complete_deletable_profile_names)
+def configure_delete(profile_name: str) -> None:
+    """Delete a non-default Infoblox profile."""
+    delete_config_profile(profile_name)
+
+
+@configure.command("use")
+@click.argument("profile_name", shell_complete=complete_existing_profile_names)
+def configure_use(profile_name: str) -> None:
+    """Set the default Infoblox profile."""
+    set_default_profile(profile_name)
+
+
+@configure.command("list")
+def configure_list() -> None:
+    """List configured Infoblox profiles."""
+    list_config_profiles()
 
 
 @cli.command()
@@ -4310,12 +5312,12 @@ def completion(shell: str | None) -> None:
         )
     )
     console.print("[bold]Prerequisite[/bold]")
-    console.print("Make sure the ib executable is on your PATH.")
+    console.print("Install ib with pipx, or make sure an existing ib executable is on your PATH.")
     print_command_block(
         [
-            "mkdir -p ~/.local/bin",
-            "install -m 755 ./ib ~/.local/bin/ib",
-            "export PATH=\"$HOME/.local/bin:$PATH\"",
+            "pipx install git+https://github.com/rwahyudi/ib.git",
+            "pipx ensurepath",
+            "ib --help",
         ]
     )
     for item in shells:
@@ -4363,13 +5365,17 @@ def completion(shell: str | None) -> None:
 def dns() -> None:
     """Manage Infoblox DNS records.
 
+    Record commands use the active DNS view from `ib dns view use`, then
+    IB_VIEW, then the selected profile's configured view.
     Record commands use the active zone unless you pass `--zone`. The active
-    zone is resolved from `ib dns zone use`, then IB_ZONE, then the default zone
-    saved by `ib configure`.
+    zone is resolved from the selected profile's `ib dns zone use`, then
+    IB_ZONE, then the selected profile's default zone.
 
     \b
     Examples:
       ib dns list
+      ib dns view list
+      ib dns view use Internal
       ib dns list example.com
       ib dns search app
       ib dns search -g app
@@ -4378,6 +5384,35 @@ def dns() -> None:
       ib dns create cname www app.example.com
       ib dns delete app
     """
+
+
+@dns.group()
+def view() -> None:
+    """Manage active DNS views for listing and session use.
+
+    \b
+    Examples:
+      ib dns view list
+      ib dns view use Internal
+      ib dns view use "DNS Zone View"
+    """
+
+
+@view.command("list")
+def view_list() -> None:
+    """List DNS views available to the configured Infoblox profile."""
+    run_dns_view_list()
+
+
+@view.command("use")
+@click.argument("view_name", shell_complete=complete_dns_view_names)
+def view_use(view_name: str) -> None:
+    """Set the active DNS view for this shell session.
+
+    A new shell session falls back to IB_VIEW or the DNS view saved by
+    `ib configure`.
+    """
+    run_dns_view_use(view_name)
 
 
 @dns.group()
@@ -4428,7 +5463,7 @@ def zone_create(
 @zone.command("list")
 @click.argument("search", required=False)
 def zone_list(search: str | None) -> None:
-    """List DNS zones in the configured view.
+    """List DNS zones in the active view.
 
     Pass an optional keyword to filter by zone name or comment.
     """
@@ -4461,10 +5496,10 @@ def zone_delete(zone_name: str) -> None:
 @zone.command("use")
 @click.argument("zone_name", shell_complete=complete_zone_names)
 def zone_use(zone_name: str) -> None:
-    """Set the active DNS zone for this shell session.
+    """Set the active DNS zone for this shell session and selected profile.
 
-    A new shell session falls back to IB_ZONE or the default zone saved by
-    `ib configure`.
+    A new shell session or different profile falls back to IB_ZONE or the
+    default zone saved by `ib configure`.
     """
     run_dns_zone_use(zone_name)
 
@@ -4475,7 +5510,7 @@ def zone_use(zone_name: str) -> None:
 @click.option("-n", "--name", "name_option", hidden=True)
 @click.option(
     "--zone",
-    help=f"DNS zone. Defaults to the session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
+    help=f"DNS zone. Defaults to the profile session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
 )
 @click.option("-t", "--ttl", type=int, callback=validate_ttl_option, help="Record TTL in seconds.")
 @click.option("--noptr", is_flag=True, help="Do not manage PTR records for A/AAAA workflows.")
@@ -4526,7 +5561,7 @@ def create(
 @click.argument("value", required=False)
 @click.option(
     "--zone",
-    help=f"DNS zone. Defaults to the session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
+    help=f"DNS zone. Defaults to the profile session active zone, ${DEFAULT_ZONE_ENV}, then the configured default zone.",
 )
 @click.option("-t", "--ttl", type=int, callback=validate_ttl_option, help="Record TTL in seconds.")
 @click.option("--noptr", is_flag=True, help="Do not manage PTR records for A/AAAA workflows.")
@@ -4577,12 +5612,12 @@ def dns_list(zone: str | None) -> None:
 @dns.command()
 @click.argument("keyword")
 @click.option("-i", "case_sensitive", is_flag=True, help="Use case-sensitive matching.")
-@click.option("-g", "global_search", is_flag=True, help="Search across the configured DNS view.")
+@click.option("-g", "global_search", is_flag=True, help="Search across the active DNS view.")
 def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
     """Search DNS records by name, value, or comment.
 
     Normal search uses the active/default zone as the root and includes child
-    authoritative zones. Use `-g` to search the configured DNS view globally.
+    authoritative zones. Use `-g` to search the active DNS view globally.
     Use `-i` for case-sensitive matching.
 
     Search data is cached under ~/.ib/allrecords-cache and refreshed when the

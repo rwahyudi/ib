@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ib"
+version = "0.1.0"
+description = "Infoblox DNS command line client for day-to-day DNS work"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.1",
+    "cryptography>=42",
+    "rich>=13.7",
+]
+
+[project.urls]
+Homepage = "https://github.com/rwahyudi/ib"
+Repository = "https://github.com/rwahyudi/ib"
+
+[tool.setuptools]
+py-modules = []
+script-files = ["ib"]

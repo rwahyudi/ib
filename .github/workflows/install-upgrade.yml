@@ -1,0 +1,205 @@
+name: Install and upgrade
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  ubuntu:
+    name: Ubuntu pipx install and upgrade
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test pipx install and upgrade
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m venv "$RUNNER_TEMP/pipx-venv"
+          "$RUNNER_TEMP/pipx-venv/bin/python" -m pip install --upgrade pip pipx
+
+          export PIPX_HOME="$RUNNER_TEMP/pipx-home"
+          export PIPX_BIN_DIR="$RUNNER_TEMP/pipx-bin"
+          export PIPX_MAN_DIR="$RUNNER_TEMP/pipx-man"
+          export IB_TEST_HOME="$RUNNER_TEMP/ib-home"
+          mkdir -p "$IB_TEST_HOME"
+
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import shutil
+
+          src = Path(os.environ["GITHUB_WORKSPACE"])
+          dst = Path(os.environ["RUNNER_TEMP"]) / "ib-src"
+          shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+          pyproject = dst / "pyproject.toml"
+          text = pyproject.read_text(encoding="utf-8")
+          current_version = re.search(r'^version = "([^"]+)"', text, re.M).group(1)
+          pyproject.write_text(
+              re.sub(r'^version = "[^"]+"', 'version = "0.0.0"', text, count=1, flags=re.M),
+              encoding="utf-8",
+          )
+          (dst / ".current-version").write_text(current_version, encoding="utf-8")
+          PY
+
+          "$RUNNER_TEMP/pipx-venv/bin/python" -m pipx install "$RUNNER_TEMP/ib-src"
+          HOME="$IB_TEST_HOME" "$PIPX_BIN_DIR/ib" --help
+          "$RUNNER_TEMP/pipx-venv/bin/python" -m pipx list | grep "package ib 0.0.0"
+
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+
+          dst = Path(os.environ["RUNNER_TEMP"]) / "ib-src"
+          pyproject = dst / "pyproject.toml"
+          current_version = (dst / ".current-version").read_text(encoding="utf-8")
+          text = pyproject.read_text(encoding="utf-8")
+          pyproject.write_text(
+              re.sub(r'^version = "[^"]+"', f'version = "{current_version}"', text, count=1, flags=re.M),
+              encoding="utf-8",
+          )
+          PY
+
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/pipx-venv/bin/python" -m pipx upgrade ib
+          HOME="$IB_TEST_HOME" "$PIPX_BIN_DIR/ib" --help
+          "$RUNNER_TEMP/pipx-venv/bin/python" -m pipx list | grep "package ib $(cat "$RUNNER_TEMP/ib-src/.current-version")"
+
+  linux-containers:
+    name: ${{ matrix.name }} pipx install and upgrade
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debian 12
+            image: debian:12
+            setup: apt-get update && apt-get install -y git grep python3 python3-pip python3-venv
+          - name: Red Hat UBI 9
+            image: registry.access.redhat.com/ubi9/ubi:latest
+            setup: dnf install -y git grep python3 python3-pip
+    steps:
+      - name: Install OS packages
+        shell: bash
+        run: ${{ matrix.setup }}
+
+      - uses: actions/checkout@v4
+
+      - name: Test pipx install and upgrade
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 -m venv /tmp/pipx-venv
+          /tmp/pipx-venv/bin/python -m pip install --upgrade pip pipx
+
+          export PIPX_HOME=/tmp/pipx-home
+          export PIPX_BIN_DIR=/tmp/pipx-bin
+          export PIPX_MAN_DIR=/tmp/pipx-man
+          export IB_TEST_HOME=/tmp/ib-home
+          mkdir -p "$IB_TEST_HOME"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import re
+          import shutil
+
+          src = Path(os.environ["GITHUB_WORKSPACE"])
+          dst = Path("/tmp/ib-src")
+          if dst.exists():
+              shutil.rmtree(dst)
+          shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git"))
+          pyproject = dst / "pyproject.toml"
+          text = pyproject.read_text(encoding="utf-8")
+          current_version = re.search(r'^version = "([^"]+)"', text, re.M).group(1)
+          pyproject.write_text(
+              re.sub(r'^version = "[^"]+"', 'version = "0.0.0"', text, count=1, flags=re.M),
+              encoding="utf-8",
+          )
+          (dst / ".current-version").write_text(current_version, encoding="utf-8")
+          PY
+
+          /tmp/pipx-venv/bin/python -m pipx install /tmp/ib-src
+          HOME="$IB_TEST_HOME" "$PIPX_BIN_DIR/ib" --help
+          /tmp/pipx-venv/bin/python -m pipx list | grep "package ib 0.0.0"
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          dst = Path("/tmp/ib-src")
+          pyproject = dst / "pyproject.toml"
+          current_version = (dst / ".current-version").read_text(encoding="utf-8")
+          text = pyproject.read_text(encoding="utf-8")
+          pyproject.write_text(
+              re.sub(r'^version = "[^"]+"', f'version = "{current_version}"', text, count=1, flags=re.M),
+              encoding="utf-8",
+          )
+          PY
+
+          cd /tmp
+          /tmp/pipx-venv/bin/python -m pipx upgrade ib
+          HOME="$IB_TEST_HOME" "$PIPX_BIN_DIR/ib" --help
+          /tmp/pipx-venv/bin/python -m pipx list | grep "package ib $(cat /tmp/ib-src/.current-version)"
+
+  windows:
+    name: Windows pipx install and upgrade
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test pipx install and upgrade
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m venv "$env:RUNNER_TEMP\pipx-venv"
+          & "$env:RUNNER_TEMP\pipx-venv\Scripts\python.exe" -m pip install --upgrade pip pipx
+
+          $env:PIPX_HOME = "$env:RUNNER_TEMP\pipx-home"
+          $env:PIPX_BIN_DIR = "$env:RUNNER_TEMP\pipx-bin"
+          $env:PIPX_MAN_DIR = "$env:RUNNER_TEMP\pipx-man"
+          $env:IB_TEST_HOME = "$env:RUNNER_TEMP\ib-home"
+          New-Item -ItemType Directory -Force -Path $env:IB_TEST_HOME | Out-Null
+
+          $src = "$env:RUNNER_TEMP\ib-src"
+          Copy-Item -Recurse -Force $env:GITHUB_WORKSPACE $src
+          Remove-Item -Recurse -Force "$src\.git" -ErrorAction SilentlyContinue
+
+          $pyproject = "$src\pyproject.toml"
+          $text = Get-Content $pyproject -Raw
+          $currentVersion = [regex]::Match($text, '(?m)^version = "([^"]+)"').Groups[1].Value
+          $text = [regex]::Replace($text, '(?m)^version = "[^"]+"', 'version = "0.0.0"', 1)
+          Set-Content -Path $pyproject -Value $text -NoNewline
+          Set-Content -Path "$src\.current-version" -Value $currentVersion -NoNewline
+
+          & "$env:RUNNER_TEMP\pipx-venv\Scripts\python.exe" -m pipx install $src
+          & "$env:PIPX_BIN_DIR\ib.exe" --help
+          & "$env:RUNNER_TEMP\pipx-venv\Scripts\python.exe" -m pipx list | Select-String "package ib 0.0.0"
+
+          $text = Get-Content $pyproject -Raw
+          $text = [regex]::Replace($text, '(?m)^version = "[^"]+"', "version = `"$currentVersion`"", 1)
+          Set-Content -Path $pyproject -Value $text -NoNewline
+
+          Set-Location $env:RUNNER_TEMP
+          & "$env:RUNNER_TEMP\pipx-venv\Scripts\python.exe" -m pipx upgrade ib
+          & "$env:PIPX_BIN_DIR\ib.exe" --help
+          & "$env:RUNNER_TEMP\pipx-venv\Scripts\python.exe" -m pipx list | Select-String "package ib $currentVersion"
