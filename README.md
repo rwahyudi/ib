@@ -237,7 +237,7 @@ the selected forward zone does not allow that IP based on its network
 association. Use an IP associated with that zone, choose the correct zone with
 `--zone` or a fully qualified name, or update the zone network association
 in Infoblox. The error details instruct the client to run
-`ib dns zone view <zone>` to view the network association for the selected zone.
+`ib dns zone info <zone>` to view the network association for the selected zone.
 
 Use `--zone` to bypass the active zone for one command:
 
@@ -416,10 +416,10 @@ ib dns zone list
 ib dns zone list test
 ```
 
-View one zone, including SOA settings:
+Show one zone, including SOA settings:
 
 ```bash
-ib dns zone view example.com
+ib dns zone info example.com
 ```
 
 Create and delete authoritative zones. `--format` accepts `forward`, `ipv4`, or
@@ -441,7 +441,7 @@ ib dns zone use test.local
 This command also starts a silent background prewarm for search and record
 completion under the selected zone.
 
-Existing zone names support shell completion for `ib dns zone view` and
+Existing zone names support shell completion for `ib dns zone info` and
 `ib dns zone use` when completion is enabled.
 
 ## Completion
@@ -488,7 +488,7 @@ and its child zones. Use `ib dns search -z <zone> <keyword>` or
 If search results look stale, confirm the zone SOA serial changed:
 
 ```bash
-ib dns zone view example.com
+ib dns zone info example.com
 ```
 
 The record cache refreshes from Infoblox when the serial number changes.

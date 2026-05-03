@@ -3041,7 +3041,7 @@ def dns_create_error_hints(error_message: str | None, context: dict[str, Any]) -
             "Use an IP associated with that zone.",
             "Choose the correct zone with --zone or a fully qualified name.",
             "Update the zone network association in Infoblox.",
-            f"Run `ib dns zone view {selected_zone}` to view the network association for this zone.",
+            f"Run `ib dns zone info {selected_zone}` to view the network association for this zone.",
         ]
 
     return []
@@ -5527,7 +5527,7 @@ def run_dns_zone_list(search: str | None = None) -> None:
 
 
 def zone_network_association_unavailable(exc: WapiError) -> str:
-    """Format a non-fatal network-association lookup failure for zone view output."""
+    """Format a non-fatal network-association lookup failure for zone info output."""
     status = f" {exc.status}" if exc.status else ""
     return f"Unavailable: Infoblox WAPI{status} failed while reading network associations."
 
@@ -5559,7 +5559,7 @@ def add_zone_network_association_details(
             zone_info[key] = association_info[key]
 
 
-def run_dns_zone_view(zone_name: str) -> None:
+def run_dns_zone_info(zone_name: str) -> None:
     """Run zone detail lookup and render table or structured zone information."""
     client = InfobloxClient(load_config())
     target = normalize_zone_name(zone_name)
@@ -6756,7 +6756,7 @@ def zone() -> None:
     Examples:
       ib dns zone list
       ib dns zone list test
-      ib dns zone view example.com
+      ib dns zone info example.com
       ib dns zone create test.local --comment "Lab zone"
       ib dns zone use example.com
     """
@@ -6803,16 +6803,16 @@ def zone_list(search: str | None) -> None:
     run_dns_zone_list(search)
 
 
-@zone.command("view")
+@zone.command("info")
 @click.argument("zone_name", shell_complete=complete_zone_names)
-def zone_view(zone_name: str) -> None:
-    """View DNS zone information.
+def zone_info(zone_name: str) -> None:
+    """Show DNS zone information.
 
     Shows the zone format, name server group, network view, network
     associations, comment, reference, and SOA settings such as serial, MNAME,
     RNAME, refresh, retry, expiry, and negative caching TTL.
     """
-    run_dns_zone_view(zone_name)
+    run_dns_zone_info(zone_name)
 
 
 @zone.command("delete")

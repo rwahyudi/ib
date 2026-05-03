@@ -2439,7 +2439,7 @@ class DefaultZoneTests(unittest.TestCase):
                 "Use an IP associated with that zone.",
                 "Choose the correct zone with --zone or a fully qualified name.",
                 "Update the zone network association in Infoblox.",
-                "Run `ib dns zone view latrobe-test.edu.au` to view the network association "
+                "Run `ib dns zone info latrobe-test.edu.au` to view the network association "
                 "for this zone.",
             ],
         )
@@ -2447,7 +2447,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("DNS zone latrobe-test.edu.au", context["hint"])
         self.assertIn("--zone or a fully qualified name", context["hint"])
         self.assertIn(
-            "Run `ib dns zone view latrobe-test.edu.au` to view the network association",
+            "Run `ib dns zone info latrobe-test.edu.au` to view the network association",
             context["hint"],
         )
         self.assertEqual(
@@ -2457,7 +2457,7 @@ class DefaultZoneTests(unittest.TestCase):
             "- Use an IP associated with that zone.\n"
             "- Choose the correct zone with --zone or a fully qualified name.\n"
             "- Update the zone network association in Infoblox.\n"
-            "- Run `ib dns zone view latrobe-test.edu.au` to view the network association "
+            "- Run `ib dns zone info latrobe-test.edu.au` to view the network association "
             "for this zone.",
         )
 
@@ -2471,7 +2471,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("- Use an IP associated with that zone.", output)
         self.assertIn("- Choose the correct zone with --zone or a fully qualified name.", output)
         self.assertIn("- Update the zone network association in Infoblox.", output)
-        self.assertIn("ib dns zone view latrobe-test.edu.au", output)
+        self.assertIn("ib dns zone info latrobe-test.edu.au", output)
         self.assertIn("network association", output)
 
     def test_dns_create_rejects_invalid_comment_characters(self):
@@ -5286,7 +5286,7 @@ class DefaultZoneTests(unittest.TestCase):
         print_mock.assert_called_once_with("context")
         print_warning.assert_called_once_with("No records found.")
 
-    def test_dns_zone_view_queries_and_prints_zone_details(self):
+    def test_dns_zone_info_queries_and_prints_zone_details(self):
         class FakeClient:
             view = "corp"
 
@@ -5312,7 +5312,7 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "safe_query", return_value=[zone_info]) as safe_query:
                     with patch.object(ib, "zone_detail_table", side_effect=fake_zone_detail_table):
                         with patch.object(ib.console, "print") as print_mock:
-                            ib.run_dns_zone_view("example.com.")
+                            ib.run_dns_zone_info("example.com.")
 
         params = safe_query.call_args.args[2]
         self.assertEqual(params["fqdn"], "example.com")
@@ -5333,7 +5333,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(table_inputs[0]["network_associations"], [{"network": "10.1.1.0/24"}])
         print_mock.assert_called_once_with("details")
 
-    def test_dns_zone_view_does_not_fail_when_network_association_query_returns_500(self):
+    def test_dns_zone_info_does_not_fail_when_network_association_query_returns_500(self):
         class FakeClient:
             view = "corp"
 
@@ -5352,7 +5352,7 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "safe_query", return_value=[zone_info]):
                     with patch.object(ib, "zone_detail_table", side_effect=fake_zone_detail_table):
                         with patch.object(ib.console, "print") as print_mock:
-                            ib.run_dns_zone_view("example.com.")
+                            ib.run_dns_zone_info("example.com.")
 
         print_mock.assert_called_once_with("details")
         self.assertIn("Unavailable: Infoblox WAPI 500", table_inputs[0]["network_associations"])
@@ -5473,10 +5473,11 @@ class DefaultZoneTests(unittest.TestCase):
             rows["Network Associations"],
         )
 
-    def test_dns_zone_view_uses_zone_name_completion(self):
-        zone_view = ib.zone.commands["view"]
+    def test_dns_zone_info_uses_zone_name_completion(self):
+        zone_info = ib.zone.commands["info"]
 
-        self.assertIs(self.original_shell_complete(zone_view.params[0]), ib.complete_zone_names)
+        self.assertIs(self.original_shell_complete(zone_info.params[0]), ib.complete_zone_names)
+        self.assertNotIn("view", ib.zone.commands)
 
     def test_dns_list_uses_zone_name_completion(self):
         dns_list = ib.dns.commands["list"]
