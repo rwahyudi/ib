@@ -3,86 +3,140 @@
   <desc id="desc">A fixed-layout flow diagram showing how ib uses zone completion cache, zone serial cache, SQLite allrecords cache, and background prewarming.</desc>
   <defs>
     <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#020617" flood-opacity="0.18"/>
+      <feDropShadow dx="0" dy="8" stdDeviation="5" flood-color="#020617" flood-opacity="0.45"/>
     </filter>
     <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#dbe3ee"/>
-      <stop offset="100%" stop-color="#aebdce"/>
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="100%" stop-color="#111827"/>
     </linearGradient>
     <linearGradient id="panel-grad" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#f1f5f9"/>
-      <stop offset="100%" stop-color="#d9e2ec"/>
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#101827"/>
     </linearGradient>
     <linearGradient id="card-grad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#ffffff"/>
-      <stop offset="100%" stop-color="#dce6f0"/>
+      <stop offset="0%" stop-color="#182235"/>
+      <stop offset="100%" stop-color="#111827"/>
     </linearGradient>
     <linearGradient id="blue-grad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#d9ecff"/>
-      <stop offset="100%" stop-color="#9fc7f6"/>
+      <stop offset="0%" stop-color="#12304f"/>
+      <stop offset="100%" stop-color="#0b2440"/>
     </linearGradient>
     <linearGradient id="purple-grad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#eee7ff"/>
-      <stop offset="100%" stop-color="#c6b6f3"/>
+      <stop offset="0%" stop-color="#35205d"/>
+      <stop offset="100%" stop-color="#24163f"/>
     </linearGradient>
     <linearGradient id="green-grad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#dff8e9"/>
-      <stop offset="100%" stop-color="#9bd9ad"/>
+      <stop offset="0%" stop-color="#123624"/>
+      <stop offset="100%" stop-color="#0f2a1c"/>
     </linearGradient>
     <linearGradient id="orange-grad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#ffe6c8"/>
-      <stop offset="100%" stop-color="#f4aa67"/>
+      <stop offset="0%" stop-color="#4a220f"/>
+      <stop offset="100%" stop-color="#33160a"/>
     </linearGradient>
     <linearGradient id="pill-purple-grad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#ddd2ff"/>
-      <stop offset="100%" stop-color="#b9a5ec"/>
+      <stop offset="0%" stop-color="#5b3aa2"/>
+      <stop offset="100%" stop-color="#3d256f"/>
     </linearGradient>
-    <marker id="arrow-blue" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
-      <path d="M 2 2 L 10 6 L 2 10 Z" fill="#1d4ed8"/>
+    <marker id="arrow-blue" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#38bdf8"/>
     </marker>
-    <marker id="arrow-purple" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
-      <path d="M 2 2 L 10 6 L 2 10 Z" fill="#6d28d9"/>
+    <marker id="arrow-purple" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#a78bfa"/>
     </marker>
-    <marker id="arrow-green" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
-      <path d="M 2 2 L 10 6 L 2 10 Z" fill="#15803d"/>
+    <marker id="arrow-green" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#4ade80"/>
     </marker>
-    <marker id="arrow-orange" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
-      <path d="M 2 2 L 10 6 L 2 10 Z" fill="#c2410c"/>
+    <marker id="arrow-orange" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 2 1.5 L 7 4 L 2 6.5 Z" fill="#fb923c"/>
     </marker>
+    <symbol id="icon-terminal" viewBox="0 0 24 24">
+      <path class="icon-line" d="M3 5 H21 V19 H3 Z M6 9 L9 12 L6 15 M11 15 H17"/>
+    </symbol>
+    <symbol id="icon-compass" viewBox="0 0 24 24">
+      <path class="icon-line" d="M12 3 L17 21 L12 18 L7 21 Z M12 3 V18"/>
+    </symbol>
+    <symbol id="icon-list" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 6 H19 M5 12 H19 M5 18 H19 M3 6 H3.5 M3 12 H3.5 M3 18 H3.5"/>
+    </symbol>
+    <symbol id="icon-cloud" viewBox="0 0 24 24">
+      <path class="icon-line" d="M7 18 H18 A4 4 0 0 0 18 10 A6 6 0 0 0 6.5 12 A3 3 0 0 0 7 18 Z"/>
+    </symbol>
+    <symbol id="icon-zones" viewBox="0 0 24 24">
+      <path class="icon-line" d="M4 5 H10 V11 H4 Z M14 5 H20 V11 H14 Z M4 15 H10 V21 H4 Z M14 15 H20 V21 H14 Z"/>
+    </symbol>
+    <symbol id="icon-key" viewBox="0 0 24 24">
+      <path class="icon-line" d="M4 14 A4 4 0 1 0 12 14 A4 4 0 0 0 4 14 M12 14 H21 M18 14 V17 M15 14 V16"/>
+    </symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 7 C5 4.8 19 4.8 19 7 V17 C19 19.2 5 19.2 5 17 Z M5 7 C5 9.2 19 9.2 19 7 M5 12 C5 14.2 19 14.2 19 12"/>
+    </symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24">
+      <path class="icon-line" d="M4 12 L9 17 L20 6"/>
+    </symbol>
+    <symbol id="icon-sync" viewBox="0 0 24 24">
+      <path class="icon-line" d="M7 8 A6 6 0 0 1 18 7 L20 9 M17 16 A6 6 0 0 1 6 17 L4 15"/>
+    </symbol>
+    <symbol id="icon-rows" viewBox="0 0 24 24">
+      <path class="icon-line" d="M4 5 H20 V9 H4 Z M4 12 H20 V16 H4 Z M4 19 H20 V21 H4 Z"/>
+    </symbol>
+    <symbol id="icon-edit" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 19 H19 M7 16 L8 12 L16 4 L20 8 L12 16 Z"/>
+    </symbol>
+    <symbol id="icon-result" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 5 H19 L14 12 V18 L10 20 V12 Z"/>
+    </symbol>
+    <symbol id="icon-keyboard" viewBox="0 0 24 24">
+      <path class="icon-line" d="M3 7 H21 V17 H3 Z M6 10 H7 M10 10 H11 M14 10 H15 M18 10 H19 M6 14 H15"/>
+    </symbol>
+    <symbol id="icon-file" viewBox="0 0 24 24">
+      <path class="icon-line" d="M6 3 H15 L20 8 V21 H6 Z M15 3 V8 H20 M9 12 H17 M9 16 H17"/>
+    </symbol>
+    <symbol id="icon-alert" viewBox="0 0 24 24">
+      <path class="icon-line" d="M12 3 L21 20 H3 Z M12 9 V14 M12 17 H12.5"/>
+    </symbol>
+    <symbol id="icon-trash" viewBox="0 0 24 24">
+      <path class="icon-line" d="M5 7 H19 M9 7 V5 H15 V7 M7 7 L8 21 H16 L17 7 M10 11 V17 M14 11 V17"/>
+    </symbol>
+    <symbol id="icon-bolt" viewBox="0 0 24 24">
+      <path class="icon-line" d="M13 2 L5 14 H12 L11 22 L19 10 H12 Z"/>
+    </symbol>
     <style>
       .bg { fill: url(#bg-grad); }
-      .panel { fill: url(#panel-grad); stroke: #94a3b8; stroke-width: 1.5; filter: url(#shadow); }
+      .panel { fill: url(#panel-grad); stroke: #334155; stroke-width: 1.5; filter: url(#shadow); shape-rendering: crispEdges; }
       .card, .card-blue, .card-purple, .card-green, .card-orange {
         transform-box: fill-box;
         transform-origin: center;
-        transform: scale(0.955);
+        transform: scale(1);
+        shape-rendering: crispEdges;
       }
-      .card { fill: url(#card-grad); stroke: #94a3b8; stroke-width: 1.5; }
-      .card-blue { fill: url(#blue-grad); stroke: #6097d4; stroke-width: 1.5; }
-      .card-purple { fill: url(#purple-grad); stroke: #9b83d6; stroke-width: 1.5; }
-      .card-green { fill: url(#green-grad); stroke: #6fb982; stroke-width: 1.5; }
-      .card-orange { fill: url(#orange-grad); stroke: #d48945; stroke-width: 1.5; }
-      .pill-blue { fill: #c6dcf4; stroke: #93b7dc; stroke-width: 1; }
-      .pill-purple { fill: url(#pill-purple-grad); stroke: #a78bdb; stroke-width: 1; }
-      .pill-green { fill: #bde9c9; stroke: #86c99a; stroke-width: 1; }
-      .pill-orange { fill: #ffd3a7; stroke: #e9a15f; stroke-width: 1; }
-      .title { fill: #0f172a; font: 700 36px Arial, sans-serif; letter-spacing: 0; }
-      .subtitle { fill: #334155; font: 400 18px Arial, sans-serif; letter-spacing: 0; }
-      .lane { fill: #1e293b; font: 700 14px Arial, sans-serif; letter-spacing: 1.2px; }
-      .label { fill: #0f172a; font: 700 17px Arial, sans-serif; letter-spacing: 0; }
-      .body { fill: #334155; font: 400 14px Arial, sans-serif; letter-spacing: 0; }
-      .small { fill: #475569; font: 400 12px Arial, sans-serif; letter-spacing: 0; }
-      .badge { fill: #1e293b; font: 700 11px Arial, sans-serif; letter-spacing: 0.4px; }
-      .blue-line { fill: none; stroke: #1d4ed8; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-blue); }
-      .purple-line { fill: none; stroke: #6d28d9; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-purple); }
-      .green-line { fill: none; stroke: #15803d; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-green); }
-      .orange-line { fill: none; stroke: #c2410c; stroke-width: 3; stroke-linecap: round; stroke-linejoin: round; marker-end: url(#arrow-orange); }
-      .muted-line { fill: none; stroke: #64748b; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 6 8; }
+      .card { fill: url(#card-grad); stroke: #475569; stroke-width: 1.5; }
+      .card-blue { fill: url(#blue-grad); stroke: #38bdf8; stroke-width: 1.5; }
+      .card-purple { fill: url(#purple-grad); stroke: #a78bfa; stroke-width: 1.5; }
+      .card-green { fill: url(#green-grad); stroke: #4ade80; stroke-width: 1.5; }
+      .card-orange { fill: url(#orange-grad); stroke: #fb923c; stroke-width: 1.5; }
+      .pill-blue { fill: #12304f; stroke: #38bdf8; stroke-width: 1; }
+      .pill-purple { fill: url(#pill-purple-grad); stroke: #c4b5fd; stroke-width: 1; }
+      .pill-green { fill: #113624; stroke: #4ade80; stroke-width: 1; }
+      .pill-orange { fill: #4a220f; stroke: #fb923c; stroke-width: 1; }
+      .title { fill: #f8fafc; font: 700 36px Arial, sans-serif; letter-spacing: 0; }
+      .subtitle { fill: #cbd5e1; font: 400 18px Arial, sans-serif; letter-spacing: 0; }
+      .lane { fill: #67e8f9; font: 700 14px Arial, sans-serif; letter-spacing: 1.2px; }
+      .label { fill: #f8fafc; font: 700 17px Arial, sans-serif; letter-spacing: 0; }
+      .body { fill: #cbd5e1; font: 400 14px Arial, sans-serif; letter-spacing: 0; }
+      .small { fill: #94a3b8; font: 400 12px Arial, sans-serif; letter-spacing: 0; }
+      .badge { fill: #f8fafc; font: 700 11px Arial, sans-serif; letter-spacing: 0.4px; }
+      .icon { opacity: 0.9; }
+      .icon-line { fill: none; stroke: #e2e8f0; stroke-width: 1.8; stroke-linecap: square; stroke-linejoin: miter; }
+      .blue-line { fill: none; stroke: #38bdf8; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-blue); }
+      .purple-line { fill: none; stroke: #a78bfa; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-purple); }
+      .green-line { fill: none; stroke: #4ade80; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-green); }
+      .orange-line { fill: none; stroke: #fb923c; stroke-width: 2.4; stroke-linecap: square; stroke-linejoin: miter; marker-end: url(#arrow-orange); }
+      .muted-line { fill: none; stroke: #334155; stroke-width: 2; stroke-linecap: square; stroke-linejoin: miter; stroke-dasharray: 6 8; }
     </style>
   </defs>
 
   <rect class="bg" x="0" y="0" width="1440" height="980"/>
-  <rect class="panel" x="40" y="36" width="1360" height="908" rx="18"/>
+  <rect class="panel" x="40" y="36" width="1360" height="908" rx="4"/>
 
   <text class="title" x="80" y="92">ib DNS Cache Flow</text>
   <text class="subtitle" x="80" y="124">Searches stay fast by validating cached records with SOA serials; writes clear caches and start a silent prewarm.</text>
@@ -90,29 +144,34 @@
   <line class="muted-line" x1="80" y1="160" x2="1360" y2="160"/>
   <text class="lane" x="80" y="194">FOREGROUND SEARCH AND LIST</text>
 
-  <rect class="card-blue" x="80" y="220" width="220" height="104" rx="6"/>
+  <rect class="card-blue" x="80" y="220" width="220" height="104" rx="2"/>
+  <use href="#icon-terminal" class="icon" x="264" y="238" width="24" height="24"/>
   <text class="label" x="104" y="254">Command starts</text>
   <text class="body" x="104" y="282">ib dns search</text>
   <text class="body" x="104" y="304">ib dns list</text>
 
-  <rect class="card" x="348" y="220" width="228" height="104" rx="6"/>
+  <rect class="card" x="348" y="220" width="228" height="104" rx="2"/>
+  <use href="#icon-compass" class="icon" x="540" y="238" width="24" height="24"/>
   <text class="label" x="372" y="254">Resolve context</text>
   <text class="body" x="372" y="282">profile, server, view</text>
   <text class="body" x="372" y="304">active zone scope</text>
 
-  <rect class="card-purple" x="624" y="220" width="250" height="104" rx="6"/>
+  <rect class="card-purple" x="624" y="220" width="250" height="104" rx="2"/>
+  <use href="#icon-list" class="icon" x="838" y="284" width="24" height="24"/>
   <text class="label" x="648" y="254">Zone serial lookup</text>
   <text class="body" x="648" y="282">zone_serial_cache</text>
   <text class="body" x="648" y="304">view scoped zone list</text>
-  <rect class="pill-purple" x="780" y="238" width="70" height="24" rx="7"/>
+  <rect class="pill-purple" x="780" y="238" width="70" height="24" rx="2"/>
   <text class="badge" x="799" y="254">30 SEC</text>
 
-  <rect class="card-orange" x="922" y="220" width="218" height="104" rx="6"/>
+  <rect class="card-orange" x="922" y="220" width="218" height="104" rx="2"/>
+  <use href="#icon-cloud" class="icon" x="1104" y="238" width="24" height="24"/>
   <text class="label" x="946" y="254">WAPI fallback</text>
   <text class="body" x="946" y="282">zone_auth query</text>
   <text class="body" x="946" y="304">paged results</text>
 
-  <rect class="card-green" x="1188" y="220" width="172" height="104" rx="6"/>
+  <rect class="card-green" x="1188" y="220" width="172" height="104" rx="2"/>
+  <use href="#icon-zones" class="icon" x="1324" y="238" width="24" height="24"/>
   <text class="label" x="1212" y="254">Zone set</text>
   <text class="body" x="1212" y="282">skip secondary</text>
   <text class="body" x="1212" y="304">sort by fqdn</text>
@@ -128,33 +187,40 @@
 
   <text class="lane" x="80" y="382">PER-ZONE RECORD CACHE VALIDATION</text>
 
-  <rect class="card" x="80" y="408" width="244" height="116" rx="6"/>
+  <rect class="card" x="80" y="408" width="244" height="116" rx="2"/>
+  <use href="#icon-key" class="icon" x="288" y="426" width="24" height="24"/>
   <text class="label" x="104" y="442">Build cache key</text>
   <text class="body" x="104" y="470">server + WAPI version</text>
   <text class="body" x="104" y="492">DNS view + zone</text>
 
-  <rect class="card-purple" x="372" y="408" width="244" height="116" rx="6"/>
+  <rect class="card-purple" x="372" y="408" width="244" height="116" rx="2"/>
+  <use href="#icon-database" class="icon" x="580" y="426" width="24" height="24"/>
   <text class="label" x="396" y="442">SQLite validation</text>
   <text class="body" x="396" y="470">zone_record_cache</text>
   <text class="body" x="396" y="492">serial must match</text>
 
-  <rect class="card-green" x="664" y="384" width="250" height="92" rx="6"/>
+  <rect class="card-green" x="664" y="384" width="250" height="92" rx="2"/>
+  <use href="#icon-check" class="icon" x="878" y="400" width="24" height="24"/>
   <text class="label" x="688" y="418">Serial matches</text>
   <text class="body" x="688" y="446">search locally in SQLite</text>
 
-  <rect class="card-orange" x="664" y="504" width="250" height="92" rx="6"/>
+  <rect class="card-orange" x="664" y="504" width="250" height="92" rx="2"/>
+  <use href="#icon-cloud" class="icon" x="878" y="520" width="24" height="24"/>
   <text class="label" x="688" y="538">Serial changed</text>
   <text class="body" x="688" y="566">fetch allrecords from WAPI</text>
 
-  <rect class="card-purple" x="962" y="384" width="232" height="92" rx="6"/>
+  <rect class="card-purple" x="962" y="384" width="232" height="92" rx="2"/>
+  <use href="#icon-rows" class="icon" x="1158" y="400" width="24" height="24"/>
   <text class="label" x="986" y="418">search_entries</text>
   <text class="body" x="986" y="446">name, value, comment</text>
 
-  <rect class="card-purple" x="962" y="504" width="232" height="92" rx="6"/>
+  <rect class="card-purple" x="962" y="504" width="232" height="92" rx="2"/>
+  <use href="#icon-sync" class="icon" x="1158" y="520" width="24" height="24"/>
   <text class="label" x="986" y="538">Normalize + write</text>
   <text class="body" x="986" y="566">replace per-zone rows</text>
 
-  <rect class="card-green" x="1242" y="444" width="118" height="92" rx="6"/>
+  <rect class="card-green" x="1242" y="444" width="118" height="92" rx="2"/>
+  <use href="#icon-result" class="icon" x="1324" y="456" width="24" height="24"/>
   <text class="label" x="1266" y="478">Result</text>
   <text class="body" x="1266" y="506">dedupe</text>
 
@@ -168,19 +234,22 @@
 
   <text class="lane" x="80" y="660">COMPLETION CACHE</text>
 
-  <rect class="card-blue" x="80" y="686" width="240" height="108" rx="6"/>
+  <rect class="card-blue" x="80" y="686" width="240" height="108" rx="2"/>
+  <use href="#icon-keyboard" class="icon" x="284" y="704" width="24" height="24"/>
   <text class="label" x="104" y="720">Zone completion</text>
   <text class="body" x="104" y="748">ib dns zone use</text>
   <text class="body" x="104" y="770">ib dns list zone</text>
 
-  <rect class="card-purple" x="368" y="686" width="276" height="108" rx="6"/>
+  <rect class="card-purple" x="368" y="686" width="276" height="108" rx="2"/>
+  <use href="#icon-file" class="icon" x="608" y="748" width="24" height="24"/>
   <text class="label" x="392" y="720">zone-completion-cache.json</text>
   <text class="body" x="392" y="748">stores view + zone names</text>
   <text class="body" x="392" y="770">filters locally by prefix</text>
-  <rect class="pill-purple" x="540" y="704" width="78" height="24" rx="7"/>
+  <rect class="pill-purple" x="540" y="704" width="78" height="24" rx="2"/>
   <text class="badge" x="558" y="720">300 SEC</text>
 
-  <rect class="card-orange" x="692" y="686" width="190" height="108" rx="6"/>
+  <rect class="card-orange" x="692" y="686" width="190" height="108" rx="2"/>
+  <use href="#icon-alert" class="icon" x="846" y="704" width="24" height="24"/>
   <text class="label" x="716" y="720">Cache miss</text>
   <text class="body" x="716" y="748">query zone_auth</text>
   <text class="body" x="716" y="770">write JSON cache</text>
@@ -191,17 +260,20 @@
 
   <text class="lane" x="928" y="660">INVALIDATION AND PREWARM</text>
 
-  <rect class="card-orange" x="928" y="686" width="186" height="108" rx="6"/>
+  <rect class="card-orange" x="928" y="686" width="186" height="108" rx="2"/>
+  <use href="#icon-edit" class="icon" x="1078" y="704" width="24" height="24"/>
   <text class="label" x="952" y="720">Successful write</text>
   <text class="body" x="952" y="748">create, edit, delete</text>
   <text class="body" x="952" y="770">zone mutations</text>
 
-  <rect class="card-orange" x="1162" y="686" width="198" height="108" rx="6"/>
+  <rect class="card-orange" x="1162" y="686" width="198" height="108" rx="2"/>
+  <use href="#icon-trash" class="icon" x="1324" y="704" width="24" height="24"/>
   <text class="label" x="1186" y="720">Clear caches</text>
   <text class="body" x="1186" y="748">remove allrecords dir</text>
   <text class="body" x="1186" y="770">remove completion JSON</text>
 
-  <rect class="card-green" x="1046" y="830" width="314" height="84" rx="6"/>
+  <rect class="card-green" x="1046" y="830" width="314" height="84" rx="2"/>
+  <use href="#icon-bolt" class="icon" x="1324" y="846" width="24" height="24"/>
   <text class="label" x="1070" y="864">Silent prewarm</text>
   <text class="body" x="1070" y="892">hidden command + prewarm.lock, stale after 600 sec</text>
 

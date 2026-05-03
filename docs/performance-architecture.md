@@ -11,7 +11,7 @@ longer valid, `ib` fetches fresh data and rebuilds the local SQLite rows.
 
 ![ib DNS cache flow](assets/cache-flow.svg)
 
-## Why Search Is Fast
+## Search Performance
 
 Search and list commands avoid doing one large, repeated live scan whenever
 possible:
