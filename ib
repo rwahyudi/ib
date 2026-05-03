@@ -133,6 +133,7 @@ FUZZY_SEARCH_RATIO = 0.82
 ZONE_SERIAL_CACHE_TTL = 30
 ZONE_SERIAL_CACHE_STALE_WHILE_REVALIDATE_SECONDS = 300
 PREWARM_LOCK_STALE_SECONDS = 600
+SEARCH_CACHE_PREWARM_POLL_SECONDS = 0.2
 SESSION_ZONE_FILE_PREFIX = "active-zone-session"
 SESSION_VIEW_FILE_PREFIX = "active-view-session"
 ZONE_COMPLETION_CACHE_FILE = CONFIG_DIR / "zone-completion-cache.json"
@@ -162,7 +163,7 @@ TABLE_OUTPUT = "table"
 STRUCTURED_OUTPUTS = ("jq", "csv")
 STRUCTURED_EXCLUDED_FIELDS = {"ref", "_ref"}
 CONFIG_USAGE_COMMANDS = [
-    "ib config new PROFILE",
+    "ib config new [PROFILE]",
     "ib config edit [PROFILE]",
     "ib config use PROFILE",
     "ib config delete PROFILE",
@@ -628,6 +629,15 @@ def normalize_profile_name(profile_name: str) -> str:
     return normalized
 
 
+def prompt_new_profile_name() -> str:
+    """Ask for a new profile name until it matches the profile naming rules."""
+    while True:
+        try:
+            return normalize_profile_name(prompt_text("Profile name"))
+        except CliError as exc:
+            print_warning(str(exc))
+
+
 def profile_section_name(profile_name: str) -> str:
     """Return the config section name for a profile so storage naming stays centralized."""
     return f"{PROFILE_SECTION_PREFIX}{normalize_profile_name(profile_name)}"
@@ -671,7 +681,7 @@ def read_config_profiles(
         profiles = {DEFAULT_PROFILE_NAME: dict(parser["default"])}
         legacy = True
     else:
-        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib config new PROFILE")
+        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib config new [PROFILE]")
 
     if decrypt_passwords:
         for profile_values in profiles.values():
@@ -1304,7 +1314,7 @@ def list_config_profiles() -> None:
     """List configured profiles and mark the default profile."""
     if not CONFIG_FILE.exists():
         if output_is_table():
-            print_warning("No profiles configured. Run: ib config new PROFILE")
+            print_warning("No profiles configured. Run: ib config new [PROFILE]")
         else:
             emit_structured([], ["profile", "default", "server", "dns_view", "default_zone"])
         return
@@ -1328,7 +1338,7 @@ def show_config_overview() -> None:
 
 def maybe_prompt_configure() -> None:
     """Report missing configuration without starting implicit profile setup."""
-    raise CliError("ERROR: no configuration file found. Run: ib config new PROFILE")
+    raise CliError("ERROR: no configuration file found. Run: ib config new [PROFILE]")
 
 
 def load_config(required: bool = True) -> dict[str, str] | None:
@@ -3213,6 +3223,21 @@ def print_dns_create_error_context(context: dict[str, Any]) -> None:
     err_console.print(dns_create_error_context_panel(context))
 
 
+def dns_create_cache_refresh_zone(
+    client: InfobloxClient,
+    record_type: str,
+    name: str,
+    resolved_zone: str | None,
+) -> str | None:
+    """Choose the zone cache that should be refreshed after a successful create."""
+    if record_type.lower() != "ptr":
+        return resolved_zone
+    try:
+        return reverse_zone_for_ip(client, ipaddress.ip_address(name.strip()))
+    except (CliError, ValueError):
+        return resolved_zone
+
+
 def run_dns_create(
     record_type: str,
     value: str,
@@ -3261,7 +3286,8 @@ def run_dns_create(
         raise DnsCreateError(error_message, context) from exc
     if noptr and record_type.lower() not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
-    refresh_dns_cache_after_update()
+    refresh_zone = dns_create_cache_refresh_zone(client, record_type, name, resolved_zone)
+    refresh_dns_cache_after_update(refresh_zone, client=client)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -3572,6 +3598,27 @@ def clear_dns_cache() -> None:
         pass
 
 
+def clear_allrecords_zone_cache(client: InfobloxClient, zone_name: str) -> None:
+    """Remove cached searchable records for one zone without dropping every cached zone."""
+    try:
+        normalized_zone = normalize_zone_name(zone_name)
+        cache_key = allrecords_cache_key(client, normalized_zone)
+    except (CliError, ValueError):
+        return
+
+    try:
+        allrecords_cache_file(client, normalized_zone).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    try:
+        with connect_search_cache_db() as conn:
+            conn.execute("DELETE FROM search_entries WHERE cache_key = ?", (cache_key,))
+            conn.execute("DELETE FROM zone_record_cache WHERE cache_key = ?", (cache_key,))
+    except (OSError, sqlite3.Error):
+        pass
+
+
 def zone_serial_cache_key(client: InfobloxClient) -> str:
     """Build the zone-serial cache key so serial state is scoped to server and view."""
     cache_key = json.dumps(
@@ -3583,6 +3630,15 @@ def zone_serial_cache_key(client: InfobloxClient) -> str:
         sort_keys=True,
     )
     return hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+
+
+def clear_zone_serial_cache(client: InfobloxClient) -> None:
+    """Remove cached zone metadata for the current server/view so serial checks refetch after writes."""
+    try:
+        with connect_search_cache_db() as conn:
+            conn.execute("DELETE FROM zone_serial_cache WHERE cache_key = ?", (zone_serial_cache_key(client),))
+    except (OSError, sqlite3.Error):
+        pass
 
 
 def zone_serial_cache_revalidate_lock_file(client: InfobloxClient) -> Path:
@@ -3820,6 +3876,16 @@ def sqlite_zone_record_cache_exists(conn: sqlite3.Connection, cache_key: str) ->
         (cache_key,),
     ).fetchone()
     return row is not None
+
+
+def allrecords_zone_cache_exists(client: InfobloxClient, zone_name: str) -> bool:
+    """Return whether the zone has any record-cache metadata, even if the serial is stale."""
+    try:
+        cache_key = allrecords_cache_key(client, zone_name)
+        with connect_search_cache_db() as conn:
+            return sqlite_zone_record_cache_exists(conn, cache_key)
+    except (CliError, OSError, sqlite3.Error, ValueError):
+        return False
 
 
 def touch_allrecords_cache_freshness(
@@ -4972,6 +5038,18 @@ def load_search_entries_for_zone(
         entries = read_allrecords_search_cache(client, zone_name, serial_number)
     if entries is None:
         if search_cache_prewarm_is_running():
+            if allrecords_zone_cache_exists(client, zone_name):
+                entries = search_sqlite_allrecords_cache(
+                    client,
+                    zone_name,
+                    serial_number,
+                    keyword,
+                    case_sensitive,
+                    fuzzy_search,
+                    allow_stale=True,
+                )
+                return entries if entries is not None else []
+            wait_for_search_cache_prewarm_completion()
             entries = search_sqlite_allrecords_cache(
                 client,
                 zone_name,
@@ -4979,9 +5057,11 @@ def load_search_entries_for_zone(
                 keyword,
                 case_sensitive,
                 fuzzy_search,
-                allow_stale=True,
             )
-            return entries if entries is not None else []
+            if entries is None:
+                entries = read_allrecords_search_cache(client, zone_name, serial_number)
+            if entries is not None:
+                return entries
         records = paged_query(
             client,
             ALLRECORDS_OBJECT,
@@ -5122,6 +5202,12 @@ def search_cache_prewarm_lock_is_stale(lock_file: Path) -> bool:
 def search_cache_prewarm_is_running() -> bool:
     """Return whether a live background prewarmer should own record-cache refreshes."""
     return not search_cache_prewarm_lock_is_stale(search_cache_prewarm_lock_file())
+
+
+def wait_for_search_cache_prewarm_completion() -> None:
+    """Wait until an active background prewarmer releases or ages out its lock."""
+    while search_cache_prewarm_is_running():
+        time.sleep(SEARCH_CACHE_PREWARM_POLL_SECONDS)
 
 
 def write_search_cache_prewarm_lock(lock_file: Path) -> tuple[int, str]:
@@ -5464,8 +5550,20 @@ def start_zone_completion_cache_revalidation(view: str) -> None:
         return
 
 
-def refresh_dns_cache_after_update() -> None:
-    """Clear and prewarm DNS caches after mutations so subsequent reads see fresh data."""
+def refresh_dns_cache_after_update(
+    zone_name: str | None = None, *, client: InfobloxClient | None = None
+) -> None:
+    """Refresh DNS search caches after mutations so subsequent reads see fresh data."""
+    if zone_name:
+        try:
+            refresh_client = client or InfobloxClient(load_config())
+            clear_allrecords_zone_cache(refresh_client, zone_name)
+            clear_zone_serial_cache(refresh_client)
+            start_search_cache_prewarm(zone_name)
+            return
+        except (CliError, OSError, ValueError, sqlite3.Error):
+            pass
+
     clear_dns_cache()
     start_search_cache_prewarm()
 
@@ -5779,7 +5877,8 @@ def run_dns_edit(
 
     if noptr and actual_type not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
-    refresh_dns_cache_after_update()
+    edited_zone = str(item.get("zone", "")).strip() or None
+    refresh_dns_cache_after_update(edited_zone, client=client)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -5890,7 +5989,7 @@ def run_dns_delete_ptr(ip_value: str | None) -> None:
         raise CliError("ERROR: matched PTR record does not include an _ref.")
     with infoblox_wait_spinner():
         client.request("DELETE", ref)
-    refresh_dns_cache_after_update()
+    refresh_dns_cache_after_update(reverse_zone, client=client)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -5978,7 +6077,8 @@ def run_dns_delete(record_name: str, zone: str | None) -> None:
         raise CliError("ERROR: matched record does not include an _ref.")
     with infoblox_wait_spinner():
         client.request("DELETE", ref)
-    refresh_dns_cache_after_update()
+    deleted_zone = str(item.get("zone", "")).strip() or None
+    refresh_dns_cache_after_update(deleted_zone, client=client)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -6013,7 +6113,7 @@ def run_dns_zone_create(
 
     with infoblox_wait_spinner():
         ref = client.request("POST", ZONE_OBJECT, payload=payload)
-    refresh_dns_cache_after_update()
+    refresh_dns_cache_after_update(payload["fqdn"], client=client)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -6125,7 +6225,7 @@ def run_dns_zone_delete(zone_name: str) -> None:
         raise CliError("ERROR: matched zone does not include an _ref.")
     with infoblox_wait_spinner():
         client.request("DELETE", ref)
-    refresh_dns_cache_after_update()
+    refresh_dns_cache_after_update(target, client=client)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -7065,7 +7165,7 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
 def cli(ctx: click.Context, output_format: str | None) -> None:
     """Infoblox command line client.
 
-    Run `ib config new PROFILE` first to save an Infoblox profile with server,
+    Run `ib config new [PROFILE]` first to save an Infoblox profile with server,
     credentials, DNS view, and default zone.
 
     \b
@@ -7111,7 +7211,7 @@ def config(ctx: click.Context) -> None:
     """Display Infoblox profiles and profile-management usage.
 
     Without a subcommand, this command is read-only: it lists available profiles
-    and shows the profile commands. Use `ib config new PROFILE` to create a
+    and shows the profile commands. Use `ib config new [PROFILE]` to create a
     profile, or `ib config edit [PROFILE]` to edit an existing profile. Existing
     values are shown as defaults during edits, so pressing Enter keeps the
     current value. Existing passwords are kept when the password prompt is left
@@ -7122,11 +7222,17 @@ def config(ctx: click.Context) -> None:
 
 
 @config.command("new")
-@click.argument("profile_name", shell_complete=complete_new_profile_names)
+@click.argument(
+    "profile_name",
+    required=False,
+    metavar="[PROFILE]",
+    shell_complete=complete_new_profile_names,
+)
 @click.option("--default", "make_default", is_flag=True, help="Make this profile the default.")
-def configure_new(profile_name: str, make_default: bool) -> None:
+def configure_new(profile_name: str | None, make_default: bool) -> None:
     """Create a profile, choose a live DNS view, and pick an optional default zone."""
-    save_config_interactive(profile_name, create=True, make_default=make_default)
+    selected_profile = profile_name if profile_name is not None else prompt_new_profile_name()
+    save_config_interactive(selected_profile, create=True, make_default=make_default)
 
 
 @config.command("edit")

@@ -7,15 +7,18 @@ parallelism, and background warming.
 
 The important rule is: `ib` can avoid live `allrecords` calls only when it has a
 safe reason to trust local data. Record data is reused when the cached zone
-serial matches the active SOA serial metadata. When the cache is absent or no
-longer valid, `ib` fetches fresh data and rebuilds the local SQLite rows.
+serial matches the active SOA serial metadata. When cache is absent while a
+background prewarmer is running, search waits for that warmer, retries the cache,
+and only then falls back to live WAPI. Other cold or invalid cache paths fetch
+fresh data and rebuild the local SQLite rows.
 
 ![ib DNS cache flow](assets/cache-flow.svg)
 
 ## Search Performance
 
-Search and list commands avoid doing one large, repeated live scan whenever
-possible:
+Search and list commands share the same serial-validated record cache so they
+avoid doing one large, repeated live scan whenever possible. Search follows this
+multi-zone flow:
 
 1. Resolve the active profile, DNS view, and zone scope.
 2. Read short-lived zone serial metadata.
@@ -23,13 +26,17 @@ possible:
 4. Process multiple zones concurrently when more than one zone is in scope.
 5. Borrow pooled keep-alive WAPI connections only for zones that need live data.
 6. For each zone, search local SQLite if the cached serial still matches.
-7. Fetch live `allrecords` only for zones that miss cache validation.
-8. Sort and deduplicate records once all zone workers finish.
+7. If a prewarmer owns refresh, serve stale rows immediately or wait for an
+   uncached zone, polling every 200 ms until the warmer finishes.
+8. Fetch live `allrecords` only for zones that still miss cache validation.
+9. Sort and deduplicate records once all zone workers finish.
 
-This keeps the common hot path local: SQLite lookup, normalized exact field
+This keeps the common search path local: SQLite lookup, normalized exact field
 matching, optional fuzzy matching, and table/JSON/CSV rendering. Live WAPI calls
 are reserved for cold cache, expired serial metadata, changed zones, or explicit
-cache refresh paths.
+cache refresh paths. `ib dns list` reads the same valid per-zone cache when it
+can, but if the requested zone misses cache validation it fetches that zone live
+instead of waiting on the search prewarmer.
 
 ## Parallel Zone Workers
 
@@ -58,11 +65,12 @@ workers return their matches, the main thread sorts records and removes
 duplicates so output remains stable.
 
 Background prewarm uses the same zone-level worker model. The hidden
-`ib _prewarm-search-cache` command scans either the global forward-zone set or
-the scoped zone set selected by `ib dns zone use <zone>`, then warms each zone
-cache concurrently, also capped by `DNS_SEARCH_WORKERS`. It uses the normal zone
-serial stale-while-revalidate path, so a hidden zone metadata refresh starts only
-when cached serial metadata is stale enough to revalidate.
+`ib _prewarm-search-cache` command scans either the global forward-zone set or a
+scoped zone set selected by `ib dns zone use <zone>` or a successful DNS
+mutation, then warms each zone cache concurrently, also capped by
+`DNS_SEARCH_WORKERS`. It uses the normal zone serial stale-while-revalidate path,
+so a hidden zone metadata refresh starts only when cached serial metadata is
+stale enough to revalidate.
 
 ## WAPI Connection Pooling
 
@@ -102,7 +110,7 @@ because replaying record or zone mutations could duplicate a write.
 | Zone completion names | `~/.ib/zone-completion-cache.json` | Active DNS view | 300 seconds fresh, then 48 hours stale-while-revalidate |
 | Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view | 30 seconds fresh, then 300 seconds stale-while-revalidate |
 | Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view, zone | SOA serial match |
-| Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | Local machine | Stale after 600 seconds |
+| Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | Local machine | Stale after 600 seconds; uncached search waits and polls every 200 ms |
 
 The cache directory is private. `ib` creates `~/.ib` and
 `~/.ib/allrecords-cache` with mode `0700`, and writes cache files with mode
@@ -135,8 +143,11 @@ zone serial reads keep serving the existing cached zone list immediately, even i
 that cache has just passed the normal stale-while-revalidate max age.
 
 If the serial cache is missing, corrupt, or older than 330 seconds, `ib` refreshes
-serial metadata synchronously before continuing. This prevents very old serial
-state from driving record-cache decisions.
+serial metadata synchronously before continuing. The exception is when a hidden
+serial refresh lock is already active: then foreground reads return the expired
+cached zone list immediately and let the active refresh publish the replacement.
+This prevents duplicate foreground WAPI calls while still avoiding very old
+serial state when no refresh is already in progress.
 
 ## Record Cache Validation
 
@@ -167,12 +178,11 @@ If the serial differs, is missing, or cannot be read, `ib` fetches fresh
 `allrecords` with WAPI paging, normalizes the records, and replaces that zone's
 cached rows.
 
-When `prewarm.lock` shows a live background warmer, foreground allrecords-backed
-commands do not start their own live record fetches. They serve whatever cached
-SQLite rows are already available, even if the row serial is older than current
-zone metadata, and return no matches for zones that are not cached yet. The
-prewarmer or hidden serial refresh remains responsible for bringing those rows
-current.
+When `prewarm.lock` shows a live background warmer, search avoids racing the
+warmer. If a zone has older cache metadata, search serves those stale SQLite rows
+immediately. If the zone has no cache metadata yet, search waits for the lock to
+clear, polling every 200 ms, then retries the cache. Only if the cache is still
+missing after the warmer completes does search fetch live `allrecords` itself.
 
 ## Completion Performance
 
@@ -201,13 +211,18 @@ Successful DNS mutations call the shared cache refresh path. That includes:
 - zone create
 - zone delete
 
-The refresh path removes the allrecords cache directory and the zone completion
-JSON file, then starts detached background prewarm. Zone completion serves stale
-names for up to 48 hours after its 300-second fresh window while a hidden
-refresh updates the JSON file. `ib dns zone use <zone>` does not clear caches,
-but it starts detached prewarm scoped to the selected zone and its child
-authoritative zones. Foreground commands do not wait for
-prewarm to finish.
+When the changed zone is known, the refresh path removes only that zone's record
+search rows, removes the current server/view zone serial metadata, and starts a
+detached prewarm scoped to that zone and child authoritative zones. That is the
+normal path for record create, record edit, record delete, zone create, and zone
+delete. If a mutation cannot identify a zone, the fallback path still clears the
+whole DNS search cache and starts global prewarm.
+
+Zone completion has its own JSON cache and refresh path. It can serve stale names
+for up to 48 hours after its 300-second fresh window while a hidden refresh
+updates the JSON file. `ib dns zone use <zone>` does not clear caches, but it
+starts detached prewarm scoped to the selected zone and its child authoritative
+zones.
 
 The prewarmer uses `prewarm.lock` to avoid duplicate warmers. If another
 prewarmer is already running, the new one exits. If the lock is older than 600

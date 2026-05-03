@@ -56,10 +56,11 @@ export PATH="$HOME/.local/bin:$PATH"
 Then create an Infoblox profile:
 
 ```bash
-ib config new default --default
+ib config new --default
 ```
 
-`ib config new PROFILE` prompts for:
+`ib config new [PROFILE]` prompts for a profile name when it is not supplied,
+then asks for:
 
 - Infoblox server
 - Username and password
@@ -84,6 +85,7 @@ Manage multiple profiles with:
 ```bash
 ib config
 ib config new prod --default
+ib config new
 ib config new lab
 ib config list
 ib config use prod
@@ -106,7 +108,7 @@ key files are kept at `0600`.
 Common workflow:
 
 ```bash
-ib config new default --default
+ib config new --default
 ib dns view list
 ib dns view use "DNS Zone View"
 ib dns zone list
@@ -368,7 +370,7 @@ address while table and structured output still display the target hostname.
 | Zone completion names | `~/.ib/zone-completion-cache.json` | 300 seconds fresh, then 48 hours stale-while-revalidate, scoped to the active DNS view |
 | Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | 30 seconds fresh, then 300 seconds stale-while-revalidate |
 | Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | reused only when the zone SOA serial matches |
-| Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | prevents duplicate warmers; stale after 600 seconds |
+| Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | prevents duplicate warmers; stale after 600 seconds; uncached search polls every 200 ms while active |
 
 Each record-cache key includes the Infoblox server, WAPI version, DNS view, and
 zone name, so cached data does not cross profiles, views, or zones. When a zone
@@ -377,9 +379,10 @@ old; record rows have no separate time-based expiry. Background prewarm refreshe
 the row `updated_at` timestamp when it validates that cached rows still match the
 current serial. When the serial changes or the cache is missing, `ib` fetches
 fresh `allrecords` with WAPI paging and rewrites that zone's cached rows. If a
-background prewarm is already running, foreground searches stay cache-only: they
-serve existing cached rows, including stale rows, and skip live `allrecords`
-fetches while the warmer owns refresh.
+background prewarm is already running, search serves existing cached rows,
+including stale rows, immediately. For an uncached zone, search waits for the
+warmer to finish, polling every 200 ms, retries the cache, and only then fetches
+live `allrecords` if the cache is still missing.
 
 `ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
 `ib dns zone use <zone>` starts a silent scoped warm for that zone and its child
@@ -389,12 +392,13 @@ the cached serial metadata is stale enough to revalidate. While that hidden
 refresh is running, new requests keep serving the existing cached zone list
 immediately. If the hidden refresh finds changed SOA serials, it takes the record
 prewarm lock before publishing the newer serial metadata and refreshes only the
-changed zones' record caches in the background. Successful DNS record or
-zone updates clear the DNS caches and start a silent background prewarm. Cache
-failures are treated as performance misses: foreground commands fall back to live
-WAPI calls, while shell completion fails quietly. Zone-name completion can serve
-stale cached names for 48 hours after the 300-second fresh window while a hidden
-refresh updates the cache.
+changed zones' record caches in the background. Successful DNS record and zone
+updates refresh the specific changed zone: they remove that zone's record-search
+rows, remove the current server/view zone serial metadata, and start a scoped
+silent prewarm. Cache failures are treated as performance misses: foreground
+commands fall back to live WAPI calls, while shell completion fails quietly.
+Zone-name completion can serve stale cached names for 48 hours after the
+300-second fresh window while a hidden refresh updates the cache.
 
 For the full performance flow, parallel worker model, and cache diagram, see
 [Performance architecture](docs/performance-architecture.md).

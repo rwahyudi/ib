@@ -8,7 +8,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import PropertyMock, patch
+from unittest.mock import PropertyMock, call, patch
 
 from click.testing import CliRunner
 
@@ -85,7 +85,8 @@ class DefaultZoneTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
             with patch.object(ib, "load_config", return_value={"default_zone": "example.com."}):
-                with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                client = FakeClient()
+                with patch.object(ib, "InfobloxClient", return_value=client):
                     with patch.object(ib, "create_payload", side_effect=fake_create_payload):
                         with patch.object(ib, "read_session_zone", return_value=None):
                             with patch.object(ib, "print_success"), patch.object(ib, "print_note") as print_note:
@@ -94,7 +95,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(seen["zone"], "example.com")
         self.assertEqual(seen["request"][0], "POST")
         print_note.assert_not_called()
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_create_uses_matching_forward_zone_from_fqdn_name(self):
         seen = {"zone_queries": []}
@@ -139,6 +140,44 @@ class DefaultZoneTests(unittest.TestCase):
             ["host1.example-dns.com", "example-dns.com"],
         )
         self.assertEqual(seen["request"][0], "POST")
+
+    def test_dns_create_ptr_refreshes_reverse_zone_after_success(self):
+        class FakeClient:
+            view = "corp"
+
+            def request(self, method, object_type, payload=None):
+                self.request_seen = (method, object_type, payload)
+                return "record:ptr/reverse"
+
+        client = FakeClient()
+        zones = [
+            {"fqdn": "168.192.in-addr.arpa", "zone_format": "IPV4"},
+            {"fqdn": "1.168.192.in-addr.arpa", "zone_format": "IPV4"},
+            {"fqdn": "example.com", "zone_format": "FORWARD"},
+        ]
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+            with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                with patch.object(ib, "read_session_zone", return_value=None):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(ib, "query_zones", return_value=zones) as query_zones:
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                                ib.run_dns_create(
+                                    "ptr",
+                                    "host.example.com",
+                                    "192.168.1.3",
+                                    None,
+                                    None,
+                                    False,
+                                    None,
+                                )
+
+        query_zones.assert_called_once_with(client)
+        self.assertEqual(client.request_seen[0], "POST")
+        self.assertEqual(client.request_seen[1], "record:ptr")
+        self.assertEqual(client.request_seen[2]["ipv4addr"], "192.168.1.3")
+        self.cache_refresh.assert_called_once_with("1.168.192.in-addr.arpa", client=client)
 
     def test_dns_create_uses_longest_matching_forward_zone_from_fqdn_name(self):
         class FakeClient:
@@ -578,7 +617,8 @@ class DefaultZoneTests(unittest.TestCase):
             os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
             with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
                 with patch.object(ib, "read_session_zone", return_value=None):
-                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                    client = FakeClient()
+                    with patch.object(ib, "InfobloxClient", return_value=client):
                         with patch.object(ib, "safe_query", side_effect=fake_safe_query):
                             with patch.object(ib, "print_success"), patch.object(ib, "print_note") as print_note:
                                 ib.run_dns_edit(
@@ -614,7 +654,7 @@ class DefaultZoneTests(unittest.TestCase):
             },
         )
         print_note.assert_not_called()
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_edit_accepts_metadata_only_without_type_or_value(self):
         runner = CliRunner()
@@ -662,7 +702,8 @@ class DefaultZoneTests(unittest.TestCase):
             os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
             with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
                 with patch.object(ib, "read_session_zone", return_value=None):
-                    with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                    client = FakeClient()
+                    with patch.object(ib, "InfobloxClient", return_value=client):
                         with patch.object(ib, "safe_query", side_effect=fake_safe_query):
                             with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
                                 ib.run_dns_edit(
@@ -681,7 +722,7 @@ class DefaultZoneTests(unittest.TestCase):
             seen["request"][2],
             {"ttl": 600, "use_ttl": True, "comment": "Updated comment"},
         )
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_edit_rejects_type_that_does_not_match_selected_record(self):
         class FakeClient:
@@ -1220,7 +1261,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("read-only", result.output)
-        self.assertIn("ib config new PROFILE", result.output)
+        self.assertIn("ib config new [PROFILE]", result.output)
         self.assertIn("ib config edit [PROFILE]", result.output)
         self.assertIn("pressing", result.output)
         self.assertIn("Enter keeps the current", result.output)
@@ -1275,7 +1316,7 @@ class DefaultZoneTests(unittest.TestCase):
         save_config.assert_not_called()
         self.assertIn("Infoblox Profiles (1)", result.output)
         self.assertIn("prod", result.output)
-        self.assertIn("ib config new PROFILE", result.output)
+        self.assertIn("ib config new [PROFILE]", result.output)
         self.assertIn("ib config edit [PROFILE]", result.output)
         self.assertNotIn("prod-secret", result.output)
 
@@ -1289,7 +1330,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         save_config.assert_not_called()
         self.assertIn("No profiles configured", result.output)
-        self.assertIn("ib config new PROFILE", result.output)
+        self.assertIn("ib config new [PROFILE]", result.output)
 
     def test_config_without_subcommand_outputs_profile_json_without_usage(self):
         runner = CliRunner()
@@ -1322,7 +1363,7 @@ class DefaultZoneTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertNotIn("ib config new PROFILE", result.output)
+        self.assertNotIn("ib config new [PROFILE]", result.output)
 
     def test_output_option_is_registered_on_all_commands(self):
         self.assert_command_tree_has_output_option(ib.cli)
@@ -1472,6 +1513,36 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(default_profile, "prod")
         self.assertIn("prod", profiles)
+
+    def test_configure_new_prompts_for_profile_name_when_omitted(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "prompt_text", return_value=" prompted-prof ") as prompt_text:
+            with patch.object(ib, "save_config_interactive") as save_config:
+                result = runner.invoke(ib.cli, ["config", "new", "--default"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        prompt_text.assert_called_once_with("Profile name")
+        save_config.assert_called_once_with(
+            "prompted-prof",
+            create=True,
+            make_default=True,
+        )
+
+    def test_prompt_new_profile_name_reprompts_until_name_is_valid(self):
+        with patch.object(
+            ib,
+            "prompt_text",
+            side_effect=["", "bad name", "valid-name"],
+        ) as prompt_text:
+            with patch.object(ib, "print_warning") as print_warning:
+                profile_name = ib.prompt_new_profile_name()
+
+        self.assertEqual(profile_name, "valid-name")
+        self.assertEqual(prompt_text.call_count, 3)
+        self.assertEqual(print_warning.call_count, 2)
+        self.assertIn("profile name is required", print_warning.call_args_list[0].args[0])
+        self.assertIn("may only contain", print_warning.call_args_list[1].args[0])
 
     def test_configure_new_default_creates_profile_and_sets_default(self):
         runner = CliRunner()
@@ -2374,7 +2445,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIsInstance(result.exception, ib.CliError)
-        self.assertIn("Run: ib config new PROFILE", str(result.exception))
+        self.assertIn("Run: ib config new [PROFILE]", str(result.exception))
 
     def test_dns_delete_missing_record_name_error_prints_ptr_hint(self):
         with patch.object(ib.sys, "argv", ["ib", "dns", "delete"]):
@@ -2969,6 +3040,22 @@ class DefaultZoneTests(unittest.TestCase):
 
         clear_cache.assert_called_once_with()
         start_prewarm.assert_called_once_with()
+
+    def test_refresh_dns_cache_after_update_refreshes_specific_zone(self):
+        class FakeClient:
+            pass
+
+        client = FakeClient()
+        with patch.object(ib, "clear_allrecords_zone_cache") as clear_zone_cache:
+            with patch.object(ib, "clear_zone_serial_cache") as clear_serial_cache:
+                with patch.object(ib, "clear_dns_cache") as clear_cache:
+                    with patch.object(ib, "start_search_cache_prewarm") as start_prewarm:
+                        ORIGINAL_REFRESH_DNS_CACHE_AFTER_UPDATE("example.com", client=client)
+
+        clear_zone_cache.assert_called_once_with(client, "example.com")
+        clear_serial_cache.assert_called_once_with(client)
+        clear_cache.assert_not_called()
+        start_prewarm.assert_called_once_with("example.com")
 
     def test_search_cache_prewarm_missing_config_exits_without_lock(self):
         with patch.object(ib, "load_config", return_value=None):
@@ -3570,7 +3657,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(client.deleted_ref, "record:a/app")
         self.assertTrue(all(name == "app.other.example.net" for _object_type, name in queries))
         print_note.assert_not_called()
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("other.example.net", client=client)
 
     def test_dns_delete_no_match_for_ip_suggests_ptr_delete_command(self):
         class FakeClient:
@@ -3658,7 +3745,7 @@ class DefaultZoneTests(unittest.TestCase):
             "SUCCESS: deleted PTR record 192.168.1.3 from reverse zone 1.168.192.in-addr.arpa"
         )
         print_note.assert_not_called()
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("1.168.192.in-addr.arpa", client=client)
 
     def test_dns_delete_ptr_requires_full_ip_address(self):
         with self.assertRaisesRegex(ib.CliError, "Use: ib dns delete ptr <ip-address>"):
@@ -3684,7 +3771,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(client.request_args[0], "POST")
         self.assertEqual(client.request_args[1], ib.ZONE_OBJECT)
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_zone_delete_refreshes_cache_after_success(self):
         class FakeClient:
@@ -3707,7 +3794,7 @@ class DefaultZoneTests(unittest.TestCase):
                         ib.run_dns_zone_delete("example.com")
 
         self.assertEqual(client.deleted_ref, "zone_auth/example")
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_usage_help_includes_current_view_and_active_zone(self):
         with patch.dict(os.environ, {ib.DEFAULT_ZONE_ENV: "example.com"}, clear=False):
@@ -4104,7 +4191,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertNotIn("ref", data)
         self.assertNotIn("_ref", data)
         self.assertEqual(client.request_seen[0], "POST")
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_edit_outputs_csv_without_ref(self):
         class FakeClient:
@@ -4149,7 +4236,7 @@ class DefaultZoneTests(unittest.TestCase):
         )
         self.assertEqual(client.request_seen[0], "PUT")
         self.assertEqual(client.request_seen[1], "record:a/app")
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_delete_outputs_json_without_ref(self):
         class FakeClient:
@@ -4194,7 +4281,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(data["view"], "corp")
         self.assertNotIn("ref", data)
         self.assertEqual(client.request_seen, ("DELETE", "record:a/app"))
-        self.cache_refresh.assert_called_once_with()
+        self.cache_refresh.assert_called_once_with("example.com", client=client)
 
     def test_dns_list_outputs_json_without_ref_or_context(self):
         class FakeClient:
@@ -5191,35 +5278,110 @@ class DefaultZoneTests(unittest.TestCase):
                                 with patch.object(ib, "paged_query", side_effect=fake_paged_query):
                                     with patch.object(ib, "record_table", side_effect=fake_record_table):
                                         with patch.object(ib, "dns_context_panel", return_value="context"):
-                                            with patch.object(ib.console, "print") as print_mock:
-                                                ib.run_dns_search("old")
+                                            with patch.object(
+                                                ib,
+                                                "wait_for_search_cache_prewarm_completion",
+                                            ) as wait_for_prewarm:
+                                                with patch.object(ib.console, "print") as print_mock:
+                                                    ib.run_dns_search("old")
 
         result_refs = {item["_ref"] for _record_type, item in table_records}
         self.assertEqual(result_refs, {"allrecords/old"})
+        wait_for_prewarm.assert_not_called()
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "records"])
 
-    def test_dns_search_skips_live_fetch_for_uncached_zone_while_prewarm_is_running(self):
+    def test_dns_search_waits_for_uncached_zone_then_fetches_when_prewarm_finishes(self):
         class FakeClient:
             server = "https://infoblox.example.com"
             wapi_version = "v2.12.3"
             view = "corp"
 
         client = FakeClient()
+        records = [
+            {
+                "_ref": "allrecords/live",
+                "type": "record:a",
+                "name": "live.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.58",
+            }
+        ]
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
                 ib.ensure_allrecords_cache_dir()
-                ib.search_cache_prewarm_lock_file().write_text("running\n", encoding="utf-8")
-                with patch.object(ib, "paged_query") as paged_query:
-                    entries = ib.load_search_entries_for_zone(
-                        client,
-                        {"fqdn": "example.com", "soa_serial_number": 9},
-                        "missing",
-                        False,
-                    )
+                with patch.object(ib, "search_cache_prewarm_is_running", return_value=True):
+                    with patch.object(ib, "wait_for_search_cache_prewarm_completion") as wait_for_prewarm:
+                        with patch.object(ib, "paged_query", return_value=records) as paged_query:
+                            entries = ib.load_search_entries_for_zone(
+                                client,
+                                {"fqdn": "example.com", "soa_serial_number": 9},
+                                "live",
+                                False,
+                            )
 
-        self.assertEqual(entries, [])
+        wait_for_prewarm.assert_called_once_with()
+        paged_query.assert_called_once_with(
+            client,
+            ib.ALLRECORDS_OBJECT,
+            ib.allrecords_query_params(client, "example.com"),
+        )
+        self.assertEqual([entry["record"]["_ref"] for entry in entries], ["allrecords/live"])
+
+    def test_dns_search_uses_cache_populated_while_waiting_for_prewarm(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        records = [
+            {
+                "_ref": "allrecords/warmed",
+                "type": "record:a",
+                "name": "warmed.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.59",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.ensure_allrecords_cache_dir()
+
+                def populate_cache():
+                    ib.write_allrecords_cache(client, "example.com", "9", records)
+
+                with patch.object(ib, "search_cache_prewarm_is_running", return_value=True):
+                    with patch.object(
+                        ib,
+                        "wait_for_search_cache_prewarm_completion",
+                        side_effect=populate_cache,
+                    ) as wait_for_prewarm:
+                        with patch.object(ib, "paged_query") as paged_query:
+                            entries = ib.load_search_entries_for_zone(
+                                client,
+                                {"fqdn": "example.com", "soa_serial_number": 9},
+                                "warmed",
+                                False,
+                            )
+
+        wait_for_prewarm.assert_called_once_with()
         paged_query.assert_not_called()
+        self.assertEqual([entry["record"]["_ref"] for entry in entries], ["allrecords/warmed"])
+
+    def test_wait_for_search_cache_prewarm_completion_polls_every_200ms(self):
+        with patch.object(ib, "search_cache_prewarm_is_running", side_effect=[True, True, False]):
+            with patch.object(ib.time, "sleep") as sleep:
+                ib.wait_for_search_cache_prewarm_completion()
+
+        self.assertEqual(
+            sleep.call_args_list,
+            [
+                call(ib.SEARCH_CACHE_PREWARM_POLL_SECONDS),
+                call(ib.SEARCH_CACHE_PREWARM_POLL_SECONDS),
+            ],
+        )
 
     def test_dns_search_rebuilds_normalized_cache_when_serial_changes(self):
         class FakeClient:
@@ -6299,6 +6461,7 @@ class DefaultZoneTests(unittest.TestCase):
             self.original_shell_complete(configure_new.params[0]),
             ib.complete_new_profile_names,
         )
+        self.assertFalse(configure_new.params[0].required)
         self.assertIs(
             self.original_shell_complete(configure_edit.params[0]),
             ib.complete_existing_profile_names,
