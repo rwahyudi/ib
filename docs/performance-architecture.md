@@ -155,9 +155,10 @@ still displays the PTR target hostname.
 
 For a zone, cached records are trusted only when the stored `zone_record_cache`
 serial matches the current serial metadata for that zone. If the serial matches,
-`ib` searches local SQLite. If it differs, is missing, or cannot be read, `ib`
-fetches fresh `allrecords` with WAPI paging, normalizes the records, and replaces
-that zone's cached rows.
+`ib` searches local SQLite regardless of row age; `updated_at` is diagnostic
+metadata, not an expiry field. If the serial differs, is missing, or cannot be
+read, `ib` fetches fresh `allrecords` with WAPI paging, normalizes the records,
+and replaces that zone's cached rows.
 
 ## Completion Performance
 

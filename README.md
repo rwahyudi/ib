@@ -371,9 +371,10 @@ address while table and structured output still display the target hostname.
 
 Each record-cache key includes the Infoblox server, WAPI version, DNS view, and
 zone name, so cached data does not cross profiles, views, or zones. When a zone
-serial matches, `ib` searches local SQLite. When it changes or the cache is
-missing, `ib` fetches fresh `allrecords` with WAPI paging and rewrites that
-zone's cached rows.
+serial matches, `ib` searches local SQLite even if the cached record rows are
+old; record rows have no separate time-based expiry. When the serial changes or
+the cache is missing, `ib` fetches fresh `allrecords` with WAPI paging and
+rewrites that zone's cached rows.
 
 `ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
 `ib dns zone use <zone>` starts a silent scoped warm for that zone and its child
