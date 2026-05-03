@@ -875,6 +875,8 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("plain,-o", result.output.splitlines())
         self.assertIn("plain,--output", result.output.splitlines())
+        self.assertIn("plain,-t", result.output.splitlines())
+        self.assertIn("plain,--type", result.output.splitlines())
 
     def test_dns_search_completion_includes_options_after_keyword(self):
         runner = CliRunner()
@@ -893,6 +895,33 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("plain,-o", result.output.splitlines())
         self.assertIn("plain,--output", result.output.splitlines())
+        self.assertIn("plain,-t", result.output.splitlines())
+        self.assertIn("plain,--type", result.output.splitlines())
+
+    def test_dns_search_type_option_completes_record_types(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns search --type ",
+                "COMP_CWORD": "4",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,a", output_lines)
+        self.assertIn("plain,host", output_lines)
+        self.assertIn("plain,cname", output_lines)
+
+    def test_dns_search_type_option_completes_comma_separated_values(self):
+        items = ib.complete_search_record_types(None, None, "a,h")
+
+        self.assertEqual([item.value for item in items], ["a,host"])
 
     def test_dns_search_zone_option_completes_zone_names(self):
         class FakeClient:
@@ -4152,6 +4181,7 @@ class DefaultZoneTests(unittest.TestCase):
             False,
             None,
             None,
+            (),
         )
 
     def test_dns_search_accepts_fuzzy_search_flag(self):
@@ -4161,7 +4191,7 @@ class DefaultZoneTests(unittest.TestCase):
             result = runner.invoke(ib.cli, ["dns", "search", "app", "-f"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        run_dns_search.assert_called_once_with("app", False, False, (), True, None, None)
+        run_dns_search.assert_called_once_with("app", False, False, (), True, None, None, ())
 
     def test_dns_search_accepts_zone_and_view_scope_options(self):
         runner = CliRunner()
@@ -4181,7 +4211,39 @@ class DefaultZoneTests(unittest.TestCase):
             False,
             "test.local",
             "Lab View",
+            (),
         )
+
+    def test_dns_search_accepts_type_filter_option(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_search") as run_dns_search:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "search", "app", "--type", "A,host,cname"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_search.assert_called_once_with(
+            "app",
+            False,
+            False,
+            (),
+            False,
+            None,
+            None,
+            ("a", "host", "cname"),
+        )
+
+    def test_dns_search_rejects_unknown_type_filter(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_search") as run_dns_search:
+            result = runner.invoke(ib.cli, ["dns", "search", "app", "-t", "a,bogus"])
+
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertIn("unsupported record type 'bogus'", result.output)
+        run_dns_search.assert_not_called()
 
     def test_dns_search_accepts_global_output_option_on_dns_group(self):
         runner = CliRunner()
@@ -4941,6 +5003,66 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(
             [item["name"] for _record_type, item in records],
             ["app.alpha.example.com", "app.beta.example.com"],
+        )
+
+    def test_dns_search_filters_results_by_record_type(self):
+        class FakeClient:
+            view = "corp"
+
+        search_entries = [
+            ib.allrecord_search_entry(
+                {
+                    "_ref": "allrecords/app-a",
+                    "type": "record:a",
+                    "name": "app.example.com",
+                    "zone": "example.com",
+                    "address": "192.0.2.10",
+                },
+                "example.com",
+            ),
+            ib.allrecord_search_entry(
+                {
+                    "_ref": "allrecords/app-host",
+                    "type": "record:host",
+                    "name": "app2.example.com",
+                    "zone": "example.com",
+                    "address": "192.0.2.20",
+                },
+                "example.com",
+            ),
+            ib.allrecord_search_entry(
+                {
+                    "_ref": "allrecords/app-cname",
+                    "type": "record:cname",
+                    "name": "app-alias.example.com",
+                    "zone": "example.com",
+                    "record": {"canonical": "app.example.com"},
+                },
+                "example.com",
+            ),
+        ]
+
+        with patch.object(
+            ib,
+            "search_zones",
+            return_value=[{"fqdn": "example.com"}],
+        ):
+            with patch.object(
+                ib,
+                "matching_search_entries_for_zone",
+                return_value=search_entries,
+            ):
+                records = ib.collect_dns_search_results(
+                    FakeClient(),
+                    "app",
+                    False,
+                    None,
+                    record_types=("a", "host"),
+                )
+
+        self.assertEqual(
+            [(record_type, item["name"]) for record_type, item in records],
+            [("a", "app.example.com"), ("host", "app2.example.com")],
         )
 
     def test_dns_search_includes_host_records(self):
@@ -5708,6 +5830,17 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIs(
             self.original_shell_complete(dns_edit.params[1]),
             ib.complete_dns_edit_record_types,
+        )
+
+    def test_dns_search_uses_type_completion(self):
+        dns_search = ib.dns.commands["search"]
+        record_type_option = next(
+            param for param in dns_search.params if param.name == "record_types"
+        )
+
+        self.assertIs(
+            self.original_shell_complete(record_type_option),
+            ib.complete_search_record_types,
         )
 
     def test_dns_delete_uses_record_name_completion(self):

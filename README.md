@@ -330,6 +330,16 @@ ib dns search app -f
 With `-f`, close matches can be returned when a record name, value, or comment is
 near the keyword.
 
+Filter by one or more record types:
+
+```bash
+ib dns search app --type a,host,cname
+ib dns search app -t txt
+```
+
+When shell completion is enabled, `-t/--type` completes supported record types
+and can complete the current value in a comma-separated list.
+
 Exclude records matching one or more keywords:
 
 ```bash

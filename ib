@@ -13,9 +13,10 @@ Script logic:
    zone saved in the selected profile so unattended commands behave
    predictably.
 3. Convert CLI input into WAPI payloads or query parameters. DNS search uses
-   exact name/value/comment matching by default; -f adds typo-tolerant fuzzy
-   matching when the operator wants broader results. Validation stays local
-   where possible so operators get actionable errors before WAPI calls.
+   exact name/value/comment matching by default; -t filters by record type and
+   -f adds typo-tolerant fuzzy matching when the operator wants broader results.
+   Validation stays local where possible so operators get actionable errors
+   before WAPI calls.
 4. Use pooled keep-alive WAPI connections, WAPI paging for list/search
    operations, and cached allrecords data in SQLite. SOA serial checks decide
    whether cached data is still valid; the short-lived serial list uses
@@ -452,6 +453,7 @@ RECORD_TYPES: dict[str, dict[str, Any]] = {
 }
 FORWARD_RECORD_TYPES = tuple(record_type for record_type in RECORD_TYPES if record_type != "ptr")
 DNS_DELETE_COMPLETION_RECORD_TYPES = frozenset(FORWARD_RECORD_TYPES)
+SEARCH_RECORD_TYPES = tuple(sorted(RECORD_TYPES))
 
 
 def normalize_server(value: str) -> str:
@@ -4517,6 +4519,79 @@ def normalize_search_exclude_keywords(exclude_keywords: tuple[str, ...]) -> tupl
     return tuple(keyword.strip() for keyword in exclude_keywords if keyword.strip())
 
 
+def normalize_search_record_types(record_types: str | tuple[str, ...] | None) -> tuple[str, ...]:
+    """Normalize comma-separated DNS search type filters while preserving user order."""
+    if record_types is None:
+        return ()
+    if isinstance(record_types, str):
+        raw_types = tuple(record_types.split(","))
+    else:
+        raw_types = tuple(
+            part
+            for record_type in record_types
+            for part in str(record_type).split(",")
+        )
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_type in raw_types:
+        record_type = str(raw_type).strip().lower()
+        if not record_type:
+            raise click.BadParameter("record types must be comma-separated non-empty values")
+        if record_type not in RECORD_TYPES:
+            supported = ", ".join(SEARCH_RECORD_TYPES)
+            raise click.BadParameter(
+                f"unsupported record type '{record_type}'. Supported: {supported}"
+            )
+        if record_type not in seen:
+            normalized.append(record_type)
+            seen.add(record_type)
+    return tuple(normalized)
+
+
+def parse_search_record_type_option(
+    ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> tuple[str, ...]:
+    """Convert the search type option into normalized type filters for downstream code."""
+    return normalize_search_record_types(value)
+
+
+def complete_search_record_types(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[CompletionItem]:
+    """Complete comma-separated DNS record types for search filtering."""
+    prefix, _separator, current = incomplete.rpartition(",")
+    current = current.strip().lower()
+    selected = {
+        record_type.strip().lower()
+        for record_type in prefix.split(",")
+        if record_type.strip()
+    }
+    completion_prefix = f"{prefix}," if prefix else ""
+    return [
+        CompletionItem(f"{completion_prefix}{record_type}", help="DNS record type")
+        for record_type in SEARCH_RECORD_TYPES
+        if record_type not in selected and record_type.startswith(current)
+    ]
+
+
+def search_record_type_matches_filter(
+    record_type: str,
+    record_type_filter: frozenset[str],
+) -> bool:
+    """Return whether a result type should remain visible for the requested search filters."""
+    if not record_type_filter:
+        return True
+    normalized_type = record_type.lower()
+    if normalized_type.startswith("shared-"):
+        normalized_type = normalized_type.removeprefix("shared-")
+    return normalized_type in record_type_filter
+
+
 def allrecord_search_entry_matches_any_keyword(
     entry: dict[str, Any],
     keywords: tuple[str, ...],
@@ -4687,11 +4762,14 @@ def collect_dns_search_results(
     root_zone: str | None,
     exclude_keywords: tuple[str, ...] = (),
     fuzzy_search: bool = False,
+    record_types: tuple[str, ...] = (),
     *,
     zone_filter: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Collect search results across scoped zones concurrently while deduplicating records."""
     exclude_keywords = normalize_search_exclude_keywords(exclude_keywords)
+    record_types = normalize_search_record_types(record_types)
+    record_type_filter = frozenset(record_types)
     seen: set[str] = set()
     records: list[tuple[str, dict[str, Any]]] = []
     zones = search_zones(client, root_zone)
@@ -4724,11 +4802,14 @@ def collect_dns_search_results(
         record = allrecord_search_entry_record(entry)
         if not record:
             continue
+        record_type = allrecord_search_entry_type(entry)
+        if not search_record_type_matches_filter(record_type, record_type_filter):
+            continue
         key = record_result_key(record)
         if key in seen:
             continue
         seen.add(key)
-        records.append((allrecord_search_entry_type(entry), record))
+        records.append((record_type, record))
     return records
 
 
@@ -5069,6 +5150,7 @@ def run_dns_search(
     fuzzy_search: bool = False,
     zone_name: str | None = None,
     view_name: str | None = None,
+    record_types: tuple[str, ...] = (),
 ) -> None:
     """Run DNS search from config loading through scoped collection and selected output rendering."""
     config = load_config()
@@ -5097,6 +5179,7 @@ def run_dns_search(
             root_zone,
             exclude_keywords,
             fuzzy_search,
+            record_types,
         )
 
     if not records:
@@ -7082,6 +7165,15 @@ def dns_list(zone: str | None) -> None:
     help="Enable fuzzy matching for typo-tolerant results.",
 )
 @click.option(
+    "-t",
+    "--type",
+    "record_types",
+    callback=parse_search_record_type_option,
+    shell_complete=complete_search_record_types,
+    metavar="TYPE[,TYPE...]",
+    help="Only show matching record types. Use commas for multiple types, e.g. a,host,cname.",
+)
+@click.option(
     "-e",
     "exclude_keywords",
     multiple=True,
@@ -7095,6 +7187,7 @@ def search(
     zone_name: str | None,
     view_name: str | None,
     fuzzy_search: bool,
+    record_types: tuple[str, ...],
     exclude_keywords: tuple[str, ...],
 ) -> None:
     """Search DNS records by name, value, or comment.
@@ -7105,6 +7198,7 @@ def search(
     DNS view globally.
     Search uses exact substring matching by default; use `-f` for fuzzy matching.
     Use `-i` for case-sensitive matching.
+    Use `-t/--type` to restrict results to one or more record types.
     Use `-e KEYWORD` one or more times to exclude matching records.
 
     Search data is cached under ~/.ib/allrecords-cache and refreshed when the
@@ -7118,6 +7212,7 @@ def search(
         fuzzy_search,
         zone_name,
         view_name,
+        record_types,
     )
 
 
