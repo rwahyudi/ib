@@ -12,7 +12,9 @@ readable terminal output.
 - Create and edit A, AAAA, CNAME, TXT, MX, PTR, and HOST records.
 - Search DNS records by name, value, or comment.
 - Search the active zone plus child authoritative zones, or search globally with `-g`.
-- Cache `allrecords` data in SQLite and refresh by SOA serial number.
+- Fast and responsive search/completion with SQLite caching, SOA serial
+  validation, and background warming; see the
+  [performance architecture](docs/performance-architecture.md).
 - List, create, delete, use, and inspect authoritative DNS zones.
 - View zone SOA settings including serial, MNAME, RNAME, refresh, retry,
   expiry, and negative caching TTL.
