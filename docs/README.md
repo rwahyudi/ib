@@ -16,5 +16,5 @@ ib dns zone --help
 
 ## Guides
 
-- [Cache architecture](cache-architecture.md) explains the completion cache,
-  SQLite record cache, SOA serial validation, and background prewarm flow.
+- [Performance architecture](performance-architecture.md) explains caching,
+  SOA serial validation, zone-level worker threads, and background prewarm.

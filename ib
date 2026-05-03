@@ -12,17 +12,20 @@ Script logic:
    over the current profile's shell/session zone, IB_ZONE, then the default
    zone saved in the selected profile so unattended commands behave
    predictably.
-3. Convert CLI input into WAPI payloads or query parameters. Validation stays
-   local where possible so operators get actionable errors before WAPI calls.
+3. Convert CLI input into WAPI payloads or query parameters. DNS search checks
+   exact name/value/comment matches first, then typo-tolerant fuzzy matches by
+   default; -f keeps search exact-only when the operator wants strict results.
+   Validation stays local where possible so operators get actionable errors
+   before WAPI calls.
 4. Use WAPI paging for list/search operations and cache allrecords data in
    SQLite. SOA serial checks decide whether cached data is still valid; the
    short-lived serial list uses stale-while-revalidate so foreground reads stay
    responsive while a hidden refresh updates slightly old serial metadata.
    Writes clear and prewarm the cache so later search/completion calls stay
    fast.
-5. Render output according to the active mode. The default is Rich table output;
-   -o jq and -o csv use structured emitters, while help always remains normal
-   operator-facing help.
+5. Render output according to the active mode. The default is Rich table output
+   with color-coded DNS record types; -o jq and -o csv use structured emitters,
+   while help always remains normal operator-facing help.
 6. Keep shell completion quiet and best-effort. Completion helpers use cached
    DNS data where possible and return no candidates instead of surfacing
    network/configuration failures to the shell.
@@ -42,6 +45,7 @@ import base64
 import binascii
 import configparser
 import csv
+import difflib
 import hashlib
 import http.client
 import ipaddress
@@ -108,6 +112,12 @@ ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
 COMMENT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9 .,_:;@#%+=/()[\]'&-]*$")
 WAPI_PAGE_SIZE = 2000
 DNS_SEARCH_WORKERS = 8
+FUZZY_SEARCH_MIN_KEYWORD_LENGTH = 3
+FUZZY_SEARCH_SHORT_KEYWORD_LENGTH = 4
+FUZZY_SEARCH_SHORT_RATIO = 0.75
+FUZZY_SEARCH_MEDIUM_KEYWORD_LENGTH = 5
+FUZZY_SEARCH_MEDIUM_RATIO = 0.80
+FUZZY_SEARCH_RATIO = 0.82
 ZONE_SERIAL_CACHE_TTL = 30
 ZONE_SERIAL_CACHE_STALE_WHILE_REVALIDATE_SECONDS = 90
 PREWARM_LOCK_STALE_SECONDS = 600
@@ -3149,13 +3159,29 @@ def search_sqlite_allrecords_cache(
     serial_number: str | None,
     keyword: str,
     case_sensitive: bool,
+    fuzzy_search: bool = True,
 ) -> list[dict[str, Any]] | None:
-    """Search cached allrecords entries locally so repeated DNS searches avoid WAPI calls."""
+    """Search cached entries, scanning all valid rows when fuzzy matching is enabled."""
     if serial_number is None:
         return None
     cache_key = allrecords_cache_key(client, zone_name)
     if not keyword:
         return read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+
+    if fuzzy_search:
+        entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+        if entries is None:
+            return None
+        return [
+            entry
+            for entry in entries
+            if allrecord_search_entry_matches_keyword(
+                entry,
+                keyword,
+                case_sensitive,
+                fuzzy_search=True,
+            )
+        ]
 
     if case_sensitive:
         condition = "instr(name, ?) > 0 OR instr(value, ?) > 0 OR instr(comment, ?) > 0"
@@ -3189,7 +3215,7 @@ def search_sqlite_allrecords_cache(
         entry = sqlite_search_entry_from_row(row)
         if entry is None:
             return None
-        if allrecord_search_entry_matches_keyword(entry, keyword, case_sensitive):
+        if allrecord_search_entry_matches_exact_keyword(entry, keyword, case_sensitive):
             entries.append(entry)
     return entries
 
@@ -3635,17 +3661,127 @@ def allrecord_search_values(record_type: str, item: dict[str, Any]) -> list[str]
     ]
 
 
+def normalized_search_text(value: str, case_sensitive: bool) -> str:
+    """Normalize search text once so exact and fuzzy paths honor the same case setting."""
+    text = str(value).strip()
+    return text if case_sensitive else text.lower()
+
+
+def search_value_exact_match(value: str, keyword: str, case_sensitive: bool) -> bool:
+    """Return exact substring matches, preserving the historical search behavior."""
+    needle = normalized_search_text(keyword, case_sensitive)
+    haystack = normalized_search_text(value, case_sensitive)
+    return needle in haystack
+
+
+def fuzzy_search_threshold(keyword: str) -> float:
+    """Use lower short-word thresholds so one-letter typos still match compact names."""
+    if len(keyword) <= FUZZY_SEARCH_SHORT_KEYWORD_LENGTH:
+        return FUZZY_SEARCH_SHORT_RATIO
+    if len(keyword) <= FUZZY_SEARCH_MEDIUM_KEYWORD_LENGTH:
+        return FUZZY_SEARCH_MEDIUM_RATIO
+    return FUZZY_SEARCH_RATIO
+
+
+def fuzzy_search_length_is_close(keyword: str, candidate: str) -> bool:
+    """Reject very different lengths early so fuzzy search stays typo-oriented."""
+    max_difference = fuzzy_search_max_length_difference(keyword)
+    return abs(len(candidate) - len(keyword)) <= max_difference
+
+
+def fuzzy_search_max_length_difference(keyword: str) -> int:
+    """Return the permitted length drift used by direct and sliding fuzzy comparisons."""
+    if len(keyword) <= FUZZY_SEARCH_SHORT_KEYWORD_LENGTH:
+        return 1
+    return max(2, len(keyword) // 3)
+
+
+def fuzzy_search_candidates(value: str) -> list[str]:
+    """Return full fields and useful tokens so typos can match DNS labels and words."""
+    text = str(value).strip()
+    if not text:
+        return []
+
+    candidates = [text]
+    for token in re.split(r"[^A-Za-z0-9]+", text):
+        if not token:
+            continue
+        candidates.append(token)
+        without_trailing_digits = re.sub(r"\d+$", "", token)
+        if without_trailing_digits and without_trailing_digits != token:
+            candidates.append(without_trailing_digits)
+
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            deduplicated.append(candidate)
+    return deduplicated
+
+
+def fuzzy_search_windows(candidate: str, keyword: str) -> list[str]:
+    """Split long alphanumeric tokens into near-keyword windows for embedded-name typos."""
+    if not candidate.isalnum() or len(candidate) <= len(keyword):
+        return []
+
+    max_difference = fuzzy_search_max_length_difference(keyword)
+    min_size = max(FUZZY_SEARCH_MIN_KEYWORD_LENGTH, len(keyword) - max_difference)
+    max_size = min(len(candidate), len(keyword) + max_difference)
+    windows: list[str] = []
+    for size in range(min_size, max_size + 1):
+        for start in range(0, len(candidate) - size + 1):
+            windows.append(candidate[start : start + size])
+    return windows
+
+
+def search_value_fuzzy_match(value: str, keyword: str, case_sensitive: bool) -> bool:
+    """Return typo-tolerant matches against useful tokens without making search too broad."""
+    needle = normalized_search_text(keyword, case_sensitive)
+    if len(needle) < FUZZY_SEARCH_MIN_KEYWORD_LENGTH:
+        return False
+
+    threshold = fuzzy_search_threshold(needle)
+    for candidate in fuzzy_search_candidates(value):
+        normalized_candidate = normalized_search_text(candidate, case_sensitive)
+        if not normalized_candidate:
+            continue
+        comparison_candidates = [normalized_candidate]
+        if not fuzzy_search_length_is_close(needle, normalized_candidate):
+            comparison_candidates = [
+                normalized_search_text(window, case_sensitive)
+                for window in fuzzy_search_windows(candidate, keyword)
+            ]
+        for comparison_candidate in comparison_candidates:
+            if not fuzzy_search_length_is_close(needle, comparison_candidate):
+                continue
+            if difflib.SequenceMatcher(None, needle, comparison_candidate).ratio() >= threshold:
+                return True
+    return False
+
+
+def search_value_matches_keyword(
+    value: str,
+    keyword: str,
+    case_sensitive: bool,
+    fuzzy_search: bool = True,
+) -> bool:
+    """Match one field exactly first, then by typo-tolerant fuzzy logic when enabled."""
+    if search_value_exact_match(value, keyword, case_sensitive):
+        return True
+    return fuzzy_search and search_value_fuzzy_match(value, keyword, case_sensitive)
+
+
 def allrecord_matches_keyword(
     item: dict[str, Any],
     keyword: str,
     case_sensitive: bool,
+    fuzzy_search: bool = True,
 ) -> bool:
-    """Return whether one allrecords entry matches the keyword using local case handling."""
-    needle = keyword if case_sensitive else keyword.lower()
+    """Return whether one allrecords entry matches the keyword by exact or fuzzy text."""
     record_type = allrecord_type(item)
     for value in allrecord_search_values(record_type, item):
-        haystack = value if case_sensitive else value.lower()
-        if needle in haystack:
+        if search_value_matches_keyword(value, keyword, case_sensitive, fuzzy_search):
             return True
     return False
 
@@ -3654,13 +3790,43 @@ def allrecord_search_entry_matches_keyword(
     entry: dict[str, Any],
     keyword: str,
     case_sensitive: bool,
+    fuzzy_search: bool = True,
 ) -> bool:
-    """Apply keyword matching to cached search entries so SQLite and live paths agree."""
-    needle = keyword if case_sensitive else keyword.lower()
+    """Apply exact or fuzzy matching to cached search entries so paths agree."""
     for key in ("name", "value", "comment"):
         value = str(entry.get(key, ""))
-        haystack = value if case_sensitive else value.lower()
-        if needle in haystack:
+        if search_value_matches_keyword(value, keyword, case_sensitive, fuzzy_search):
+            return True
+    return False
+
+
+def allrecord_search_entry_matches_exact_keyword(
+    entry: dict[str, Any],
+    keyword: str,
+    case_sensitive: bool,
+) -> bool:
+    """Return exact substring matches for exclusions and exact-only search mode."""
+    return allrecord_search_entry_matches_keyword(
+        entry,
+        keyword,
+        case_sensitive,
+        fuzzy_search=False,
+    )
+
+
+def normalize_search_exclude_keywords(exclude_keywords: tuple[str, ...]) -> tuple[str, ...]:
+    """Normalize repeated search exclusions while ignoring empty option values."""
+    return tuple(keyword.strip() for keyword in exclude_keywords if keyword.strip())
+
+
+def allrecord_search_entry_matches_any_keyword(
+    entry: dict[str, Any],
+    keywords: tuple[str, ...],
+    case_sensitive: bool,
+) -> bool:
+    """Return whether a search entry exactly matches any exclusion keyword."""
+    for keyword in keywords:
+        if allrecord_search_entry_matches_exact_keyword(entry, keyword, case_sensitive):
             return True
     return False
 
@@ -3721,8 +3887,11 @@ def matching_search_entries_for_zone(
     keyword: str,
     case_sensitive: bool,
     root_zone: str | None,
+    exclude_keywords: tuple[str, ...] = (),
+    fuzzy_search: bool = True,
 ) -> list[dict[str, Any]]:
     """Return matching entries for one zone using cache first, then local keyword filtering."""
+    exclude_keywords = normalize_search_exclude_keywords(exclude_keywords)
     zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
     serial_number = zone_serial(zone_info)
     entries = search_sqlite_allrecords_cache(
@@ -3731,6 +3900,7 @@ def matching_search_entries_for_zone(
         serial_number,
         keyword,
         case_sensitive,
+        fuzzy_search,
     )
     if entries is None:
         entries = read_allrecords_search_cache(client, zone_name, serial_number)
@@ -3741,10 +3911,21 @@ def matching_search_entries_for_zone(
 
     matches = []
     for entry in entries:
-        if not allrecord_search_entry_matches_keyword(entry, keyword, case_sensitive):
+        if not allrecord_search_entry_matches_keyword(
+            entry,
+            keyword,
+            case_sensitive,
+            fuzzy_search,
+        ):
             continue
         record = allrecord_search_entry_record(entry)
         if root_zone and not record_in_zone_scope(record, root_zone):
+            continue
+        if exclude_keywords and allrecord_search_entry_matches_any_keyword(
+            entry,
+            exclude_keywords,
+            case_sensitive,
+        ):
             continue
         matches.append(entry)
     return matches
@@ -3755,10 +3936,13 @@ def collect_dns_search_results(
     keyword: str,
     case_sensitive: bool,
     root_zone: str | None,
+    exclude_keywords: tuple[str, ...] = (),
+    fuzzy_search: bool = True,
     *,
     zone_filter: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     """Collect search results across scoped zones concurrently while deduplicating records."""
+    exclude_keywords = normalize_search_exclude_keywords(exclude_keywords)
     seen: set[str] = set()
     records: list[tuple[str, dict[str, Any]]] = []
     zones = search_zones(client, root_zone)
@@ -3774,6 +3958,8 @@ def collect_dns_search_results(
             keyword,
             case_sensitive,
             root_zone,
+            exclude_keywords,
+            fuzzy_search,
         )
 
     search_entries: list[dict[str, Any]] = []
@@ -4002,6 +4188,8 @@ def run_dns_search(
     keyword: str,
     case_sensitive: bool = False,
     global_search: bool = False,
+    exclude_keywords: tuple[str, ...] = (),
+    fuzzy_search: bool = True,
 ) -> None:
     """Run DNS search from config loading through scoped collection and selected output rendering."""
     config = load_config()
@@ -4009,7 +4197,14 @@ def run_dns_search(
     root_zone = None if global_search else search_root_zone(config)
     if not global_search and output_is_table():
         console.print(dns_context_panel("Current DNS Context"))
-    records = collect_dns_search_results(client, keyword, case_sensitive, root_zone)
+    records = collect_dns_search_results(
+        client,
+        keyword,
+        case_sensitive,
+        root_zone,
+        exclude_keywords,
+        fuzzy_search,
+    )
 
     if not records:
         if output_is_table():
@@ -4993,10 +5188,32 @@ def record_name(item: dict[str, Any]) -> str:
     return str(item.get("name", ""))
 
 
+RECORD_TYPE_STYLES = {
+    "a": "bold green",
+    "aaaa": "bold bright_green",
+    "host": "bold cyan",
+    "cname": "bold magenta",
+    "txt": "bold yellow",
+    "mx": "bold blue",
+    "ptr": "bold bright_blue",
+    "ns": "bold bright_cyan",
+    "soa": "bold bright_magenta",
+    "srv": "bold red",
+}
+
+
+def record_type_style(record_type: str) -> str:
+    """Return a stable Rich style so table output identifies DNS record types at a glance."""
+    normalized_type = str(record_type).strip().lower()
+    if normalized_type.startswith("shared-"):
+        normalized_type = normalized_type.removeprefix("shared-")
+    return RECORD_TYPE_STYLES.get(normalized_type, "dim white")
+
+
 def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = False) -> Table:
-    """Build the Rich DNS record table, showing refs only for ambiguity workflows that need them."""
+    """Build the Rich DNS record table with color-coded types and optional ambiguity refs."""
     table = Table(title=f"DNS Records ({len(records)})", header_style="bold cyan")
-    table.add_column("Type", style="bold", no_wrap=True)
+    table.add_column("Type", no_wrap=True)
     table.add_column("Name", overflow="fold")
     table.add_column("Value", overflow="fold")
     table.add_column("Zone", overflow="fold")
@@ -5007,7 +5224,7 @@ def record_table(records: list[tuple[str, dict[str, Any]]], include_ref: bool = 
 
     for record_type, item in records:
         row = [
-            record_type.upper(),
+            Text(record_type.upper(), style=record_type_style(record_type)),
             record_name(item),
             record_value(record_type, item),
             str(item.get("zone", "")),
@@ -5136,6 +5353,7 @@ def complete_dns_delete_records(
             incomplete.strip(),
             False,
             None,
+            fuzzy_search=False,
             zone_filter=is_forward_zone,
         )
     except (CliError, OSError, ValueError, sqlite3.Error):
@@ -5183,6 +5401,7 @@ def complete_dns_edit_records(
             incomplete.strip(),
             False,
             None,
+            fuzzy_search=False,
             zone_filter=is_forward_zone,
         )
     except (CliError, OSError, ValueError, sqlite3.Error):
@@ -5790,17 +6009,38 @@ def dns_list(zone: str | None) -> None:
 @click.argument("keyword")
 @click.option("-i", "case_sensitive", is_flag=True, help="Use case-sensitive matching.")
 @click.option("-g", "global_search", is_flag=True, help="Search across the active DNS view.")
-def search(keyword: str, case_sensitive: bool, global_search: bool) -> None:
+@click.option(
+    "-f",
+    "exact_only",
+    is_flag=True,
+    help="Disable fuzzy matching; only return exact substring matches.",
+)
+@click.option(
+    "-e",
+    "exclude_keywords",
+    multiple=True,
+    metavar="KEYWORD",
+    help="Exclude records matching KEYWORD. Can be used multiple times.",
+)
+def search(
+    keyword: str,
+    case_sensitive: bool,
+    global_search: bool,
+    exact_only: bool,
+    exclude_keywords: tuple[str, ...],
+) -> None:
     """Search DNS records by name, value, or comment.
 
     Normal search uses the active/default zone as the root and includes child
     authoritative zones. Use `-g` to search the active DNS view globally.
+    Search is typo-tolerant by default; use `-f` for exact-only matching.
     Use `-i` for case-sensitive matching.
+    Use `-e KEYWORD` one or more times to exclude matching records.
 
     Search data is cached under ~/.ib/allrecords-cache and refreshed when the
     zone SOA serial changes.
     """
-    run_dns_search(keyword, case_sensitive, global_search)
+    run_dns_search(keyword, case_sensitive, global_search, exclude_keywords, not exact_only)
 
 
 @dns.command(cls=DnsDeleteCommand)

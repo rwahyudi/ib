@@ -170,7 +170,9 @@ Command overview:
   records.
 - `ib dns edit <name> [a|aaaa|cname|host|mx|ptr|srv|txt] [value]` updates one
   existing DNS record.
-- `ib dns search [-i] [-g] <keyword>` searches records by name, value, or comment.
+- `ib dns search [-i] [-g] [-f] [-e <keyword>]... <keyword>` searches records by
+  name, value, or comment. Fuzzy matching is enabled by default; use `-f` for
+  exact-only matching.
 - `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
   CNAME, TXT, MX, or HOST record.
 - `ib dns delete ptr <ip-address>` deletes a reverse DNS PTR record by full IP address.
@@ -347,7 +349,8 @@ ib dns search app
 
 Normal search uses the active/default zone as the root and includes child
 authoritative zones. If no active/default zone is set, search uses all
-non-secondary zones in the active DNS view.
+non-secondary zones in the active DNS view. Search is typo-tolerant by default
+and still checks exact substring matches first.
 
 Search across the whole active view explicitly:
 
@@ -361,7 +364,24 @@ Use case-sensitive matching:
 ib dns search -i App
 ```
 
-### Caching Architecture
+Disable fuzzy matching for exact-only results:
+
+```bash
+ib dns search app -f
+```
+
+With `-f`, only exact substring matches are returned.
+
+Exclude records matching one or more keywords:
+
+```bash
+ib dns search app -e old -e test
+```
+
+Exclusions use the same record name, value, and comment fields as the search
+keyword. They follow `-i` when case-sensitive matching is enabled.
+
+### Performance Architecture
 
 Search and record completion use a local cache so repeated DNS operations do not
 need to query Infoblox for every request. Results are based on Infoblox
@@ -386,8 +406,8 @@ Successful DNS record or zone updates clear the DNS caches and start a silent
 background prewarm. Cache failures are treated as performance misses: foreground
 commands fall back to live WAPI calls, while shell completion fails quietly.
 
-For the full flow and diagram, see
-[Cache architecture](docs/cache-architecture.md).
+For the full performance flow, parallel worker model, and cache diagram, see
+[Performance architecture](docs/performance-architecture.md).
 
 ## List Records
 

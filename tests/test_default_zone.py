@@ -2436,7 +2436,14 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "collect_dns_search_results", return_value=records) as collect:
                     items = ib.complete_dns_delete_records(None, None, "app")
 
-        collect.assert_called_once_with(client, "app", False, None, zone_filter=ib.is_forward_zone)
+        collect.assert_called_once_with(
+            client,
+            "app",
+            False,
+            None,
+            fuzzy_search=False,
+            zone_filter=ib.is_forward_zone,
+        )
         self.assertEqual([item.value for item in items], ["app.example.com", "www.other.example.net"])
         self.assertNotIn("10.2.0.192.in-addr.arpa", [item.value for item in items])
         self.assertNotIn("example.com", [item.value for item in items])
@@ -3324,6 +3331,24 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertNotIn("ref", data[0])
         self.assertNotIn("No such option", result.output)
 
+    def test_dns_search_accepts_multiple_exclude_keywords(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_search") as run_dns_search:
+            result = runner.invoke(ib.cli, ["dns", "search", "app", "-e", "old", "-e", "test"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_search.assert_called_once_with("app", False, False, ("old", "test"), True)
+
+    def test_dns_search_accepts_exact_only_flag(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_search") as run_dns_search:
+            result = runner.invoke(ib.cli, ["dns", "search", "app", "-f"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_search.assert_called_once_with("app", False, False, (), False)
+
     def test_dns_search_accepts_global_output_option_on_dns_group(self):
         runner = CliRunner()
 
@@ -3506,6 +3531,198 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(table_records, [("cname", cached_record)])
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "records"])
+
+    def test_dns_search_fuzzy_matches_normalized_cache_entries(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        cached_record = {
+            "_ref": "allrecords/printer",
+            "type": "record:a",
+            "name": "printer",
+            "zone": "example.com",
+            "address": "192.0.2.80",
+        }
+        table_records = []
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            if object_type == ib.ZONE_OBJECT:
+                return [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 7}]
+            if object_type == ib.ALLRECORDS_OBJECT:
+                raise AssertionError("fuzzy cache hit should not query allrecords")
+            raise AssertionError(f"unexpected object type: {object_type}")
+
+        def fake_record_table(records):
+            table_records.extend(records)
+            return "records"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_allrecords_cache(
+                    client,
+                    "example.com",
+                    "7",
+                    [cached_record],
+                    [
+                        {
+                            "type": "a",
+                            "zone": "example.com",
+                            "name": "printer.example.com",
+                            "value": "192.0.2.80",
+                            "comment": "main printer",
+                            "record": cached_record,
+                        }
+                    ],
+                )
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                    with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                        with patch.object(ib, "read_session_zone", return_value=None):
+                            with patch.object(ib, "InfobloxClient", return_value=client):
+                                with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                                    with patch.object(ib, "record_table", side_effect=fake_record_table):
+                                        with patch.object(ib, "dns_context_panel", return_value="context"):
+                                            with patch.object(ib.console, "print"):
+                                                ib.run_dns_search("prnter", fuzzy_search=True)
+
+        self.assertEqual(table_records, [("a", cached_record)])
+
+    def test_dns_search_excludes_matching_name_value_or_comment(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        entries = [
+            {
+                "type": "a",
+                "zone": "example.com",
+                "name": "app.example.com",
+                "value": "192.0.2.10",
+                "comment": "production service",
+                "record": {"_ref": "allrecords/app", "name": "app.example.com"},
+            },
+            {
+                "type": "a",
+                "zone": "example.com",
+                "name": "app-old.example.com",
+                "value": "192.0.2.11",
+                "comment": "old service",
+                "record": {"_ref": "allrecords/app-old", "name": "app-old.example.com"},
+            },
+            {
+                "type": "cname",
+                "zone": "example.com",
+                "name": "app-alias.example.com",
+                "value": "legacy.example.net",
+                "comment": "",
+                "record": {"_ref": "allrecords/app-alias", "name": "app-alias.example.com"},
+            },
+        ]
+
+        with patch.object(ib, "search_sqlite_allrecords_cache", return_value=entries):
+            matches = ib.matching_search_entries_for_zone(
+                FakeClient(),
+                {"fqdn": "example.com", "soa_serial_number": 7},
+                "app",
+                False,
+                None,
+                ("old", "legacy"),
+            )
+
+        self.assertEqual([entry["name"] for entry in matches], ["app.example.com"])
+
+    def test_dns_search_exclude_keywords_follow_case_sensitivity(self):
+        entry = {
+            "type": "a",
+            "zone": "example.com",
+            "name": "app.example.com",
+            "value": "192.0.2.10",
+            "comment": "Prod app",
+            "record": {"_ref": "allrecords/app", "name": "app.example.com"},
+        }
+
+        self.assertFalse(
+            ib.allrecord_search_entry_matches_any_keyword(entry, ("prod",), case_sensitive=True)
+        )
+        self.assertTrue(
+            ib.allrecord_search_entry_matches_any_keyword(entry, ("prod",), case_sensitive=False)
+        )
+
+    def test_dns_search_fuzzy_helper_is_typo_tolerant_not_broad(self):
+        self.assertTrue(
+            ib.search_value_matches_keyword(
+                "printer.example.com",
+                "prnter",
+                False,
+                fuzzy_search=True,
+            )
+        )
+        self.assertTrue(
+            ib.search_value_matches_keyword("main printer", "prnter", False, fuzzy_search=True)
+        )
+        self.assertTrue(
+            ib.search_value_matches_keyword("createdbysam", "crated", False, fuzzy_search=True)
+        )
+        self.assertFalse(
+            ib.search_value_matches_keyword("createdbysam", "crated", False, fuzzy_search=False)
+        )
+        self.assertTrue(
+            ib.search_value_matches_keyword(
+                "benjitest.latrobe-test.edu.au",
+                "banji",
+                False,
+                fuzzy_search=True,
+            )
+        )
+        self.assertFalse(
+            ib.search_value_matches_keyword(
+                "benjitest.latrobe-test.edu.au",
+                "banji",
+                False,
+                fuzzy_search=False,
+            )
+        )
+        self.assertFalse(
+            ib.search_value_matches_keyword("router.example.com", "prnter", False, fuzzy_search=True)
+        )
+        self.assertFalse(
+            ib.search_value_matches_keyword("db.example.com", "bd", False, fuzzy_search=True)
+        )
+
+    def test_dns_search_defaults_to_fuzzy_matching(self):
+        entry = {
+            "type": "a",
+            "zone": "example.com",
+            "name": "printer.example.com",
+            "value": "192.0.2.80",
+            "comment": "main printer",
+            "record": {"_ref": "allrecords/printer", "name": "printer.example.com"},
+        }
+
+        self.assertTrue(ib.allrecord_search_entry_matches_keyword(entry, "prnter", False))
+        self.assertTrue(
+            ib.allrecord_search_entry_matches_keyword(
+                entry,
+                "prnter",
+                False,
+                fuzzy_search=True,
+            )
+        )
+        self.assertFalse(
+            ib.allrecord_search_entry_matches_keyword(
+                entry,
+                "prnter",
+                False,
+                fuzzy_search=False,
+            )
+        )
+        self.assertFalse(
+            ib.allrecord_search_entry_matches_any_keyword(entry, ("prnter",), False)
+        )
 
     def test_dns_search_upgrades_legacy_allrecords_cache_to_search_entries(self):
         class FakeClient:
@@ -3758,7 +3975,15 @@ class DefaultZoneTests(unittest.TestCase):
             },
         }
 
-        def fake_matches_for_zone(client, zone_info, keyword, case_sensitive, root_zone):
+        def fake_matches_for_zone(
+            client,
+            zone_info,
+            keyword,
+            case_sensitive,
+            root_zone,
+            exclude_keywords=(),
+            fuzzy_search=False,
+        ):
             zone_name = zone_info["fqdn"]
             return [ib.allrecord_search_entry(records_by_zone[zone_name], zone_name)]
 
@@ -4004,6 +4229,36 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertNotIn("UNSUPPORTED", output)
         self.assertNotIn("record:ns/", output)
         self.assertNotIn(ns_item["_ref"], output)
+
+    def test_record_type_style_maps_common_and_shared_types(self):
+        self.assertEqual(ib.record_type_style("A"), "bold green")
+        self.assertEqual(ib.record_type_style("aaaa"), "bold bright_green")
+        self.assertEqual(ib.record_type_style("HOST"), "bold cyan")
+        self.assertEqual(ib.record_type_style("shared-cname"), "bold magenta")
+        self.assertEqual(ib.record_type_style("srv"), "bold red")
+        self.assertEqual(ib.record_type_style("unsupported"), "dim white")
+
+    def test_record_table_colors_type_cell_only(self):
+        table = ib.record_table(
+            [
+                (
+                    "a",
+                    {
+                        "_ref": "record:a/example",
+                        "name": "app.example.com",
+                        "ipv4addr": "192.0.2.10",
+                        "zone": "example.com",
+                    },
+                )
+            ]
+        )
+
+        type_cell = table.columns[0]._cells[0]
+        name_cell = table.columns[1]._cells[0]
+        self.assertIsInstance(type_cell, ib.Text)
+        self.assertEqual(type_cell.plain, "A")
+        self.assertEqual(str(type_cell.style), "bold green")
+        self.assertEqual(name_cell, "app.example.com")
 
     def test_dns_search_formats_nested_ns_nameserver_value(self):
         ns_item = {
