@@ -512,10 +512,13 @@ def read_config_key() -> bytes:
     try:
         key = CONFIG_KEY_FILE.read_bytes().strip()
         Fernet(key)
-        os.chmod(CONFIG_KEY_FILE, 0o600)
-        return key
     except (OSError, ValueError):
         raise CliError(f"ERROR: invalid encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+    try:
+        os.chmod(CONFIG_KEY_FILE, 0o600)
+    except OSError:
+        pass
+    return key
 
 
 def get_or_create_config_key() -> bytes:
@@ -3582,6 +3585,24 @@ def connect_search_cache_db() -> sqlite3.Connection:
     return conn
 
 
+def connect_search_cache_db_readonly() -> sqlite3.Connection:
+    """Open the existing SQLite cache without schema writes for shell-completion fallbacks."""
+    db_path = urllib.parse.quote(str(allrecords_cache_db_file()), safe="/")
+    last_error: sqlite3.Error | None = None
+    for query in ("mode=ro", "mode=ro&immutable=1"):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?{query}", uri=True, timeout=30)
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+            return conn
+        except sqlite3.Error as exc:
+            last_error = exc
+            if conn is not None:
+                conn.close()
+    raise last_error or sqlite3.OperationalError("unable to open search cache read-only")
+
+
 def normalize_zone_serial_cache(zones: Any) -> list[dict[str, Any]] | None:
     """Validate zone serial cache payloads so corrupt JSON can be ignored safely."""
     if not isinstance(zones, list) or not all(isinstance(zone, dict) for zone in zones):
@@ -6076,6 +6097,114 @@ def dns_delete_completion_excluded_record(record_type: str, item: dict[str, Any]
     )
 
 
+def completion_record_name_matches(item: dict[str, Any], incomplete: str) -> bool:
+    """Match completion candidates by record name only, using the normal case-insensitive substring rule."""
+    keyword = incomplete.strip()
+    return not keyword or search_value_exact_match(record_name(item), keyword, case_sensitive=False)
+
+
+def cached_record_completion_records(
+    client: InfobloxClient,
+    keyword: str,
+    limit: int,
+    zone_filter: Callable[[dict[str, Any]], bool] | None = None,
+    *,
+    name_only: bool = False,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Read cached search rows for shell completion when live cache validation cannot run."""
+    keyword = keyword.strip()
+    params: list[Any] = [client.server, client.wapi_version, client.view]
+    condition_sql = ""
+    if keyword:
+        if name_only:
+            condition_sql = " AND instr(lower(s.name), ?) > 0"
+            params.append(keyword.lower())
+        else:
+            condition, search_params = sqlite_exact_search_condition(keyword, case_sensitive=False)
+            condition_sql = f" AND ({condition})"
+            params.extend(search_params)
+
+    try:
+        with connect_search_cache_db_readonly() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT s.type, s.zone, s.name, s.value, s.comment, s.record_json
+                FROM search_entries s
+                JOIN zone_record_cache z ON z.cache_key = s.cache_key
+                WHERE z.server = ? AND z.wapi_version = ? AND z.view = ?
+                {condition_sql}
+                ORDER BY lower(s.zone), lower(s.name), lower(s.type), lower(s.value), s.record_key
+                """,
+                tuple(params),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return []
+
+    entries = sqlite_search_entries_from_rows(rows)
+    if entries is None:
+        return []
+
+    records: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        zone_name = str(entry.get("zone", ""))
+        if zone_filter is not None and not zone_filter({"fqdn": zone_name}):
+            continue
+        record = dict(allrecord_search_entry_record(entry))
+        if not record:
+            continue
+        record.setdefault("zone", zone_name)
+        record.setdefault("name", str(entry.get("name", "")))
+        record.setdefault("comment", str(entry.get("comment", "")))
+        record_type = allrecord_search_entry_type(entry)
+        if dns_delete_completion_excluded_record(record_type, record):
+            continue
+        if name_only and not completion_record_name_matches(record, keyword):
+            continue
+        record_key = str(record.get("_ref") or json.dumps(record, sort_keys=True))
+        if record_key in seen:
+            continue
+        seen.add(record_key)
+        records.append((record_type, record))
+        if len(records) >= limit:
+            break
+    return records
+
+
+def collect_record_completion_records(
+    client: InfobloxClient,
+    keyword: str,
+    limit: int,
+    *,
+    name_only: bool = False,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Collect forward records for completion, falling back to cached rows when live validation fails."""
+    try:
+        records = collect_dns_search_results(
+            client,
+            keyword.strip(),
+            False,
+            None,
+            fuzzy_search=False,
+            zone_filter=is_forward_zone,
+        )
+        if name_only:
+            records = [
+                (record_type, item)
+                for record_type, item in records
+                if completion_record_name_matches(item, keyword)
+            ]
+        return records
+    except (CliError, OSError, ValueError, sqlite3.Error):
+        return cached_record_completion_records(
+            client,
+            keyword,
+            limit,
+            zone_filter=is_forward_zone,
+            name_only=name_only,
+        )
+
+
 def complete_dns_delete_records(
     ctx: click.Context,
     param: click.Parameter,
@@ -6088,13 +6217,11 @@ def complete_dns_delete_records(
         if not config:
             return items
         client = InfobloxClient(config)
-        records = collect_dns_search_results(
+        records = collect_record_completion_records(
             client,
-            incomplete.strip(),
-            False,
-            None,
-            fuzzy_search=False,
-            zone_filter=is_forward_zone,
+            incomplete,
+            DNS_DELETE_COMPLETION_LIMIT,
+            name_only=True,
         )
     except (CliError, OSError, ValueError, sqlite3.Error):
         return items
@@ -6105,6 +6232,8 @@ def complete_dns_delete_records(
             continue
         name = record_name(item).strip().rstrip(".")
         if not name or name in seen:
+            continue
+        if not completion_record_name_matches(item, incomplete):
             continue
         seen.add(name)
         items.append(CompletionItem(name, help=dns_delete_completion_help(record_type, item)))
@@ -6136,14 +6265,7 @@ def complete_dns_edit_records(
         if not config:
             return items
         client = InfobloxClient(config)
-        records = collect_dns_search_results(
-            client,
-            incomplete.strip(),
-            False,
-            None,
-            fuzzy_search=False,
-            zone_filter=is_forward_zone,
-        )
+        records = collect_record_completion_records(client, incomplete, DNS_EDIT_COMPLETION_LIMIT)
     except (CliError, OSError, ValueError, sqlite3.Error):
         return items
 

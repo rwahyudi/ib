@@ -1230,6 +1230,18 @@ class DefaultZoneTests(unittest.TestCase):
             {"name": "app.example.com", "nested": [{"name": "www.example.com"}]},
         )
 
+    def test_read_config_key_allows_chmod_failure_after_valid_read(self):
+        key = ib.Fernet.generate_key()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.CONFIG_DIR.mkdir(mode=0o700)
+                ib.CONFIG_KEY_FILE.write_bytes(key + b"\n")
+
+                with patch.object(ib.os, "chmod", side_effect=OSError("read only")):
+                    loaded_key = ib.read_config_key()
+
+        self.assertEqual(loaded_key, key)
+
     def test_legacy_default_config_loads_as_default_profile_and_migrates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.config_path_patch(tmpdir):
@@ -2948,7 +2960,7 @@ class DefaultZoneTests(unittest.TestCase):
         fetch.assert_not_called()
         write_cache.assert_not_called()
 
-    def test_dns_delete_completion_searches_global_records(self):
+    def test_dns_delete_completion_matches_record_names_only(self):
         class FakeClient:
             view = "corp"
 
@@ -2971,6 +2983,16 @@ class DefaultZoneTests(unittest.TestCase):
                     "name": "www.other.example.net",
                     "zone": "other.example.net",
                     "record": {"canonical": "app.example.com"},
+                },
+            ),
+            (
+                "txt",
+                {
+                    "type": "record:txt",
+                    "name": "spf.other.example.net",
+                    "zone": "other.example.net",
+                    "text": "allowed-app-service",
+                    "comment": "app owner",
                 },
             ),
             (
@@ -3025,7 +3047,9 @@ class DefaultZoneTests(unittest.TestCase):
             fuzzy_search=False,
             zone_filter=ib.is_forward_zone,
         )
-        self.assertEqual([item.value for item in items], ["app.example.com", "www.other.example.net"])
+        self.assertEqual([item.value for item in items], ["app.example.com"])
+        self.assertNotIn("www.other.example.net", [item.value for item in items])
+        self.assertNotIn("spf.other.example.net", [item.value for item in items])
         self.assertNotIn("10.2.0.192.in-addr.arpa", [item.value for item in items])
         self.assertNotIn("example.com", [item.value for item in items])
         self.assertNotIn("shared.example.com", [item.value for item in items])
@@ -3110,6 +3134,79 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(queried_zones, ["example.com"])
         self.assertEqual([item.value for item in items], ["app.example.com"])
+
+    def test_dns_delete_completion_uses_cached_rows_when_live_validation_fails(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        records = [
+            {
+                "_ref": "allrecords/app",
+                "type": "record:a",
+                "name": "app.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.10",
+                "comment": "web",
+            },
+            {
+                "_ref": "allrecords/web",
+                "type": "record:cname",
+                "name": "web.example.com",
+                "zone": "example.com",
+                "record": {"canonical": "app.example.com"},
+                "comment": "app owner",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_allrecords_cache(client, "example.com", "1", records)
+                with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(
+                            ib,
+                            "collect_dns_search_results",
+                            side_effect=ib.CliError("ERROR: offline"),
+                        ):
+                            items = ib.complete_dns_delete_records(None, None, "app")
+
+        self.assertEqual([item.value for item in items], ["app.example.com"])
+        self.assertNotIn("web.example.com", [item.value for item in items])
+        self.assertIn("192.0.2.10", items[0].help)
+
+    def test_dns_delete_empty_completion_uses_cached_rows_when_live_validation_fails(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        records = [
+            {
+                "_ref": "allrecords/app",
+                "type": "record:a",
+                "name": "app.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.10",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_allrecords_cache(client, "example.com", "1", records)
+                with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(
+                            ib,
+                            "collect_dns_search_results",
+                            side_effect=ib.CliError("ERROR: offline"),
+                        ):
+                            items = ib.complete_dns_delete_records(None, None, "")
+
+        self.assertEqual([item.value for item in items], ["ptr", "app.example.com"])
 
     def test_dns_delete_second_argument_does_not_complete_zones_for_ptr_mode(self):
         class FakeContext:
@@ -5331,6 +5428,18 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIs(
             self.original_shell_complete(dns_edit.params[1]),
             ib.complete_dns_edit_record_types,
+        )
+
+    def test_dns_delete_uses_record_name_completion(self):
+        dns_delete = ib.dns.commands["delete"]
+
+        self.assertIs(
+            self.original_shell_complete(dns_delete.params[0]),
+            ib.complete_dns_delete_records,
+        )
+        self.assertIs(
+            self.original_shell_complete(dns_delete.params[1]),
+            ib.complete_dns_delete_zone_or_ip,
         )
 
     def test_dns_edit_type_completion_only_suggests_existing_record_type(self):
