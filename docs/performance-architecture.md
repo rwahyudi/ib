@@ -61,7 +61,7 @@ Background prewarm uses the same zone-level worker model. The hidden
 `ib _prewarm-search-cache` command scans either the global forward-zone set or
 the scoped zone set selected by `ib dns zone use <zone>`, then warms each zone
 cache concurrently, also capped by `DNS_SEARCH_WORKERS`. It uses the normal zone
-serial stale-while-revalidate path, so a hidden serial-only refresh starts only
+serial stale-while-revalidate path, so a hidden zone metadata refresh starts only
 when cached serial metadata is stale enough to revalidate.
 
 ## WAPI Connection Pooling
@@ -121,17 +121,18 @@ avoids querying the full zone list again.
 
 From 31 through 330 seconds, the serial list enters stale-while-revalidate.
 Foreground commands keep using the cached serial list immediately and start a
-hidden serial-only refresh:
+hidden zone metadata refresh:
 
 ```text
 ib _refresh-zone-serial-cache
 ```
 
-That hidden refresh updates only serial metadata. It does not rebuild record
-caches and does not use the 10-worker search pool because the serial refresh is a
-single zone-list query. While that refresh lock is active, new foreground zone
-serial reads keep serving the existing cached zone list immediately, even if that
-cache has just passed the normal stale-while-revalidate max age.
+That hidden refresh first fetches zone serial metadata. When it detects changed
+SOA serials for authoritative zones, it acquires `prewarm.lock` before publishing
+the newer serial metadata, then refreshes only those changed zones' record caches
+in the same background process. While that refresh lock is active, new foreground
+zone serial reads keep serving the existing cached zone list immediately, even if
+that cache has just passed the normal stale-while-revalidate max age.
 
 If the serial cache is missing, corrupt, or older than 330 seconds, `ib` refreshes
 serial metadata synchronously before continuing. This prevents very old serial
@@ -170,7 +171,8 @@ When `prewarm.lock` shows a live background warmer, foreground allrecords-backed
 commands do not start their own live record fetches. They serve whatever cached
 SQLite rows are already available, even if the row serial is older than current
 zone metadata, and return no matches for zones that are not cached yet. The
-prewarmer remains responsible for bringing those rows current.
+prewarmer or hidden serial refresh remains responsible for bringing those rows
+current.
 
 ## Completion Performance
 

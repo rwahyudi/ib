@@ -3124,6 +3124,90 @@ class DefaultZoneTests(unittest.TestCase):
         write_cache.assert_called_once_with(client, zones)
         release_lock.assert_called_once_with(client, (123, "token"))
 
+    def test_zone_serial_cache_revalidation_warms_changed_record_cache_under_lock(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        old_zones = [
+            {"fqdn": "changed.example.com", "primary_type": "Grid", "soa_serial_number": 1},
+            {"fqdn": "same.example.com", "primary_type": "Grid", "soa_serial_number": 5},
+            {"fqdn": "secondary.example.com", "primary_type": "External", "soa_serial_number": 1},
+        ]
+        new_zones = [
+            {"fqdn": "changed.example.com", "primary_type": "Grid", "soa_serial_number": 2},
+            {"fqdn": "same.example.com", "primary_type": "Grid", "soa_serial_number": 5},
+            {"fqdn": "secondary.example.com", "primary_type": "External", "soa_serial_number": 2},
+        ]
+        events = []
+
+        def acquire_record_lock():
+            events.append("record-lock")
+            return (456, "record-token")
+
+        def write_cache(client, zones):
+            events.append("serial-write")
+
+        def warm_zones(client, zones):
+            events.append(("warm", [zone["fqdn"] for zone in zones]))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_zone_serial_cache(client, old_zones)
+                with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(
+                            ib,
+                            "acquire_zone_serial_cache_revalidate_lock",
+                            return_value=(123, "serial-token"),
+                        ):
+                            with patch.object(ib, "release_zone_serial_cache_revalidate_lock"):
+                                with patch.object(ib, "fetch_zone_serials", return_value=new_zones):
+                                    with patch.object(ib, "acquire_search_cache_prewarm_lock", side_effect=acquire_record_lock):
+                                        with patch.object(ib, "release_search_cache_prewarm_lock") as release_record:
+                                            with patch.object(ib, "write_zone_serial_cache", side_effect=write_cache) as write_serial:
+                                                with patch.object(ib, "warm_search_cache_zones", side_effect=warm_zones) as warm_cache:
+                                                    ib.run_zone_serial_cache_revalidation()
+
+        self.assertEqual(
+            events,
+            ["record-lock", "serial-write", ("warm", ["changed.example.com"])],
+        )
+        write_serial.assert_called_once_with(client, new_zones)
+        warm_cache.assert_called_once()
+        release_record.assert_called_once_with((456, "record-token"))
+
+    def test_zone_serial_cache_revalidation_defers_changed_serials_without_record_lock(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        old_zones = [{"fqdn": "changed.example.com", "primary_type": "Grid", "soa_serial_number": 1}]
+        new_zones = [{"fqdn": "changed.example.com", "primary_type": "Grid", "soa_serial_number": 2}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_zone_serial_cache(client, old_zones)
+                with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                    with patch.object(ib, "InfobloxClient", return_value=client):
+                        with patch.object(
+                            ib,
+                            "acquire_zone_serial_cache_revalidate_lock",
+                            return_value=(123, "serial-token"),
+                        ):
+                            with patch.object(ib, "release_zone_serial_cache_revalidate_lock"):
+                                with patch.object(ib, "fetch_zone_serials", return_value=new_zones):
+                                    with patch.object(ib, "acquire_search_cache_prewarm_lock", return_value=None):
+                                        with patch.object(ib, "write_zone_serial_cache") as write_serial:
+                                            with patch.object(ib, "warm_search_cache_zones") as warm_cache:
+                                                ib.run_zone_serial_cache_revalidation()
+
+        write_serial.assert_not_called()
+        warm_cache.assert_not_called()
+
     def test_zone_serial_cache_revalidation_skips_when_fresh_lock_exists(self):
         class FakeClient:
             server = "https://infoblox.example.com"

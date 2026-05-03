@@ -384,14 +384,17 @@ fetches while the warmer owns refresh.
 `ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
 `ib dns zone use <zone>` starts a silent scoped warm for that zone and its child
 authoritative zones. Warmers use the same zone serial stale-while-revalidate
-path as foreground search, so a hidden serial-only metadata refresh starts only
-when the cached serial metadata is stale enough to revalidate. While that hidden
-serial refresh is running, new requests keep serving the existing cached zone
-list immediately. Successful DNS record or zone updates clear the DNS caches and
-start a silent background prewarm. Cache failures are treated as performance
-misses: foreground commands fall back to live WAPI calls, while shell completion
-fails quietly. Zone-name completion can serve stale cached names for 48 hours
-after the 300-second fresh window while a hidden refresh updates the cache.
+path as foreground search, so a hidden zone metadata refresh starts only when
+the cached serial metadata is stale enough to revalidate. While that hidden
+refresh is running, new requests keep serving the existing cached zone list
+immediately. If the hidden refresh finds changed SOA serials, it takes the record
+prewarm lock before publishing the newer serial metadata and refreshes only the
+changed zones' record caches in the background. Successful DNS record or
+zone updates clear the DNS caches and start a silent background prewarm. Cache
+failures are treated as performance misses: foreground commands fall back to live
+WAPI calls, while shell completion fails quietly. Zone-name completion can serve
+stale cached names for 48 hours after the 300-second fresh window while a hidden
+refresh updates the cache.
 
 For the full performance flow, parallel worker model, and cache diagram, see
 [Performance architecture](docs/performance-architecture.md).

@@ -3739,6 +3739,44 @@ def zone_serial_cache_revalidation_is_running(client: InfobloxClient) -> bool:
     return not search_cache_prewarm_lock_is_stale(zone_serial_cache_revalidate_lock_file(client))
 
 
+def zone_serials_by_name(zones: list[dict[str, Any]]) -> dict[str, str]:
+    """Map normalized zone names to serials so refresh can detect changed zones."""
+    serials: dict[str, str] = {}
+    for zone in zones:
+        try:
+            zone_name = normalize_zone_name(str(zone.get("fqdn", "")))
+        except CliError:
+            continue
+        serial_number = zone_serial(zone)
+        if serial_number is None:
+            continue
+        serials[zone_name] = serial_number
+    return serials
+
+
+def zones_with_changed_serials(
+    old_zones: list[dict[str, Any]] | None,
+    new_zones: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return non-secondary zones whose serial changed between cached and refreshed metadata."""
+    if old_zones is None:
+        return []
+    old_serials = zone_serials_by_name(old_zones)
+    changed_zones: list[dict[str, Any]] = []
+    for zone in new_zones:
+        if is_secondary_zone(zone):
+            continue
+        try:
+            zone_name = normalize_zone_name(str(zone.get("fqdn", "")))
+        except CliError:
+            continue
+        old_serial = old_serials.get(zone_name)
+        new_serial = zone_serial(zone)
+        if old_serial is not None and new_serial is not None and old_serial != new_serial:
+            changed_zones.append(zone)
+    return sorted(changed_zones, key=lambda zone: str(zone.get("fqdn", "")).lower())
+
+
 def write_zone_serial_cache(client: InfobloxClient, zones: list[dict[str, Any]]) -> None:
     """Persist zone serials for later cache validation and tolerate cache write failures."""
     try:
@@ -5224,10 +5262,11 @@ def release_zone_completion_cache_revalidate_lock(
         pass
 
 
-def warm_search_cache(client: InfobloxClient, root_zone: str | None = None) -> None:
-    """Warm search cache for all zones or for one zone scope when a root is supplied."""
-    zones = search_zones(client, root_zone)
-
+def warm_search_cache_zones(
+    client: InfobloxClient,
+    zones: list[dict[str, Any]],
+) -> None:
+    """Warm search cache for an explicit zone list already selected by the caller."""
     def warm_zone(zone_info: dict[str, Any]) -> None:
         """Warm cache for one zone in the background prewarm pool so later completions/searches are faster."""
         try:
@@ -5245,6 +5284,11 @@ def warm_search_cache(client: InfobloxClient, root_zone: str | None = None) -> N
             list(executor.map(warm_zone, zones))
     elif zones:
         warm_zone(zones[0])
+
+
+def warm_search_cache(client: InfobloxClient, root_zone: str | None = None) -> None:
+    """Warm search cache for all zones or for one zone scope when a root is supplied."""
+    warm_search_cache_zones(client, search_zones(client, root_zone))
 
 
 def warm_global_search_cache(client: InfobloxClient) -> None:
@@ -5317,8 +5361,9 @@ def start_search_cache_prewarm(zone_name: str | None = None) -> None:
 
 
 def run_zone_serial_cache_revalidation() -> None:
-    """Refresh only the zone serial cache behind SWR without rebuilding record caches."""
+    """Refresh zone serials behind SWR and warm changed record caches in the background."""
     lock: tuple[int, str] | None = None
+    record_lock: tuple[int, str] | None = None
     client: InfobloxClient | None = None
     try:
         config = load_config(required=False)
@@ -5328,16 +5373,30 @@ def run_zone_serial_cache_revalidation() -> None:
         lock = acquire_zone_serial_cache_revalidate_lock(client)
         if lock is None:
             return
-        write_zone_serial_cache(client, fetch_zone_serials(client))
+        old_cache = read_zone_serial_cache(client, allow_expired=True)
+        new_zones = fetch_zone_serials(client)
+        changed_zones = zones_with_changed_serials(
+            old_cache.zones if old_cache is not None else None,
+            new_zones,
+        )
+        if changed_zones:
+            record_lock = acquire_search_cache_prewarm_lock()
+            if record_lock is None:
+                return
+        write_zone_serial_cache(client, new_zones)
+        if changed_zones:
+            warm_search_cache_zones(client, changed_zones)
     except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
         return
     finally:
+        if record_lock is not None:
+            release_search_cache_prewarm_lock(record_lock)
         if lock is not None and client is not None:
             release_zone_serial_cache_revalidate_lock(client, lock)
 
 
 def start_zone_serial_cache_revalidation() -> None:
-    """Start a hidden serial-only cache refresh when cached serial metadata enters SWR."""
+    """Start a hidden zone-serial refresh when cached serial metadata enters SWR."""
     env = os.environ.copy()
     env.pop("_IB_COMPLETE", None)
     try:
