@@ -31,13 +31,7 @@ pipx ensurepath
 Upgrade later with:
 
 ```bash
-# Linux / macOS
 (cd /tmp && pipx upgrade ib)
-```
-
-```powershell
-# Windows PowerShell
-Push-Location $env:TEMP; pipx upgrade ib; Pop-Location
 ```
 
 Running the upgrade from a neutral directory avoids `pipx` treating a local
@@ -49,8 +43,6 @@ If `pipx` is unavailable, use the Python user install path:
 python3 -m pip install --user git+https://github.com/rwahyudi/ib.git
 python3 -m pip install --user --upgrade git+https://github.com/rwahyudi/ib.git
 ```
-
-On Windows, use `py -m pip` in place of `python3 -m pip`.
 
 For development from a local checkout, run from the repository root:
 
