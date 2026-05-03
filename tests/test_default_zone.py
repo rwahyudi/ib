@@ -1517,17 +1517,49 @@ class DefaultZoneTests(unittest.TestCase):
     def test_configure_new_prompts_for_profile_name_when_omitted(self):
         runner = CliRunner()
 
-        with patch.object(ib, "prompt_text", return_value=" prompted-prof ") as prompt_text:
-            with patch.object(ib, "save_config_interactive") as save_config:
-                result = runner.invoke(ib.cli, ["config", "new", "--default"])
+        with patch.object(ib, "save_config_interactive") as save_config:
+            result = runner.invoke(ib.cli, ["config", "new", "--default"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        prompt_text.assert_called_once_with("Profile name")
         save_config.assert_called_once_with(
-            "prompted-prof",
+            None,
             create=True,
             make_default=True,
         )
+
+    def test_configure_new_prompts_for_profile_name_under_banner(self):
+        runner = CliRunner()
+        events = []
+
+        def fake_console_print(*args, **kwargs):
+            events.append("banner")
+
+        def fake_prompt_text(label, default=None):
+            events.append(label)
+            values = {
+                "Profile name": " prompted-prof ",
+                "Infoblox server": "https://new.example.com",
+                "Username": "new-user",
+            }
+            return values[label]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib.console, "print", side_effect=fake_console_print):
+                    with patch.object(ib, "prompt_text", side_effect=fake_prompt_text):
+                        with patch.object(ib, "prompt_password", return_value="new-secret"):
+                            with patch.object(ib.Prompt, "ask", side_effect=["v2.12.3", "corp"]):
+                                with patch.object(ib.Confirm, "ask", side_effect=[True, False]):
+                                    with patch.object(ib, "require_infoblox_connection_for_config"):
+                                        with patch.object(
+                                            ib,
+                                            "query_dns_view_names_for_config",
+                                            return_value=["corp"],
+                                        ):
+                                            result = runner.invoke(ib.cli, ["config", "new"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(events[:3], ["banner", "Profile name", "Infoblox server"])
 
     def test_prompt_new_profile_name_reprompts_until_name_is_valid(self):
         with patch.object(
@@ -1557,13 +1589,17 @@ class DefaultZoneTests(unittest.TestCase):
                         with patch.object(ib.Confirm, "ask", side_effect=[True, False]):
                             with patch.object(
                                 ib,
-                                "query_dns_view_names_for_config",
-                                return_value=["default", "new-view"],
-                            ) as query_views:
-                                result = runner.invoke(
-                                    ib.cli,
-                                    ["config", "new", "new-prof", "--default"],
-                                )
+                                "require_infoblox_connection_for_config",
+                            ) as connection_test:
+                                with patch.object(
+                                    ib,
+                                    "query_dns_view_names_for_config",
+                                    return_value=["default", "new-view"],
+                                ) as query_views:
+                                    result = runner.invoke(
+                                        ib.cli,
+                                        ["config", "new", "new-prof", "--default"],
+                                    )
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1579,6 +1615,37 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(query_config["password"], "new-secret")
         self.assertEqual(query_config["wapi_version"], "v2.12.3")
         self.assertEqual(query_config["verify_ssl"], "true")
+        connection_test.assert_called_once()
+        self.assertEqual(connection_test.call_args.args[0], query_config)
+
+    def test_configure_new_connection_failure_exits_before_dns_view_prompt(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
+                    with patch.object(ib, "prompt_password", return_value="new-secret"):
+                        with patch.object(ib.Prompt, "ask", return_value="v2.12.3"):
+                            with patch.object(ib.Confirm, "ask", return_value=True):
+                                with patch.object(
+                                    ib,
+                                    "require_infoblox_connection_for_config",
+                                    side_effect=ib.CliError(
+                                        "ERROR: Infoblox connection test failed (HTTP 401): authentication failed"
+                                    ),
+                                ):
+                                    with patch.object(
+                                        ib,
+                                        "query_dns_view_names_for_config",
+                                    ) as query_views:
+                                        result = runner.invoke(
+                                            ib.cli,
+                                            ["config", "new", "new-prof"],
+                                        )
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIsInstance(result.exception, ib.CliError)
+        self.assertIn("HTTP 401", str(result.exception))
+        query_views.assert_not_called()
 
     def test_configure_new_falls_back_to_manual_dns_view_when_lookup_fails(self):
         runner = CliRunner()
@@ -1591,15 +1658,16 @@ class DefaultZoneTests(unittest.TestCase):
                         side_effect=["new-secret", "v2.12.3", "manual-view"],
                     ):
                         with patch.object(ib.Confirm, "ask", side_effect=[True, False]):
-                            with patch.object(
-                                ib,
-                                "query_dns_view_names_for_config",
-                                side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
-                            ):
-                                result = runner.invoke(
-                                    ib.cli,
-                                    ["config", "new", "new-prof"],
-                                )
+                            with patch.object(ib, "require_infoblox_connection_for_config"):
+                                with patch.object(
+                                    ib,
+                                    "query_dns_view_names_for_config",
+                                    side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
+                                ):
+                                    result = runner.invoke(
+                                        ib.cli,
+                                        ["config", "new", "new-prof"],
+                                    )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1618,15 +1686,16 @@ class DefaultZoneTests(unittest.TestCase):
                         side_effect=["new-secret", "v2.12.3", "corp", "new.example.com"],
                     ):
                         with patch.object(ib.Confirm, "ask", return_value=False):
-                            with patch.object(
-                                ib,
-                                "query_dns_view_names_for_config",
-                                return_value=["corp", "default"],
-                            ) as query_views:
-                                result = runner.invoke(
-                                    ib.cli,
-                                    ["config", "new", "default", "--default"],
-                                )
+                            with patch.object(ib, "require_infoblox_connection_for_config"):
+                                with patch.object(
+                                    ib,
+                                    "query_dns_view_names_for_config",
+                                    return_value=["corp", "default"],
+                                ) as query_views:
+                                    result = runner.invoke(
+                                        ib.cli,
+                                        ["config", "new", "default", "--default"],
+                                    )
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1652,20 +1721,21 @@ class DefaultZoneTests(unittest.TestCase):
                         side_effect=["new-secret", "v2.12.3", "corp", "example", "1"],
                     ):
                         with patch.object(ib.Confirm, "ask", side_effect=[True, True]) as confirm_ask:
-                            with patch.object(
-                                ib,
-                                "query_dns_view_names_for_config",
-                                return_value=["corp"],
-                            ):
+                            with patch.object(ib, "require_infoblox_connection_for_config"):
                                 with patch.object(
                                     ib,
-                                    "query_default_zone_candidates_for_config",
-                                    return_value=ib.selectable_zone_records(zones),
-                                ) as query_zones:
-                                    result = runner.invoke(
-                                        ib.cli,
-                                        ["config", "new", "new-prof"],
-                                    )
+                                    "query_dns_view_names_for_config",
+                                    return_value=["corp"],
+                                ):
+                                    with patch.object(
+                                        ib,
+                                        "query_default_zone_candidates_for_config",
+                                        return_value=ib.selectable_zone_records(zones),
+                                    ) as query_zones:
+                                        result = runner.invoke(
+                                            ib.cli,
+                                            ["config", "new", "new-prof"],
+                                        )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1692,20 +1762,21 @@ class DefaultZoneTests(unittest.TestCase):
                         ],
                     ):
                         with patch.object(ib.Confirm, "ask", side_effect=[True, True]):
-                            with patch.object(
-                                ib,
-                                "query_dns_view_names_for_config",
-                                return_value=["corp"],
-                            ):
+                            with patch.object(ib, "require_infoblox_connection_for_config"):
                                 with patch.object(
                                     ib,
-                                    "query_default_zone_candidates_for_config",
-                                    side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
+                                    "query_dns_view_names_for_config",
+                                    return_value=["corp"],
                                 ):
-                                    result = runner.invoke(
-                                        ib.cli,
-                                        ["config", "new", "new-prof"],
-                                    )
+                                    with patch.object(
+                                        ib,
+                                        "query_default_zone_candidates_for_config",
+                                        side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
+                                    ):
+                                        result = runner.invoke(
+                                            ib.cli,
+                                            ["config", "new", "new-prof"],
+                                        )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1854,6 +1925,104 @@ class DefaultZoneTests(unittest.TestCase):
             ib.dns_view_query_params(),
             warn_on_skip=False,
         )
+
+    def test_config_connection_test_uses_grid_object_and_closes_client(self):
+        class FakeClient:
+            def __init__(self):
+                self.closed = False
+                self.request_args = None
+
+            def request(self, method, object_type, params=None, payload=None):
+                self.request_args = (method, object_type, params, payload)
+                return [{"name": "Grid"}]
+
+            def close(self):
+                self.closed = True
+
+        client = FakeClient()
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "default",
+        }
+
+        with patch.object(ib, "InfobloxClient", return_value=client) as client_factory:
+            ib.test_infoblox_connection_for_config(config)
+
+        client_factory.assert_called_once_with(config)
+        self.assertEqual(
+            client.request_args,
+            (
+                "GET",
+                ib.CONFIG_CONNECTION_TEST_OBJECT,
+                ib.config_connection_test_params(),
+                None,
+            ),
+        )
+        self.assertTrue(client.closed)
+
+    def test_require_infoblox_connection_for_config_uses_spinner(self):
+        events = []
+
+        class FakeSpinner:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit")
+                return False
+
+        config = {"server": "https://infoblox.example.com"}
+
+        with patch.object(ib, "print_note", side_effect=lambda message: events.append("note")) as print_note:
+            with patch.object(
+                ib,
+                "print_success",
+                side_effect=lambda message: events.append("success"),
+            ) as print_success:
+                with patch.object(ib, "infoblox_wait_spinner", return_value=FakeSpinner()) as spinner:
+                    with patch.object(
+                        ib,
+                        "test_infoblox_connection_for_config",
+                        side_effect=lambda config_values: events.append("body"),
+                    ) as connection_test:
+                        ib.require_infoblox_connection_for_config(config)
+
+        print_note.assert_called_once_with("Testing Infoblox connection before saving profile...")
+        print_success.assert_called_once_with("SUCCESS: Infoblox connection test successful.")
+        spinner.assert_called_once_with("Testing Infoblox connection")
+        connection_test.assert_called_once_with(config)
+        self.assertEqual(events, ["note", "enter", "body", "exit", "success"])
+
+    def test_require_infoblox_connection_for_config_reports_http_status(self):
+        class FakeSpinner:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+        with patch.object(ib, "print_note"):
+            with patch.object(ib, "print_success") as print_success:
+                with patch.object(ib, "infoblox_wait_spinner", return_value=FakeSpinner()):
+                    with patch.object(
+                        ib,
+                        "test_infoblox_connection_for_config",
+                        side_effect=ib.WapiError(
+                            "ERROR: Infoblox WAPI 401: authentication failed",
+                            status=401,
+                        ),
+                    ):
+                        with self.assertRaisesRegex(
+                            ib.CliError,
+                            r"connection test failed \(HTTP 401\): authentication failed",
+                        ):
+                            ib.require_infoblox_connection_for_config({"server": "https://bad.example.com"})
+
+        print_success.assert_not_called()
 
     def test_configure_edit_updates_existing_profile_and_keeps_blank_password(self):
         runner = CliRunner()

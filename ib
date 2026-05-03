@@ -151,6 +151,8 @@ ZONE_OBJECT = "zone_auth"
 ZONE_RETURN_FIELDS = "fqdn,view,zone_format,comment,ns_group"
 DNS_VIEW_OBJECT = "view"
 DNS_VIEW_RETURN_FIELDS = "name"
+CONFIG_CONNECTION_TEST_OBJECT = "grid"
+CONFIG_CONNECTION_TEST_RETURN_FIELDS = "name"
 BASE_ZONE_DETAIL_RETURN_FIELDS = (
     f"{ZONE_RETURN_FIELDS},member_soa_mnames,soa_email,soa_expire,soa_negative_ttl,"
     "soa_refresh,soa_retry,soa_serial_number"
@@ -799,6 +801,55 @@ def query_dns_view_names_for_config(config_values: dict[str, str]) -> list[str]:
         client.close()
 
 
+def config_connection_test_params() -> dict[str, Any]:
+    """Build the small WAPI query used to verify new profile connectivity."""
+    return {
+        "_return_fields": CONFIG_CONNECTION_TEST_RETURN_FIELDS,
+        "_max_results": 1,
+    }
+
+
+def test_infoblox_connection_for_config(config_values: dict[str, str]) -> None:
+    """Verify that the unsaved profile values can authenticate and reach WAPI."""
+    client = InfobloxClient(config_values)
+    try:
+        client.request(
+            "GET",
+            CONFIG_CONNECTION_TEST_OBJECT,
+            params=config_connection_test_params(),
+        )
+    finally:
+        client.close()
+
+
+def strip_error_prefix(message: str) -> str:
+    """Remove the standard CLI error prefix when composing a more specific error."""
+    return re.sub(r"^ERROR:\s*", "", message.strip())
+
+
+def config_connection_failure_message(exc: BaseException) -> str:
+    """Format connection-test failures with the HTTP status code when WAPI supplied one."""
+    detail = strip_error_prefix(str(exc))
+    status = getattr(exc, "status", None)
+    if status is not None:
+        wapi_prefix = f"Infoblox WAPI {status}: "
+        if detail.startswith(wapi_prefix):
+            detail = detail[len(wapi_prefix) :]
+        return f"ERROR: Infoblox connection test failed (HTTP {status}): {detail}"
+    return f"ERROR: Infoblox connection test failed: {detail}"
+
+
+def require_infoblox_connection_for_config(config_values: dict[str, str]) -> None:
+    """Run the new-profile connection test with wait UI and stop setup on failure."""
+    try:
+        print_note("Testing Infoblox connection before saving profile...")
+        with infoblox_wait_spinner("Testing Infoblox connection"):
+            test_infoblox_connection_for_config(config_values)
+        print_success("SUCCESS: Infoblox connection test successful.")
+    except (CliError, OSError, ValueError) as exc:
+        raise CliError(config_connection_failure_message(exc)) from exc
+
+
 def render_dns_view_choices(view_names: list[str]) -> None:
     """Show fetched DNS views in a compact table so users can choose from real Infoblox data."""
     table = Table(title="Available DNS Views", show_header=True)
@@ -1126,12 +1177,14 @@ def save_config_interactive(
     else:
         default_profile, profiles = DEFAULT_PROFILE_NAME, {}
 
-    selected_profile = normalize_profile_name(profile_name or default_profile)
-    is_new_profile = create or selected_profile not in profiles
-    if create and selected_profile in profiles:
-        raise CliError(f"ERROR: profile '{selected_profile}' already exists.")
-    if not create and selected_profile not in profiles and (profiles or profile_name is not None):
-        raise CliError(f"ERROR: profile '{selected_profile}' does not exist.")
+    if create:
+        selected_profile = normalize_profile_name(profile_name) if profile_name is not None else None
+        if selected_profile in profiles:
+            raise CliError(f"ERROR: profile '{selected_profile}' already exists.")
+    else:
+        selected_profile = normalize_profile_name(profile_name or default_profile)
+        if selected_profile not in profiles and (profiles or profile_name is not None):
+            raise CliError(f"ERROR: profile '{selected_profile}' does not exist.")
 
     had_profiles = bool(profiles)
     current = {} if create else dict(profiles.get(selected_profile, {}))
@@ -1141,16 +1194,27 @@ def save_config_interactive(
         except CliError as exc:
             print_warning(str(exc))
             current.pop("password", None)
+    is_new_profile = create or selected_profile not in profiles
     profile_action = "Create" if is_new_profile else "Edit"
+    profile_label = (
+        f"profile [bold]{selected_profile}[/bold]"
+        if selected_profile is not None
+        else "a new profile"
+    )
     console.print(
         Panel.fit(
-            f"{profile_action} profile [bold]{selected_profile}[/bold] in [bold]{CONFIG_FILE}[/bold].\n"
+            f"{profile_action} {profile_label} in [bold]{CONFIG_FILE}[/bold].\n"
             "You can run this multiple times; existing values are shown as defaults.\n"
             "Press Enter to keep a value, or leave the password blank to keep it unchanged.",
             title="Infoblox Configuration",
             border_style="cyan",
         )
     )
+
+    if create and selected_profile is None:
+        selected_profile = prompt_new_profile_name()
+        if selected_profile in profiles:
+            raise CliError(f"ERROR: profile '{selected_profile}' already exists.")
 
     server = normalize_server(prompt_text("Infoblox server", current.get("server")))
     username = prompt_text("Username", current.get("username"))
@@ -1181,6 +1245,7 @@ def save_config_interactive(
         "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
     }
     if is_new_profile:
+        require_infoblox_connection_for_config(probe_config)
         dns_view = prompt_dns_view_from_infoblox(
             probe_config,
             current.get("dns_view", "default"),
@@ -7231,8 +7296,7 @@ def config(ctx: click.Context) -> None:
 @click.option("--default", "make_default", is_flag=True, help="Make this profile the default.")
 def configure_new(profile_name: str | None, make_default: bool) -> None:
     """Create a profile, choose a live DNS view, and pick an optional default zone."""
-    selected_profile = profile_name if profile_name is not None else prompt_new_profile_name()
-    save_config_interactive(selected_profile, create=True, make_default=make_default)
+    save_config_interactive(profile_name, create=True, make_default=make_default)
 
 
 @config.command("edit")

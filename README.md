@@ -69,10 +69,13 @@ then asks for:
 - DNS view
 - Default DNS zone
 
-When a new profile is created, `ib config new` connects to Infoblox with the
-entered credentials and lists available DNS views so you can select one. If the
-DNS view lookup fails, the command falls back to manual DNS view entry and still
-saves the profile.
+When a new profile is created, `ib config new` shows a connection-test indicator
+and connects to Infoblox with the entered credentials immediately after the SSL
+verification prompt. If the connection test fails, the command prints the WAPI
+status code when Infoblox returns one and exits without saving the profile.
+After a successful connection test, it lists available DNS views so you can
+select one. If the DNS view lookup fails, the command falls back to manual DNS
+view entry and still saves the profile.
 
 Profile setup also asks whether to configure a default DNS zone, with yes as the
 default answer. If you choose yes, it loads forward zones from the selected DNS
