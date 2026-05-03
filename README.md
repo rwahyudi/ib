@@ -290,14 +290,36 @@ ib dns search app
 ```
 
 Normal search uses the active/default zone as the root and includes child
-authoritative zones. If no active/default zone is set, search uses all
-non-secondary zones in the active DNS view. Search uses exact substring matching
-by default.
+authoritative zones. Use `-z/--zone` to search a different zone scope for one
+command, and `-v/--view` to search a different DNS view. If no active/default
+zone is set, search uses all non-secondary zones in the selected DNS view.
+Search uses exact substring matching by default.
 
-Search across the whole active view explicitly:
+Search a specific zone and its child authoritative zones:
+
+```bash
+ib dns search app -z test.local
+```
+
+Search in a specific DNS view:
+
+```bash
+ib dns search app -v "DNS Zone View"
+```
+
+When shell completion is enabled, `-z/--zone` completes zone names and
+`-v/--view` completes DNS view names.
+
+Search across the whole selected view explicitly:
 
 ```bash
 ib dns search -g app
+```
+
+Combine `-g` with `-v/--view` to search the whole selected view:
+
+```bash
+ib dns search -g -v "DNS Zone View" app
 ```
 
 Use case-sensitive matching:
@@ -467,7 +489,8 @@ Use `--zone` with `ib dns create`, or pass the optional positional zone to
 `ib dns delete`, when the active zone is not the target zone.
 
 Use `ib dns search -g <keyword>` when you need to search outside the active zone
-and its child zones.
+and its child zones. Use `ib dns search -z <zone> <keyword>` or
+`ib dns search -v <view> <keyword>` for one-off search scope changes.
 
 If search results look stale, confirm the zone SOA serial changed:
 

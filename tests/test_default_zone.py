@@ -892,6 +892,100 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("plain,-o", result.output.splitlines())
         self.assertIn("plain,--output", result.output.splitlines())
 
+    def test_dns_search_zone_option_completes_zone_names(self):
+        class FakeClient:
+            view = "corp"
+
+        runner = CliRunner()
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "read_zone_completion_cache",
+                    return_value=["alpha.example.com", "beta.example.com"],
+                ):
+                    result = runner.invoke(
+                        ib.cli,
+                        [],
+                        prog_name="ib",
+                        env={
+                            "_IB_COMPLETE": "bash_complete",
+                            "COMP_WORDS": "ib dns search -z ",
+                            "COMP_CWORD": "4",
+                        },
+                    )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,alpha.example.com", output_lines)
+        self.assertIn("plain,beta.example.com", output_lines)
+
+    def test_dns_search_global_view_option_completes_view_names(self):
+        class FakeClient:
+            def close(self):
+                pass
+
+        runner = CliRunner()
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "query_dns_view_names",
+                    return_value=["External", "Internal"],
+                ):
+                    result = runner.invoke(
+                        ib.cli,
+                        [],
+                        prog_name="ib",
+                        env={
+                            "_IB_COMPLETE": "bash_complete",
+                            "COMP_WORDS": "ib dns search -g -v ",
+                            "COMP_CWORD": "5",
+                        },
+                    )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,External", output_lines)
+        self.assertIn("plain,Internal", output_lines)
+
+    def test_dns_search_completion_hides_conflicting_scope_options(self):
+        runner = CliRunner()
+
+        global_result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns search -g ",
+                "COMP_CWORD": "4",
+            },
+        )
+        zone_result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns search -z test.local ",
+                "COMP_CWORD": "5",
+            },
+        )
+
+        self.assertEqual(global_result.exit_code, 0, global_result.output)
+        self.assertNotIn("plain,-g", global_result.output.splitlines())
+        self.assertNotIn("plain,-z", global_result.output.splitlines())
+        self.assertNotIn("plain,--zone", global_result.output.splitlines())
+        self.assertIn("plain,-v", global_result.output.splitlines())
+        self.assertIn("plain,--view", global_result.output.splitlines())
+        self.assertEqual(zone_result.exit_code, 0, zone_result.output)
+        self.assertNotIn("plain,-g", zone_result.output.splitlines())
+        self.assertNotIn("plain,-z", zone_result.output.splitlines())
+        self.assertNotIn("plain,--zone", zone_result.output.splitlines())
+
     def test_bash_completion_source_defaults_to_rich_layout(self):
         runner = CliRunner()
 
@@ -3656,7 +3750,15 @@ class DefaultZoneTests(unittest.TestCase):
             result = runner.invoke(ib.cli, ["dns", "search", "app", "-e", "old", "-e", "test"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        run_dns_search.assert_called_once_with("app", False, False, ("old", "test"), False)
+        run_dns_search.assert_called_once_with(
+            "app",
+            False,
+            False,
+            ("old", "test"),
+            False,
+            None,
+            None,
+        )
 
     def test_dns_search_accepts_fuzzy_search_flag(self):
         runner = CliRunner()
@@ -3665,7 +3767,27 @@ class DefaultZoneTests(unittest.TestCase):
             result = runner.invoke(ib.cli, ["dns", "search", "app", "-f"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        run_dns_search.assert_called_once_with("app", False, False, (), True)
+        run_dns_search.assert_called_once_with("app", False, False, (), True, None, None)
+
+    def test_dns_search_accepts_zone_and_view_scope_options(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_search") as run_dns_search:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "search", "app", "-z", "test.local", "-v", "Lab View"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_search.assert_called_once_with(
+            "app",
+            False,
+            False,
+            (),
+            False,
+            "test.local",
+            "Lab View",
+        )
 
     def test_dns_search_accepts_global_output_option_on_dns_group(self):
         runner = CliRunner()
@@ -3678,6 +3800,48 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(result.output.splitlines(), ["type,name,value,zone,ttl,comment"])
+
+    def test_dns_search_applies_zone_and_view_scope_options(self):
+        class FakeClient:
+            view = "Lab View"
+
+        captured_config = {}
+        runner = CliRunner()
+
+        def fake_client(config):
+            captured_config.update(config)
+            return FakeClient()
+
+        with patch.object(
+            ib,
+            "load_config",
+            return_value={"profile": "prod", "dns_view": "corp", "default_zone": "example.com"},
+        ):
+            with patch.object(ib, "InfobloxClient", side_effect=fake_client):
+                with patch.object(ib, "collect_dns_search_results", return_value=[]) as collect:
+                    result = runner.invoke(
+                        ib.cli,
+                        [
+                            "-o",
+                            "jq",
+                            "dns",
+                            "search",
+                            "app",
+                            "--zone",
+                            "test.local.",
+                            "--view",
+                            "Lab View",
+                        ],
+                    )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(captured_config["dns_view"], "Lab View")
+        collect.assert_called_once()
+        args = collect.call_args.args
+        self.assertIsInstance(args[0], FakeClient)
+        self.assertEqual(args[1], "app")
+        self.assertFalse(args[2])
+        self.assertEqual(args[3], "test.local")
 
     def test_dns_search_searches_active_zone_and_child_zones(self):
         class FakeClient:

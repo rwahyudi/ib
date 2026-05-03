@@ -1577,6 +1577,18 @@ def resolve_dns_view(config: dict[str, str]) -> str:
     return normalize_dns_view(configured_view) if configured_view else "default"
 
 
+def config_with_dns_view_override(
+    config: dict[str, str],
+    view_name: str | None,
+) -> dict[str, str]:
+    """Return config with a one-command DNS view override applied when requested."""
+    if not view_name:
+        return config
+    overridden_config = dict(config)
+    overridden_config["dns_view"] = normalize_dns_view(view_name)
+    return overridden_config
+
+
 def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> str:
     """Resolve the target zone through CLI, profile session, environment, then config."""
     if zone_name:
@@ -1888,9 +1900,36 @@ def dns_create_option_note_text() -> Text:
     )
 
 
-def dns_context_panel(title: str = "Current DNS Context") -> Text:
+def dns_context_panel(
+    title: str = "Current DNS Context",
+    status: dict[str, Any] | None = None,
+) -> Text:
     """Return the compact DNS context renderable used by commands and errors."""
-    return dns_context_line_text()
+    return dns_context_line_text(status)
+
+
+def dns_search_context_status(
+    config: dict[str, str],
+    root_zone: str | None,
+    zone_name: str | None = None,
+    view_name: str | None = None,
+) -> dict[str, Any]:
+    """Build DNS context for search after applying per-command scope overrides."""
+    profile_name = (
+        str(config.get("profile", DEFAULT_PROFILE_NAME)).strip()
+        or DEFAULT_PROFILE_NAME
+    )
+    view = str(config.get("dns_view", "default")).strip() or "default"
+    active_zone = root_zone or "not set"
+    return {
+        "profile": profile_name,
+        "profile_source": "default profile",
+        "view": view,
+        "view_source": "search --view" if view_name else "active",
+        "active_zone": active_zone,
+        "active_zone_source": "search --zone" if zone_name else "active/default",
+        "has_active_zone": bool(root_zone),
+    }
 
 
 def dns_create_usage_panel() -> Panel:
@@ -2083,6 +2122,21 @@ class DnsDeleteCommand(UsageContextCommand):
         self.format_epilog(ctx, formatter)
 
 
+class DnsSearchCommand(UsageContextCommand):
+    """Specialize search completion so mutually exclusive scope options stay out of the way."""
+
+    def excluded_completion_options(self, ctx: click.Context) -> set[str]:
+        """Hide conflicting search-scope options once one scope has already been selected."""
+        excluded: set[str] = set()
+        if ctx.params.get("global_search"):
+            excluded.update({"-g", "-z", "--zone"})
+        if ctx.params.get("zone_name"):
+            excluded.update({"-g", "-z", "--zone"})
+        if ctx.params.get("view_name"):
+            excluded.update({"-v", "--view"})
+        return excluded
+
+
 def command_option_completion_items(
     command: click.Command,
     ctx: click.Context,
@@ -2090,12 +2144,15 @@ def command_option_completion_items(
 ) -> list[CompletionItem]:
     """Return visible option names for completions that land in free-form arguments."""
     prefix = incomplete or "-"
+    excluded_options = command_excluded_completion_options(command, ctx)
     items: list[CompletionItem] = []
     for param in command.params:
         if not isinstance(param, click.Option) or param.hidden:
             continue
         help_text = param.help or None
         for opt in [*param.opts, *param.secondary_opts]:
+            if opt in excluded_options:
+                continue
             if opt.startswith(prefix):
                 items.append(CompletionItem(opt, help=help_text))
 
@@ -2106,6 +2163,17 @@ def command_option_completion_items(
             if opt.startswith(prefix):
                 items.append(CompletionItem(opt, help=help_text))
     return items
+
+
+def command_excluded_completion_options(
+    command: click.Command,
+    ctx: click.Context,
+) -> set[str]:
+    """Return command-specific options to omit from context-aware completions."""
+    excluded_options = getattr(command, "excluded_completion_options", None)
+    if callable(excluded_options):
+        return set(excluded_options(ctx))
+    return set()
 
 
 def option_completion_is_relevant(incomplete: str) -> bool:
@@ -4697,13 +4765,28 @@ def run_dns_search(
     global_search: bool = False,
     exclude_keywords: tuple[str, ...] = (),
     fuzzy_search: bool = False,
+    zone_name: str | None = None,
+    view_name: str | None = None,
 ) -> None:
     """Run DNS search from config loading through scoped collection and selected output rendering."""
     config = load_config()
+    config = config_with_dns_view_override(config, view_name)
+    if global_search and zone_name:
+        raise CliError("ERROR: --zone cannot be used with -g/--global search.")
     client = InfobloxClient(config)
-    root_zone = None if global_search else search_root_zone(config)
+    if global_search:
+        root_zone = None
+    elif zone_name:
+        root_zone = resolve_dns_zone(config, zone_name)
+    else:
+        root_zone = search_root_zone(config)
     if not global_search and output_is_table():
-        console.print(dns_context_panel("Current DNS Context"))
+        console.print(
+            dns_context_panel(
+                "Current DNS Context",
+                dns_search_context_status(config, root_zone, zone_name, view_name),
+            )
+        )
     records = collect_dns_search_results(
         client,
         keyword,
@@ -5519,6 +5602,34 @@ def complete_zone_names(
         config = load_config(required=False)
         if not config:
             return []
+        client = InfobloxClient(config)
+        names = read_zone_completion_cache(client.view)
+        if names is None:
+            zones = paged_query(
+                client,
+                ZONE_OBJECT,
+                zone_query_params(client),
+                warn_on_skip=False,
+            )
+            names = zone_names_from_results(zones)
+            write_zone_completion_cache(client.view, names)
+    except (CliError, OSError, ValueError):
+        return []
+
+    return filter_zone_names(names, incomplete)
+
+
+def complete_search_zone_names(
+    ctx: click.Context,
+    param: click.Parameter,
+    incomplete: str,
+) -> list[str]:
+    """Return search zone completions, honoring a preceding --view override when Click parsed it."""
+    try:
+        config = load_config(required=False)
+        if not config:
+            return []
+        config = config_with_dns_view_override(config, ctx.params.get("view_name"))
         client = InfobloxClient(config)
         names = read_zone_completion_cache(client.view)
         if names is None:
@@ -6522,10 +6633,24 @@ def dns_list(zone: str | None) -> None:
     run_dns_list(zone)
 
 
-@dns.command()
+@dns.command(cls=DnsSearchCommand)
 @click.argument("keyword")
 @click.option("-i", "case_sensitive", is_flag=True, help="Use case-sensitive matching.")
-@click.option("-g", "global_search", is_flag=True, help="Search across the active DNS view.")
+@click.option("-g", "global_search", is_flag=True, help="Search across the selected DNS view.")
+@click.option(
+    "-z",
+    "--zone",
+    "zone_name",
+    shell_complete=complete_search_zone_names,
+    help="Search this zone and child authoritative zones instead of the active/default zone.",
+)
+@click.option(
+    "-v",
+    "--view",
+    "view_name",
+    shell_complete=complete_dns_view_names,
+    help="Search this DNS view instead of the active/default view.",
+)
 @click.option(
     "-f",
     "fuzzy_search",
@@ -6543,13 +6668,17 @@ def search(
     keyword: str,
     case_sensitive: bool,
     global_search: bool,
+    zone_name: str | None,
+    view_name: str | None,
     fuzzy_search: bool,
     exclude_keywords: tuple[str, ...],
 ) -> None:
     """Search DNS records by name, value, or comment.
 
     Normal search uses the active/default zone as the root and includes child
-    authoritative zones. Use `-g` to search the active DNS view globally.
+    authoritative zones. Use `-z/--zone` to choose a different zone scope,
+    `-v/--view` to choose a different DNS view, or `-g` to search the selected
+    DNS view globally.
     Search uses exact substring matching by default; use `-f` for fuzzy matching.
     Use `-i` for case-sensitive matching.
     Use `-e KEYWORD` one or more times to exclude matching records.
@@ -6557,7 +6686,15 @@ def search(
     Search data is cached under ~/.ib/allrecords-cache and refreshed when the
     zone SOA serial changes.
     """
-    run_dns_search(keyword, case_sensitive, global_search, exclude_keywords, fuzzy_search)
+    run_dns_search(
+        keyword,
+        case_sensitive,
+        global_search,
+        exclude_keywords,
+        fuzzy_search,
+        zone_name,
+        view_name,
+    )
 
 
 @dns.command(cls=DnsDeleteCommand)
