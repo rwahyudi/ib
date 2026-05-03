@@ -25,7 +25,7 @@ possible:
 7. Sort and deduplicate records once all zone workers finish.
 
 This keeps the common hot path local: SQLite lookup, normalized exact field
-matching, default fuzzy matching, and table/JSON/CSV rendering. Live WAPI calls
+matching, optional fuzzy matching, and table/JSON/CSV rendering. Live WAPI calls
 are reserved for cold cache, expired serial metadata, changed zones, or explicit
 cache refresh paths.
 
@@ -107,10 +107,10 @@ Record cache rows are stored as normalized search entries:
 - original record JSON
 
 Search uses the normalized `name`, `value`, and `comment` fields. By default it
-checks exact substring matches first, then typo-tolerant fuzzy matches. When the
-user passes `-f`, search stays exact-only. The original record JSON remains
-available so table, JSON, and CSV output can use the same rendering path as live
-WAPI results.
+checks exact substring matches. When the user passes `-f`, search also checks
+typo-tolerant fuzzy matches. The original record JSON remains available so
+table, JSON, and CSV output can use the same rendering path as live WAPI
+results.
 
 For a zone, cached records are trusted only when the stored `zone_record_cache`
 serial matches the current serial metadata for that zone. If the serial matches,

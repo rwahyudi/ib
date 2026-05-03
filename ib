@@ -12,11 +12,10 @@ Script logic:
    over the current profile's shell/session zone, IB_ZONE, then the default
    zone saved in the selected profile so unattended commands behave
    predictably.
-3. Convert CLI input into WAPI payloads or query parameters. DNS search checks
-   exact name/value/comment matches first, then typo-tolerant fuzzy matches by
-   default; -f keeps search exact-only when the operator wants strict results.
-   Validation stays local where possible so operators get actionable errors
-   before WAPI calls.
+3. Convert CLI input into WAPI payloads or query parameters. DNS search uses
+   exact name/value/comment matching by default; -f adds typo-tolerant fuzzy
+   matching when the operator wants broader results. Validation stays local
+   where possible so operators get actionable errors before WAPI calls.
 4. Use WAPI paging for list/search operations and cache allrecords data in
    SQLite. SOA serial checks decide whether cached data is still valid; the
    short-lived serial list uses stale-while-revalidate so foreground reads stay
@@ -3159,7 +3158,7 @@ def search_sqlite_allrecords_cache(
     serial_number: str | None,
     keyword: str,
     case_sensitive: bool,
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Search cached entries, scanning all valid rows when fuzzy matching is enabled."""
     if serial_number is None:
@@ -3764,7 +3763,7 @@ def search_value_matches_keyword(
     value: str,
     keyword: str,
     case_sensitive: bool,
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
 ) -> bool:
     """Match one field exactly first, then by typo-tolerant fuzzy logic when enabled."""
     if search_value_exact_match(value, keyword, case_sensitive):
@@ -3776,7 +3775,7 @@ def allrecord_matches_keyword(
     item: dict[str, Any],
     keyword: str,
     case_sensitive: bool,
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
 ) -> bool:
     """Return whether one allrecords entry matches the keyword by exact or fuzzy text."""
     record_type = allrecord_type(item)
@@ -3790,7 +3789,7 @@ def allrecord_search_entry_matches_keyword(
     entry: dict[str, Any],
     keyword: str,
     case_sensitive: bool,
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
 ) -> bool:
     """Apply exact or fuzzy matching to cached search entries so paths agree."""
     for key in ("name", "value", "comment"):
@@ -3805,7 +3804,7 @@ def allrecord_search_entry_matches_exact_keyword(
     keyword: str,
     case_sensitive: bool,
 ) -> bool:
-    """Return exact substring matches for exclusions and exact-only search mode."""
+    """Return exact substring matches for exclusions and normal search mode."""
     return allrecord_search_entry_matches_keyword(
         entry,
         keyword,
@@ -3888,7 +3887,7 @@ def matching_search_entries_for_zone(
     case_sensitive: bool,
     root_zone: str | None,
     exclude_keywords: tuple[str, ...] = (),
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
 ) -> list[dict[str, Any]]:
     """Return matching entries for one zone using cache first, then local keyword filtering."""
     exclude_keywords = normalize_search_exclude_keywords(exclude_keywords)
@@ -3937,7 +3936,7 @@ def collect_dns_search_results(
     case_sensitive: bool,
     root_zone: str | None,
     exclude_keywords: tuple[str, ...] = (),
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
     *,
     zone_filter: Callable[[dict[str, Any]], bool] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -4189,7 +4188,7 @@ def run_dns_search(
     case_sensitive: bool = False,
     global_search: bool = False,
     exclude_keywords: tuple[str, ...] = (),
-    fuzzy_search: bool = True,
+    fuzzy_search: bool = False,
 ) -> None:
     """Run DNS search from config loading through scoped collection and selected output rendering."""
     config = load_config()
@@ -6011,9 +6010,9 @@ def dns_list(zone: str | None) -> None:
 @click.option("-g", "global_search", is_flag=True, help="Search across the active DNS view.")
 @click.option(
     "-f",
-    "exact_only",
+    "fuzzy_search",
     is_flag=True,
-    help="Disable fuzzy matching; only return exact substring matches.",
+    help="Enable fuzzy matching for typo-tolerant results.",
 )
 @click.option(
     "-e",
@@ -6026,21 +6025,21 @@ def search(
     keyword: str,
     case_sensitive: bool,
     global_search: bool,
-    exact_only: bool,
+    fuzzy_search: bool,
     exclude_keywords: tuple[str, ...],
 ) -> None:
     """Search DNS records by name, value, or comment.
 
     Normal search uses the active/default zone as the root and includes child
     authoritative zones. Use `-g` to search the active DNS view globally.
-    Search is typo-tolerant by default; use `-f` for exact-only matching.
+    Search uses exact substring matching by default; use `-f` for fuzzy matching.
     Use `-i` for case-sensitive matching.
     Use `-e KEYWORD` one or more times to exclude matching records.
 
     Search data is cached under ~/.ib/allrecords-cache and refreshed when the
     zone SOA serial changes.
     """
-    run_dns_search(keyword, case_sensitive, global_search, exclude_keywords, not exact_only)
+    run_dns_search(keyword, case_sensitive, global_search, exclude_keywords, fuzzy_search)
 
 
 @dns.command(cls=DnsDeleteCommand)

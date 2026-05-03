@@ -171,8 +171,7 @@ Command overview:
 - `ib dns edit <name> [a|aaaa|cname|host|mx|ptr|srv|txt] [value]` updates one
   existing DNS record.
 - `ib dns search [-i] [-g] [-f] [-e <keyword>]... <keyword>` searches records by
-  name, value, or comment. Fuzzy matching is enabled by default; use `-f` for
-  exact-only matching.
+  name, value, or comment. Use `-f` to enable fuzzy matching.
 - `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
   CNAME, TXT, MX, or HOST record.
 - `ib dns delete ptr <ip-address>` deletes a reverse DNS PTR record by full IP address.
@@ -349,8 +348,8 @@ ib dns search app
 
 Normal search uses the active/default zone as the root and includes child
 authoritative zones. If no active/default zone is set, search uses all
-non-secondary zones in the active DNS view. Search is typo-tolerant by default
-and still checks exact substring matches first.
+non-secondary zones in the active DNS view. Search uses exact substring matching
+by default.
 
 Search across the whole active view explicitly:
 
@@ -364,13 +363,14 @@ Use case-sensitive matching:
 ib dns search -i App
 ```
 
-Disable fuzzy matching for exact-only results:
+Enable fuzzy matching for typo-tolerant results:
 
 ```bash
 ib dns search app -f
 ```
 
-With `-f`, only exact substring matches are returned.
+With `-f`, close matches can be returned when a record name, value, or comment is
+near the keyword.
 
 Exclude records matching one or more keywords:
 
