@@ -15,8 +15,11 @@ Script logic:
 3. Convert CLI input into WAPI payloads or query parameters. Validation stays
    local where possible so operators get actionable errors before WAPI calls.
 4. Use WAPI paging for list/search operations and cache allrecords data in
-   SQLite. SOA serial checks decide whether cached data is still valid; writes
-   clear and prewarm the cache so later search/completion calls stay fast.
+   SQLite. SOA serial checks decide whether cached data is still valid; the
+   short-lived serial list uses stale-while-revalidate so foreground reads stay
+   responsive while a hidden refresh updates slightly old serial metadata.
+   Writes clear and prewarm the cache so later search/completion calls stay
+   fast.
 5. Render output according to the active mode. The default is Rich table output;
    -o jq and -o csv use structured emitters, while help always remains normal
    operator-facing help.
@@ -58,7 +61,7 @@ import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 try:
     import click
@@ -106,6 +109,7 @@ COMMENT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9 .,_:;@#%+=/()[\]'&-]*$")
 WAPI_PAGE_SIZE = 2000
 DNS_SEARCH_WORKERS = 8
 ZONE_SERIAL_CACHE_TTL = 30
+ZONE_SERIAL_CACHE_STALE_WHILE_REVALIDATE_SECONDS = 90
 PREWARM_LOCK_STALE_SECONDS = 600
 SESSION_ZONE_FILE_PREFIX = "active-zone-session"
 SESSION_VIEW_FILE_PREFIX = "active-view-session"
@@ -136,6 +140,13 @@ STRUCTURED_OUTPUTS = ("jq", "csv")
 STRUCTURED_EXCLUDED_FIELDS = {"ref", "_ref"}
 console = Console()
 err_console = Console(stderr=True)
+
+
+class ZoneSerialCacheRead(NamedTuple):
+    """Zone serial cache payload plus whether callers should refresh it in the background."""
+
+    zones: list[dict[str, Any]]
+    should_revalidate: bool
 
 
 class CliError(Exception):
@@ -2922,6 +2933,11 @@ def zone_serial_cache_key(client: InfobloxClient) -> str:
     return hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
 
 
+def zone_serial_cache_revalidate_lock_file(client: InfobloxClient) -> Path:
+    """Return the per-context lock path for hidden zone-serial refresh work."""
+    return ALLRECORDS_CACHE_DIR / f"zone-serial-{zone_serial_cache_key(client)}.lock"
+
+
 def ensure_allrecords_cache_dir() -> None:
     """Create the cache directory before cache reads or writes so callers stay simple."""
     ALLRECORDS_CACHE_DIR.parent.mkdir(mode=0o700, exist_ok=True)
@@ -3003,8 +3019,8 @@ def normalize_zone_serial_cache(zones: Any) -> list[dict[str, Any]] | None:
     return zones
 
 
-def read_zone_serial_cache(client: InfobloxClient) -> list[dict[str, Any]] | None:
-    """Read cached zone serials so search can skip expensive zone queries when still fresh."""
+def read_zone_serial_cache(client: InfobloxClient) -> ZoneSerialCacheRead | None:
+    """Read zone serials and flag slightly stale entries for background refresh."""
     try:
         with connect_search_cache_db() as conn:
             row = conn.execute(
@@ -3014,14 +3030,28 @@ def read_zone_serial_cache(client: InfobloxClient) -> list[dict[str, Any]] | Non
     except (OSError, sqlite3.Error):
         return None
 
-    if row is None or time.time() - float(row["created_at"]) > ZONE_SERIAL_CACHE_TTL:
+    if row is None:
+        return None
+
+    try:
+        age = time.time() - float(row["created_at"])
+    except (TypeError, ValueError):
+        return None
+    max_age = ZONE_SERIAL_CACHE_TTL + ZONE_SERIAL_CACHE_STALE_WHILE_REVALIDATE_SECONDS
+    if age > max_age:
         return None
 
     try:
         zones = json.loads(str(row["zones_json"]))
     except json.JSONDecodeError:
         return None
-    return normalize_zone_serial_cache(zones)
+    normalized_zones = normalize_zone_serial_cache(zones)
+    if normalized_zones is None:
+        return None
+    return ZoneSerialCacheRead(
+        zones=normalized_zones,
+        should_revalidate=age > ZONE_SERIAL_CACHE_TTL,
+    )
 
 
 def write_zone_serial_cache(client: InfobloxClient, zones: list[dict[str, Any]]) -> None:
@@ -3379,17 +3409,24 @@ def write_allrecords_cache(
         return
 
 
-def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
-    """Query zone serials with paging so cache validation sees every authoritative zone."""
-    cached_zones = read_zone_serial_cache(client)
-    if cached_zones is not None:
-        return cached_zones
-
-    zones = paged_query(
+def fetch_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
+    """Fetch zone serials directly from WAPI so foreground and background refresh paths agree."""
+    return paged_query(
         client,
         ZONE_OBJECT,
         zone_query_params(client, return_fields=ZONE_SERIAL_RETURN_FIELDS),
     )
+
+
+def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
+    """Return cached zone serials, refreshing synchronously only outside the SWR window."""
+    cached_zones = read_zone_serial_cache(client)
+    if cached_zones is not None:
+        if cached_zones.should_revalidate:
+            start_zone_serial_cache_revalidation()
+        return cached_zones.zones
+
+    zones = fetch_zone_serials(client)
     write_zone_serial_cache(client, zones)
     return zones
 
@@ -3820,6 +3857,49 @@ def release_search_cache_prewarm_lock(lock: tuple[int, str]) -> None:
         pass
 
 
+def acquire_zone_serial_cache_revalidate_lock(client: InfobloxClient) -> tuple[int, str] | None:
+    """Acquire a per-view serial refresh lock so SWR starts at most one live refresh."""
+    try:
+        ensure_allrecords_cache_dir()
+        lock_file = zone_serial_cache_revalidate_lock_file(client)
+        try:
+            return write_search_cache_prewarm_lock(lock_file)
+        except FileExistsError:
+            if not search_cache_prewarm_lock_is_stale(lock_file):
+                return None
+            try:
+                lock_file.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return None
+            try:
+                return write_search_cache_prewarm_lock(lock_file)
+            except FileExistsError:
+                return None
+    except OSError:
+        return None
+
+
+def release_zone_serial_cache_revalidate_lock(
+    client: InfobloxClient,
+    lock: tuple[int, str],
+) -> None:
+    """Release the serial refresh lock only when the hidden process still owns it."""
+    lock_fd, token = lock
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+
+    lock_file = zone_serial_cache_revalidate_lock_file(client)
+    try:
+        if lock_file.read_text(encoding="utf-8").strip() == token:
+            lock_file.unlink()
+    except (FileNotFoundError, OSError):
+        pass
+
+
 def warm_global_search_cache(client: InfobloxClient) -> None:
     """Warm search cache for all zones so later search and completion are responsive."""
     zones = search_zones(client, None)
@@ -3865,6 +3945,43 @@ def start_search_cache_prewarm() -> None:
     try:
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "_prewarm-search-cache"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            env=env,
+        )
+    except (OSError, ValueError):
+        return
+
+
+def run_zone_serial_cache_revalidation() -> None:
+    """Refresh only the zone serial cache behind SWR without rebuilding record caches."""
+    lock: tuple[int, str] | None = None
+    client: InfobloxClient | None = None
+    try:
+        config = load_config(required=False)
+        if not config:
+            return
+        client = InfobloxClient(config)
+        lock = acquire_zone_serial_cache_revalidate_lock(client)
+        if lock is None:
+            return
+        write_zone_serial_cache(client, fetch_zone_serials(client))
+    except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
+        return
+    finally:
+        if lock is not None and client is not None:
+            release_zone_serial_cache_revalidate_lock(client, lock)
+
+
+def start_zone_serial_cache_revalidation() -> None:
+    """Start a hidden serial-only cache refresh when cached serial metadata enters SWR."""
+    env = os.environ.copy()
+    env.pop("_IB_COMPLETE", None)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "_refresh-zone-serial-cache"],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -5291,6 +5408,12 @@ def cli(ctx: click.Context, output_format: str | None) -> None:
 def prewarm_search_cache() -> None:
     """Prewarm the DNS search cache."""
     run_search_cache_prewarm()
+
+
+@cli.command("_refresh-zone-serial-cache", hidden=True)
+def refresh_zone_serial_cache() -> None:
+    """Refresh the zone serial cache used by DNS search and list freshness checks."""
+    run_zone_serial_cache_revalidation()
 
 
 @cli.group(invoke_without_command=True)

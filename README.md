@@ -361,20 +361,33 @@ Use case-sensitive matching:
 ib dns search -i App
 ```
 
-Search performance notes:
+### Caching Architecture
 
-- Secondary zones are skipped.
-- Results are based on Infoblox `allrecords`.
-- The SQLite cache lives at `~/.ib/allrecords-cache/cache.sqlite3`.
-- `ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
-- Zone serial lists are cached for 30 seconds.
-- A zone's records are refreshed only when its SOA serial number changes.
-- Cached records include normalized searchable fields, so repeated searches are faster.
-- Cold or refreshed searches process zones with 8 workers by default.
-- Successful DNS record or zone updates clear the DNS caches and start a silent
-  background cache warm.
+Search and record completion use a local cache so repeated DNS operations do not
+need to query Infoblox for every request. Results are based on Infoblox
+`allrecords`, normalized into searchable `name`, `value`, and `comment` fields,
+and stored in SQLite.
 
-For the full cache flow, see [Cache architecture](docs/cache-architecture.md).
+| Cache | Location | Freshness rule |
+| --- | --- | --- |
+| Zone completion names | `~/.ib/zone-completion-cache.json` | 300 seconds, scoped to the active DNS view |
+| Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | 30 seconds fresh, then 90 seconds stale-while-revalidate |
+| Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | reused only when the zone SOA serial matches |
+| Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | prevents duplicate warmers; stale after 600 seconds |
+
+Each record-cache key includes the Infoblox server, WAPI version, DNS view, and
+zone name, so cached data does not cross profiles, views, or zones. When a zone
+serial matches, `ib` searches local SQLite. When it changes or the cache is
+missing, `ib` fetches fresh `allrecords` with WAPI paging and rewrites that
+zone's cached rows.
+
+`ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
+Successful DNS record or zone updates clear the DNS caches and start a silent
+background prewarm. Cache failures are treated as performance misses: foreground
+commands fall back to live WAPI calls, while shell completion fails quietly.
+
+For the full flow and diagram, see
+[Cache architecture](docs/cache-architecture.md).
 
 ## List Records
 
@@ -518,5 +531,6 @@ ib dns zone view example.com
 
 The record cache refreshes from Infoblox when the serial number changes.
 Successful record or zone updates clear the DNS caches and start a silent
-background cache warm. Zone serial metadata can otherwise lag by up to 30
-seconds because it is cached briefly for faster repeated searches.
+background cache warm. Zone serial metadata is fresh for 30 seconds, then may
+lag for up to 90 more seconds while `ib` serves the cached serial list and
+refreshes it in the background.

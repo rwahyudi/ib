@@ -12,7 +12,7 @@ matches Infoblox.
 | Cache | Location | Scope | Expiry or validation |
 | --- | --- | --- | --- |
 | Zone completion names | `~/.ib/zone-completion-cache.json` | Active DNS view | 300 seconds |
-| Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view | 30 seconds |
+| Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view | 30 seconds fresh, then 90 seconds stale-while-revalidate |
 | Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view, zone | SOA serial match |
 | Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | Local machine | Stale after 600 seconds |
 
@@ -26,9 +26,12 @@ When a command such as `ib dns search` or `ib dns list` needs records, `ib`
 first resolves the active profile, Infoblox server, WAPI version, DNS view, and
 zone scope. It then retrieves zone serial metadata.
 
-Zone serial metadata is cached for 30 seconds. If that short-lived cache is
-fresh, `ib` can avoid re-querying the full zone list. If it is missing, expired,
-or corrupt, `ib` queries `zone_auth` with WAPI paging and writes the new serial
+Zone serial metadata is fresh for 30 seconds. If that short-lived cache is
+fresh, `ib` can avoid re-querying the full zone list. From 31 through 120
+seconds, `ib` serves the cached serial list immediately and starts a hidden
+serial-only refresh so the next command can use updated serial metadata. If the
+serial cache is missing, corrupt, or older than 120 seconds, `ib` queries
+`zone_auth` with WAPI paging before continuing and writes the new serial
 metadata back to SQLite.
 
 For each zone, `ib` builds a cache key from:
@@ -126,5 +129,6 @@ empty candidate list so the shell remains clean.
 - Secondary zones are skipped during global search and warmup.
 - Cold searches and background warmup process multiple zones concurrently, up to
   the configured worker limit.
-- Zone serial metadata can lag by up to 30 seconds by design; record data is
-  still validated against the SOA serial before reuse.
+- Zone serial metadata can lag by up to 120 seconds by design during the
+  stale-while-revalidate window; record data is still validated against the SOA
+  serial supplied by that serial metadata before reuse.
