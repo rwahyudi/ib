@@ -166,9 +166,9 @@ Command overview:
   only non-default profiles, while `new` suggests unused common names.
 - `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
 - `ib dns list [zone]` lists all DNS records in the active or specified zone.
-- `ib dns create <a|aaaa|cname|host|mx|ptr|txt> <name> <value>` creates DNS
+- `ib dns create <a|aaaa|cname|host|mx|ptr|srv|txt> <name> <value>` creates DNS
   records.
-- `ib dns edit <name> [a|aaaa|cname|host|mx|ptr|txt] [value]` updates one
+- `ib dns edit <name> [a|aaaa|cname|host|mx|ptr|srv|txt] [value]` updates one
   existing DNS record.
 - `ib dns search [-i] [-g] <keyword>` searches records by name, value, or comment.
 - `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
@@ -268,7 +268,7 @@ export IB_ZONE=test.local
 
 ## Create Records
 
-The command shape is `ib dns create {a|aaaa|cname|host|mx|ptr|txt} NAME VALUE`.
+The command shape is `ib dns create {a|aaaa|cname|host|mx|ptr|srv|txt} NAME VALUE`.
 Record names are relative to the active zone unless already fully qualified.
 Use `@` as the name for the zone apex. Use `-t` or `--ttl` for record TTL,
 and `-c` or `--comment` for a plain ASCII comment.
@@ -288,6 +288,7 @@ Assuming the active zone is `example.com`, these commands produce:
 | `ib dns create cname www app.example.com` | `CNAME www.example.com -> app.example.com` |
 | `ib dns create txt _spf "v=spf1 include:example.net -all"` | `TXT _spf.example.com = "v=spf1 include:example.net -all"` |
 | `ib dns create mx @ "10 mail.example.com"` | `MX example.com -> mail.example.com` with preference `10` |
+| `ib dns create srv _sip._tcp "10 20 5060 sip.example.com"` | `SRV _sip._tcp.example.com -> sip.example.com` with priority `10`, weight `20`, and port `5060` |
 | `ib dns create ptr 192.0.2.10 host.example.com` | `PTR 192.0.2.10 -> host.example.com` |
 
 CNAME creates check whether the target resolves from the local system before
@@ -330,6 +331,7 @@ ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
 ib dns edit app -t 300 -c "Application host"
 ib dns edit www cname app.example.com
 ib dns edit app.example.com a 192.0.2.20
+ib dns edit _sip._tcp srv "10 20 5061 sip2.example.com"
 ```
 
 If a name matches multiple records, `ib` prints the ambiguous matches instead of
@@ -371,6 +373,8 @@ Search performance notes:
 - Cold or refreshed searches process zones with 8 workers by default.
 - Successful DNS record or zone updates clear the DNS caches and start a silent
   background cache warm.
+
+For the full cache flow, see [Cache architecture](docs/cache-architecture.md).
 
 ## List Records
 

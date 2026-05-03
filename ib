@@ -359,6 +359,11 @@ RECORD_TYPES: dict[str, dict[str, Any]] = {
         "search_value_fields": ("mail_exchanger",),
         "return_fields": "name,mail_exchanger,preference,ttl,use_ttl,view,zone,comment",
     },
+    "srv": {
+        "object": "record:srv",
+        "search_value_fields": ("target",),
+        "return_fields": "name,target,priority,weight,port,ttl,use_ttl,view,zone,comment",
+    },
     "host": {
         "object": "record:host",
         "search_value_fields": ("ipv4addrs", "ipv6addrs"),
@@ -2258,6 +2263,33 @@ def mx_payload(value: str) -> dict[str, Any]:
     return {"preference": int(parts[0]), "mail_exchanger": parts[1].rstrip(".")}
 
 
+def srv_int_field(label: str, value: str) -> int:
+    """Parse one SRV integer field and keep WAPI range errors local and actionable."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise CliError(f"ERROR: SRV {label} must be an integer.")
+    if parsed < 0 or parsed > 65535:
+        raise CliError(f"ERROR: SRV {label} must be between 0 and 65535.")
+    return parsed
+
+
+def srv_payload(value: str) -> dict[str, Any]:
+    """Parse SRV value syntax into priority, weight, port, and target fields for Infoblox."""
+    parts = value.split()
+    if len(parts) != 4:
+        raise CliError("ERROR: SRV value must be quoted as '<priority> <weight> <port> <target>'.")
+    target = parts[3].rstrip(".")
+    if not target:
+        raise CliError("ERROR: SRV target is required.")
+    return {
+        "priority": srv_int_field("priority", parts[0]),
+        "weight": srv_int_field("weight", parts[1]),
+        "port": srv_int_field("port", parts[2]),
+        "target": target,
+    }
+
+
 def ptr_payload(name: str, value: str) -> dict[str, Any]:
     """Build a PTR WAPI payload from address and target host so reverse records use the right field names."""
     field = "ipv6addr" if ":" in name else "ipv4addr"
@@ -2305,6 +2337,8 @@ def create_payload(
 
     if record_type == "mx":
         payload.update(mx_payload(value))
+    elif record_type == "srv":
+        payload.update(srv_payload(value))
     elif record_type == "host":
         payload.update(host_payload(value))
     elif record_type == "ptr":
@@ -2589,6 +2623,8 @@ def update_value_payload(record_type: str, value: str) -> dict[str, Any]:
 
     if record_type == "mx":
         return mx_payload(value)
+    if record_type == "srv":
+        return srv_payload(value)
     if record_type == "host":
         return host_payload(value)
     if record_type == "ptr":
@@ -3517,6 +3553,13 @@ def allrecord_display_value(record_type: str, item: dict[str, Any]) -> str:
         exchanger = first_record_value(item, ("mail_exchanger",))
         preference = first_record_value(item, ("preference",))
         return f"{preference} {exchanger}".strip() if exchanger else ""
+    if record_type in {"srv", "shared-srv"}:
+        priority = first_record_value(item, ("priority",))
+        weight = first_record_value(item, ("weight",))
+        port = first_record_value(item, ("port",))
+        target = first_record_value(item, ("target",))
+        values = [priority, weight, port, target]
+        return " ".join(value for value in values if value)
     if record_type == "ptr":
         return first_record_value(item, ("ptrdname", "ipv4addr", "ipv6addr"))
     if record_type == "host":
@@ -4815,6 +4858,14 @@ def record_value(record_type: str, item: dict[str, Any]) -> str:
     value = next((str(item[key]) for key in value_keys if key in item), "")
     if record_type == "mx" and "preference" in item and value:
         return f"{item['preference']} {value}"
+    if record_type == "srv":
+        values = [
+            str(item.get("priority", "")),
+            str(item.get("weight", "")),
+            str(item.get("port", "")),
+            str(item.get("target", "")),
+        ]
+        return " ".join(value for value in values if value)
     return value
 
 
@@ -5528,7 +5579,7 @@ def create(
 
     Record names are relative to the active zone unless already fully qualified.
     Use `@` as the name for the zone apex. Supported record types are A, AAAA,
-    CNAME, TXT, MX, PTR, and HOST.
+    CNAME, TXT, MX, PTR, SRV, and HOST.
 
     \b
     Examples:
@@ -5543,6 +5594,8 @@ def create(
       Creates: TXT _spf.example.com = "v=spf1 include:example.net -all"
       Command: ib dns create mx @ "10 mail.example.com"
       Creates: MX example.com -> mail.example.com with preference 10
+      Command: ib dns create srv _sip._tcp "10 20 5060 sip.example.com"
+      Creates: SRV _sip._tcp.example.com -> sip.example.com with priority 10, weight 20, and port 5060
       Command: ib dns create ptr 192.0.2.10 host.example.com
       Creates: PTR 192.0.2.10 -> host.example.com
     """
@@ -5589,6 +5642,7 @@ def edit(
       ib dns edit app -t 300 -c "Application host"
       ib dns edit www cname app.example.com
       ib dns edit app.example.com a 192.0.2.20
+      ib dns edit _sip._tcp srv "10 20 5061 sip2.example.com"
     """
     run_dns_edit(record_name, record_type, value, zone, ttl, noptr, comment)
 

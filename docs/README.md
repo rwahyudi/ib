@@ -13,3 +13,8 @@ ib --help
 ib dns --help
 ib dns zone --help
 ```
+
+## Guides
+
+- [Cache architecture](cache-architecture.md) explains the completion cache,
+  SQLite record cache, SOA serial validation, and background prewarm flow.

@@ -277,6 +277,64 @@ class DefaultZoneTests(unittest.TestCase):
         with self.assertRaisesRegex(ib.CliError, "host value must be an IPv4 or IPv6 address"):
             ib.create_payload("host", "target.example.com", "app", "example.com", None, None, FakeClient())
 
+    def test_dns_create_srv_payload_uses_priority_weight_port_and_target(self):
+        class FakeClient:
+            view = "corp"
+
+        object_type, payload = ib.create_payload(
+            "srv",
+            "10 20 5060 sip.example.com.",
+            "_sip._tcp",
+            "example.com",
+            300,
+            "SIP service",
+            FakeClient(),
+        )
+
+        self.assertEqual(object_type, "record:srv")
+        self.assertEqual(
+            payload,
+            {
+                "name": "_sip._tcp.example.com",
+                "view": "corp",
+                "ttl": 300,
+                "use_ttl": True,
+                "comment": "SIP service",
+                "priority": 10,
+                "weight": 20,
+                "port": 5060,
+                "target": "sip.example.com",
+            },
+        )
+
+    def test_dns_create_srv_rejects_malformed_value(self):
+        class FakeClient:
+            view = "corp"
+
+        bad_values = [
+            ("10 20 5060", "SRV value must be quoted"),
+            ("high 20 5060 sip.example.com", "SRV priority must be an integer"),
+            ("10 heavy 5060 sip.example.com", "SRV weight must be an integer"),
+            ("10 20 sip sip.example.com", "SRV port must be an integer"),
+            ("10 20 70000 sip.example.com", "SRV port must be between 0 and 65535"),
+        ]
+
+        for value, message in bad_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ib.CliError, message):
+                    ib.create_payload("srv", value, "_sip._tcp", "example.com", None, None, FakeClient())
+
+    def test_dns_edit_srv_value_payload_uses_priority_weight_port_and_target(self):
+        self.assertEqual(
+            ib.update_value_payload("srv", "10 20 5061 sip2.example.com."),
+            {
+                "priority": 10,
+                "weight": 20,
+                "port": 5061,
+                "target": "sip2.example.com",
+            },
+        )
+
     def test_dns_create_cname_checks_target_resolution_without_warning_when_resolved(self):
         seen = {}
 
@@ -416,6 +474,26 @@ class DefaultZoneTests(unittest.TestCase):
             None,
         )
 
+    def test_dns_create_accepts_srv_quoted_value(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_create") as run_dns_create:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "create", "srv", "_sip._tcp", "10 20 5060 sip.example.com"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_create.assert_called_once_with(
+            "srv",
+            "10 20 5060 sip.example.com",
+            "_sip._tcp",
+            None,
+            None,
+            False,
+            None,
+        )
+
     def test_dns_edit_accepts_name_first_and_create_style_options(self):
         runner = CliRunner()
 
@@ -447,6 +525,26 @@ class DefaultZoneTests(unittest.TestCase):
             300,
             True,
             "Application host",
+        )
+
+    def test_dns_edit_accepts_srv_quoted_value(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "run_dns_edit") as run_dns_edit:
+            result = runner.invoke(
+                ib.cli,
+                ["dns", "edit", "_sip._tcp", "srv", "10 20 5061 sip2.example.com"],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_dns_edit.assert_called_once_with(
+            "_sip._tcp",
+            "srv",
+            "10 20 5061 sip2.example.com",
+            None,
+            None,
+            False,
+            None,
         )
 
     def test_dns_edit_updates_existing_record_by_ref(self):
@@ -3656,6 +3754,57 @@ class DefaultZoneTests(unittest.TestCase):
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "records"])
 
+    def test_dns_search_includes_srv_records_by_target(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        table_records = []
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            if object_type == ib.ZONE_OBJECT:
+                return [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 10}]
+            if object_type == ib.ALLRECORDS_OBJECT:
+                return [
+                    {
+                        "_ref": "allrecords/srv",
+                        "type": "record:srv",
+                        "name": "_sip._tcp",
+                        "zone": "example.com",
+                        "record": {
+                            "name": "_sip._tcp.example.com",
+                            "priority": 10,
+                            "weight": 20,
+                            "port": 5060,
+                            "target": "sip.example.com",
+                        },
+                    }
+                ]
+            raise AssertionError(f"unexpected object type: {object_type}")
+
+        def fake_record_table(records):
+            table_records.extend(records)
+            return "records"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                    with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                        with patch.object(ib, "read_session_zone", return_value=None):
+                            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                                with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                                    with patch.object(ib, "record_table", side_effect=fake_record_table):
+                                        with patch.object(ib, "dns_context_panel", return_value="context"):
+                                            with patch.object(ib.console, "print") as print_mock:
+                                                ib.run_dns_search("sip.example.com")
+
+        self.assertEqual(table_records[0][0], "srv")
+        self.assertEqual(ib.record_value("srv", table_records[0][1]), "10 20 5060 sip.example.com")
+        printed = [call.args[0] for call in print_mock.call_args_list]
+        self.assertEqual(printed, ["context", "records"])
+
     def test_dns_search_formats_cname_and_txt_allrecords(self):
         cname = {
             "_ref": "allrecords/cname",
@@ -3684,6 +3833,36 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(ib.record_value("shared-cname", cname), "target.example.net")
         self.assertEqual(ib.record_name(txt), "spf.example.com")
         self.assertEqual(ib.record_value("txt", txt), "v=spf1 include:example.net -all")
+
+    def test_dns_search_formats_srv_records(self):
+        direct = {
+            "_ref": "record:srv/sip",
+            "name": "_sip._tcp.example.com",
+            "zone": "example.com",
+            "priority": 10,
+            "weight": 20,
+            "port": 5060,
+            "target": "sip.example.com",
+        }
+        wrapped = {
+            "_ref": "allrecords/srv",
+            "type": "record:srv",
+            "name": "_sip._tcp",
+            "zone": "example.com",
+            "record": {
+                "name": "_sip._tcp.example.com",
+                "priority": 10,
+                "weight": 20,
+                "port": 5060,
+                "target": "sip.example.com",
+            },
+        }
+
+        self.assertEqual(ib.record_value("srv", direct), "10 20 5060 sip.example.com")
+        self.assertEqual(ib.record_name(wrapped), "_sip._tcp.example.com")
+        self.assertEqual(ib.record_value("srv", wrapped), "10 20 5060 sip.example.com")
+        self.assertEqual(ib.record_value("shared-srv", wrapped), "10 20 5060 sip.example.com")
+        self.assertTrue(ib.allrecord_matches_keyword(wrapped, "sip.example.com", False))
 
     def test_dns_search_infers_known_unsupported_allrecords_types_from_ref(self):
         def allrecords_ref(decoded: str) -> str:
