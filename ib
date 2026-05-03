@@ -161,6 +161,13 @@ ZONE_FORMATS = ("FORWARD", "IPV4", "IPV6")
 TABLE_OUTPUT = "table"
 STRUCTURED_OUTPUTS = ("jq", "csv")
 STRUCTURED_EXCLUDED_FIELDS = {"ref", "_ref"}
+CONFIG_USAGE_COMMANDS = [
+    "ib config new PROFILE",
+    "ib config edit [PROFILE]",
+    "ib config use PROFILE",
+    "ib config delete PROFILE",
+    "ib config list",
+]
 console = Console()
 err_console = Console(stderr=True)
 LIGHT_GREEN_TEXT = "#4ade80"
@@ -664,7 +671,7 @@ def read_config_profiles(
         profiles = {DEFAULT_PROFILE_NAME: dict(parser["default"])}
         legacy = True
     else:
-        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib config")
+        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib config new PROFILE")
 
     if decrypt_passwords:
         for profile_values in profiles.values():
@@ -1287,11 +1294,17 @@ def emit_profile_list(default_profile: str, profiles: dict[str, dict[str, str]])
     emit_structured(rows, ["profile", "default", "server", "dns_view", "default_zone"])
 
 
+def print_config_usage() -> None:
+    """Print profile-management commands for the read-only config overview."""
+    print_note("Profile commands:")
+    print_command_block(CONFIG_USAGE_COMMANDS)
+
+
 def list_config_profiles() -> None:
     """List configured profiles and mark the default profile."""
     if not CONFIG_FILE.exists():
         if output_is_table():
-            print_warning("No profiles configured. Run: ib config")
+            print_warning("No profiles configured. Run: ib config new PROFILE")
         else:
             emit_structured([], ["profile", "default", "server", "dns_view", "default_zone"])
         return
@@ -1299,14 +1312,23 @@ def list_config_profiles() -> None:
     emit_profile_list(default_profile, profiles)
 
 
+def show_config_overview() -> None:
+    """Display profiles and usage without creating or editing profile data."""
+    if not output_is_table():
+        list_config_profiles()
+        return
+
+    if CONFIG_FILE.exists():
+        default_profile, profiles, _legacy = read_config_profiles()
+        emit_profile_list(default_profile, profiles)
+    else:
+        print_warning("No profiles configured.")
+    print_config_usage()
+
+
 def maybe_prompt_configure() -> None:
-    """Offer configuration setup when required config is missing so users get a clear next step."""
-    if not sys.stdin.isatty():
-        raise CliError("ERROR: no configuration file found. Run: ib config")
-    print_warning(f"No configuration file found at {CONFIG_FILE}.")
-    if not Confirm.ask("Run 'ib config' now?", default=False):
-        raise CliError("ERROR: no configuration file found. Run: ib config")
-    save_config_interactive()
+    """Report missing configuration without starting implicit profile setup."""
+    raise CliError("ERROR: no configuration file found. Run: ib config new PROFILE")
 
 
 def load_config(required: bool = True) -> dict[str, str] | None:
@@ -6984,7 +7006,7 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
 def cli(ctx: click.Context, output_format: str | None) -> None:
     """Infoblox command line client.
 
-    Run `ib config` first to save an Infoblox profile with server,
+    Run `ib config new PROFILE` first to save an Infoblox profile with server,
     credentials, DNS view, and default zone.
 
     \b
@@ -7027,22 +7049,17 @@ def refresh_zone_completion_cache() -> None:
 @cli.group("config", invoke_without_command=True)
 @click.pass_context
 def config(ctx: click.Context) -> None:
-    """Create or update Infoblox connection profiles in ~/.ib/config.
+    """Display Infoblox profiles and profile-management usage.
 
-    Prompts for the Infoblox server, username, password, WAPI version, SSL
-    verification preference, DNS view, and default DNS zone.
-    New profile setup connects with the entered credentials and lists available
-    Infoblox DNS views so the saved view can be selected from live data. Profile
-    setup can also open a live forward-zone picker and save one DNS zone as the
-    profile default.
-
-    You can run this command multiple times. Without a subcommand, it edits the
-    current default profile. Existing values are shown as defaults, so pressing
-    Enter keeps the current value. Existing passwords are kept when the password
-    prompt is left blank.
+    Without a subcommand, this command is read-only: it lists available profiles
+    and shows the profile commands. Use `ib config new PROFILE` to create a
+    profile, or `ib config edit [PROFILE]` to edit an existing profile. Existing
+    values are shown as defaults during edits, so pressing Enter keeps the
+    current value. Existing passwords are kept when the password prompt is left
+    blank.
     """
     if ctx.invoked_subcommand is None:
-        save_config_interactive()
+        show_config_overview()
 
 
 @config.command("new")

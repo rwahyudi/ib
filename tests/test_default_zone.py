@@ -1213,15 +1213,17 @@ class DefaultZoneTests(unittest.TestCase):
             show_default=False,
         )
 
-    def test_configure_help_explains_repeated_runs_keep_existing_values(self):
+    def test_config_help_explains_read_only_overview_and_explicit_editing(self):
         runner = CliRunner()
 
         result = runner.invoke(ib.cli, ["config", "--help"])
 
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("run this command multiple times", result.output)
+        self.assertIn("read-only", result.output)
+        self.assertIn("ib config new PROFILE", result.output)
+        self.assertIn("ib config edit [PROFILE]", result.output)
         self.assertIn("pressing", result.output)
-        self.assertIn("Enter keeps the current value", result.output)
+        self.assertIn("Enter keeps the current", result.output)
         self.assertIn("password", result.output)
         self.assertIn("prompt is left blank", result.output)
         self.assertIn("new", result.output)
@@ -1249,6 +1251,78 @@ class DefaultZoneTests(unittest.TestCase):
     def test_config_replaces_configure_command_name(self):
         self.assertIn("config", ib.cli.commands)
         self.assertNotIn("configure", ib.cli.commands)
+
+    def test_config_without_subcommand_lists_profiles_and_usage_without_editing(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "dns_view": "corp",
+                            "default_zone": "example.com",
+                        }
+                    },
+                )
+                with patch.object(ib, "save_config_interactive") as save_config:
+                    result = runner.invoke(ib.cli, ["config"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        save_config.assert_not_called()
+        self.assertIn("Infoblox Profiles (1)", result.output)
+        self.assertIn("prod", result.output)
+        self.assertIn("ib config new PROFILE", result.output)
+        self.assertIn("ib config edit [PROFILE]", result.output)
+        self.assertNotIn("prod-secret", result.output)
+
+    def test_config_without_subcommand_guides_new_profile_when_none_exist(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "save_config_interactive") as save_config:
+                    result = runner.invoke(ib.cli, ["config"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        save_config.assert_not_called()
+        self.assertIn("No profiles configured", result.output)
+        self.assertIn("ib config new PROFILE", result.output)
+
+    def test_config_without_subcommand_outputs_profile_json_without_usage(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "dns_view": "corp",
+                            "default_zone": "example.com",
+                        }
+                    },
+                )
+                result = runner.invoke(ib.cli, ["-o", "jq", "config"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(
+            json.loads(result.output),
+            [
+                {
+                    "profile": "prod",
+                    "default": True,
+                    "server": "https://prod.example.com",
+                    "dns_view": "corp",
+                    "default_zone": "example.com",
+                }
+            ],
+        )
+        self.assertNotIn("ib config new PROFILE", result.output)
 
     def test_output_option_is_registered_on_all_commands(self):
         self.assert_command_tree_has_output_option(ib.cli)
@@ -1462,7 +1536,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(profiles["new-prof"]["dns_view"], "manual-view")
         self.assertIn("could not load DNS views", result.output)
 
-    def test_first_configure_fetches_dns_views_for_default_profile(self):
+    def test_configure_new_default_fetches_dns_views_for_default_profile(self):
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.config_path_patch(tmpdir):
@@ -1478,7 +1552,10 @@ class DefaultZoneTests(unittest.TestCase):
                                 "query_dns_view_names_for_config",
                                 return_value=["corp", "default"],
                             ) as query_views:
-                                result = runner.invoke(ib.cli, ["config"])
+                                result = runner.invoke(
+                                    ib.cli,
+                                    ["config", "new", "default", "--default"],
+                                )
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1759,7 +1836,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(query_config["dns_view"], "new-view")
         self.assertEqual(query_config["verify_ssl"], "false")
 
-    def test_configure_existing_default_profile_uses_zone_search_picker(self):
+    def test_configure_edit_default_profile_uses_zone_search_picker(self):
         runner = CliRunner()
         zones = [
             {"fqdn": "app.example.com", "zone_format": "FORWARD", "comment": "Apps"},
@@ -1794,7 +1871,7 @@ class DefaultZoneTests(unittest.TestCase):
                                 "query_default_zone_candidates_for_config",
                                 return_value=ib.selectable_zone_records(zones),
                             ) as query_zones:
-                                result = runner.invoke(ib.cli, ["config"])
+                                result = runner.invoke(ib.cli, ["config", "edit"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -2297,7 +2374,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIsInstance(result.exception, ib.CliError)
-        self.assertIn("Run: ib config", str(result.exception))
+        self.assertIn("Run: ib config new PROFILE", str(result.exception))
 
     def test_dns_delete_missing_record_name_error_prints_ptr_hint(self):
         with patch.object(ib.sys, "argv", ["ib", "dns", "delete"]):

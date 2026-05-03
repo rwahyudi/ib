@@ -53,13 +53,13 @@ install -m 755 ./ib ~/.local/bin/ib
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Then configure Infoblox access:
+Then create an Infoblox profile:
 
 ```bash
-ib config
+ib config new default --default
 ```
 
-`ib config` edits the current default profile and prompts for:
+`ib config new PROFILE` prompts for:
 
 - Infoblox server
 - Username and password
@@ -68,7 +68,7 @@ ib config
 - DNS view
 - Default DNS zone
 
-When a new profile is created, `ib config` connects to Infoblox with the
+When a new profile is created, `ib config new` connects to Infoblox with the
 entered credentials and lists available DNS views so you can select one. If the
 DNS view lookup fails, the command falls back to manual DNS view entry and still
 saves the profile.
@@ -77,11 +77,12 @@ Profile setup also asks whether to configure a default DNS zone, with yes as the
 default answer. If you choose yes, it loads forward zones from the selected DNS
 view, including subdomain zones, and shows a live search box where the zone list
 filters as you type. Reverse zones are excluded from selection. This picker is
-used by `ib config`, `ib config new`, and `ib config edit`.
+used by `ib config new` and `ib config edit`.
 
 Manage multiple profiles with:
 
 ```bash
+ib config
 ib config new prod --default
 ib config new lab
 ib config list
@@ -90,10 +91,10 @@ ib config edit lab
 ib config delete lab
 ```
 
-You can run `ib config` multiple times. It will not wipe existing values just
-because you rerun it: saved values are shown as defaults, pressing Enter keeps
-the current value, and leaving the password prompt blank keeps the current
-password.
+Bare `ib config` is read-only: it lists available profiles and shows profile
+management usage. Use `ib config edit [profile]` to update an existing profile.
+Saved values are shown as defaults during edits, pressing Enter keeps the
+current value, and leaving the password prompt blank keeps the current password.
 
 Private files are written under `~/.ib/`. Profiles are stored in
 `~/.ib/config` as `[profile:<name>]` sections with `[meta] default_profile`
@@ -105,7 +106,7 @@ key files are kept at `0600`.
 Common workflow:
 
 ```bash
-ib config
+ib config new default --default
 ib dns view list
 ib dns view use "DNS Zone View"
 ib dns zone list
@@ -500,9 +501,9 @@ exec bash
 
 ## Troubleshooting
 
-Run `ib config` if you see a missing configuration or credential error. Use
-`ib config list` and `ib config use <profile>` to inspect or switch the
-default profile.
+Run `ib config new <profile>` if you see a missing configuration or credential
+error. Use `ib config` or `ib config list` to inspect profiles, and
+`ib config use <profile>` to switch the default profile.
 
 Use `--zone` with `ib dns create`, or pass the optional positional zone to
 `ib dns delete`, when the active zone is not the target zone.
