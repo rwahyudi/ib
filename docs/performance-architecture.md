@@ -54,8 +54,9 @@ workers return their matches, the main thread sorts records and removes
 duplicates so output remains stable.
 
 Background prewarm uses the same zone-level worker model. The hidden
-`ib _prewarm-search-cache` command scans the global forward-zone set and warms
-each zone cache concurrently, also capped by `DNS_SEARCH_WORKERS`.
+`ib _prewarm-search-cache` command scans either the global forward-zone set or
+the scoped zone set selected by `ib dns zone use <zone>`, then warms each zone
+cache concurrently, also capped by `DNS_SEARCH_WORKERS`.
 
 ## Cache Layers
 
@@ -141,10 +142,12 @@ Successful DNS mutations call the shared cache refresh path. That includes:
 - zone delete
 
 The refresh path removes the allrecords cache directory and the zone completion
-JSON file, then starts detached background prewarm. Foreground write commands do
-not wait for prewarm to finish.
+JSON file, then starts detached background prewarm. `ib dns zone use <zone>`
+does not clear caches, but it starts detached prewarm scoped to the selected
+zone and its child authoritative zones. Foreground commands do not wait for
+prewarm to finish.
 
-The prewarmer uses `prewarm.lock` to avoid duplicate global warmers. If another
+The prewarmer uses `prewarm.lock` to avoid duplicate warmers. If another
 prewarmer is already running, the new one exits. If the lock is older than 600
 seconds, it is considered stale and can be replaced.
 

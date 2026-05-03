@@ -29,8 +29,8 @@ Script logic:
    DNS data where possible, return no candidates instead of surfacing
    network/configuration failures to the shell, and append visible command
    options at command and argument positions so global options such as -o stay
-   discoverable everywhere. Bash completion defaults to the plain shell list,
-   with an opt-in Rich-rendered table for colored candidate browsing.
+   discoverable everywhere. Bash completion defaults to a Rich-rendered table
+   for colored candidate browsing while keeping inserted values plain.
 7. Convert expected Click, configuration, and WAPI failures into concise
    messages. Tracebacks are reserved for unexpected programming errors.
 
@@ -99,6 +99,7 @@ COMPLETION_LAYOUT_ENV = "IB_COMPLETION_LAYOUT"
 COMPLETION_COLOR_ENV = "IB_COMPLETION_COLOR"
 COMPLETION_MAX_ROWS_ENV = "IB_COMPLETION_MAX_ROWS"
 COMPLETION_RENDER_ENV = "IB_COMPLETION_RENDER"
+PREWARM_SEARCH_ZONE_ENV = "IB_PREWARM_SEARCH_ZONE"
 CONFIG_META_SECTION = "meta"
 PROFILE_SECTION_PREFIX = "profile:"
 DEFAULT_PROFILE_NAME = "default"
@@ -2305,7 +2306,7 @@ RICH_BASH_SOURCE = """%(complete_func)s() {
         COLUMNS="${COLUMNS:-80}" \\
         %(complete_var)s=bash_complete \\
         IB_COMPLETION_RENDER=1 \\
-        IB_COMPLETION_LAYOUT="${IB_COMPLETION_LAYOUT:-plain}" \\
+        IB_COMPLETION_LAYOUT="${IB_COMPLETION_LAYOUT:-rich}" \\
         IB_COMPLETION_COLOR="${IB_COMPLETION_COLOR:-auto}" \\
         IB_COMPLETION_MAX_ROWS="${IB_COMPLETION_MAX_ROWS:-40}" \\
         "$1")
@@ -2336,8 +2337,8 @@ RICH_BASH_SOURCE = """%(complete_func)s() {
 
 
 def completion_layout_mode() -> str:
-    """Return the requested completion layout mode, defaulting to plain Bash completion."""
-    return os.environ.get(COMPLETION_LAYOUT_ENV, "plain").strip().lower()
+    """Return the requested completion layout mode, defaulting to the Rich Bash view."""
+    return os.environ.get(COMPLETION_LAYOUT_ENV, "rich").strip().lower()
 
 
 def completion_color_mode() -> str:
@@ -2355,9 +2356,17 @@ def completion_max_rows() -> int:
     return max(1, value)
 
 
+def bash_completion_is_listing_request() -> bool:
+    """Detect Bash's explicit list-completions request so normal Tab insertion stays quiet."""
+    completion_type = os.environ.get("COMP_TYPE", "9")
+    return completion_type in {"33", "63", "64", "!", "?", "@"}
+
+
 def completion_rich_layout_enabled(items: list[CompletionItem]) -> bool:
     """Decide whether Bash completion should render a separate Rich candidate table."""
     if os.environ.get(COMPLETION_RENDER_ENV) != "1":
+        return False
+    if not bash_completion_is_listing_request():
         return False
     if completion_layout_mode() != "rich":
         return False
@@ -2433,6 +2442,34 @@ def completion_item_help(item: CompletionItem) -> str:
     return "" if help_text == "_" else str(help_text)
 
 
+def grouped_completion_table_items(
+    items: list[CompletionItem],
+) -> list[list[CompletionItem]]:
+    """Group option aliases with the same description so -o and --output share one row."""
+    plain_items = [item for item in items if item.type == "plain"]
+    groups: list[list[CompletionItem]] = []
+    index = 0
+    while index < len(plain_items):
+        item = plain_items[index]
+        group = [item]
+        if str(item.value).startswith("-"):
+            help_text = completion_item_help(item)
+            next_index = index + 1
+            while next_index < len(plain_items):
+                next_item = plain_items[next_index]
+                if not str(next_item.value).startswith("-"):
+                    break
+                if completion_item_help(next_item) != help_text:
+                    break
+                group.append(next_item)
+                next_index += 1
+            index = next_index
+        else:
+            index += 1
+        groups.append(group)
+    return groups
+
+
 def render_bash_completion_table(
     items: list[CompletionItem],
     incomplete: str,
@@ -2440,12 +2477,12 @@ def render_bash_completion_table(
     max_rows: int | None = None,
 ) -> bool:
     """Render a colored Bash completion table without changing the values Bash inserts."""
-    plain_items = [item for item in items if item.type == "plain"]
-    if len(plain_items) <= 1:
+    grouped_items = grouped_completion_table_items(items)
+    if len(grouped_items) <= 1:
         return False
 
     row_limit = max_rows if max_rows is not None else completion_max_rows()
-    shown_items = plain_items[:row_limit]
+    shown_groups = grouped_items[:row_limit]
     title = "ib completions"
     if incomplete:
         title = f"{title} for {incomplete}"
@@ -2455,18 +2492,20 @@ def render_bash_completion_table(
     table.add_column("Complete", overflow="fold")
     table.add_column("Details", overflow="fold", style="dim")
 
-    for item in shown_items:
+    for group in shown_groups:
+        item = group[0]
         kind, style = completion_item_kind_and_style(item)
+        value = ", ".join(str(grouped_item.value) for grouped_item in group)
         table.add_row(
             Text(kind, style=style),
-            Text(str(item.value), style=style),
+            Text(value, style=style),
             completion_item_help(item),
         )
 
-    hidden_count = len(plain_items) - len(shown_items)
+    hidden_count = len(grouped_items) - len(shown_groups)
     if hidden_count > 0:
         table.caption = (
-            f"Showing {len(shown_items)} of {len(plain_items)} matches. "
+            f"Showing {len(shown_groups)} of {len(grouped_items)} matches. "
             "Keep typing to narrow results."
         )
 
@@ -4521,9 +4560,9 @@ def release_zone_serial_cache_revalidate_lock(
         pass
 
 
-def warm_global_search_cache(client: InfobloxClient) -> None:
-    """Warm search cache for all zones so later search and completion are responsive."""
-    zones = search_zones(client, None)
+def warm_search_cache(client: InfobloxClient, root_zone: str | None = None) -> None:
+    """Warm search cache for all zones or for one zone scope when a root is supplied."""
+    zones = search_zones(client, root_zone)
 
     def warm_zone(zone_info: dict[str, Any]) -> None:
         """Warm cache for one zone in the background prewarm pool so later completions/searches are faster."""
@@ -4540,6 +4579,31 @@ def warm_global_search_cache(client: InfobloxClient) -> None:
         warm_zone(zones[0])
 
 
+def warm_global_search_cache(client: InfobloxClient) -> None:
+    """Warm search cache for all zones so later search and completion are responsive."""
+    warm_search_cache(client)
+
+
+def warm_zone_search_cache(client: InfobloxClient, zone_name: str) -> None:
+    """Warm search cache for one selected zone and its child authoritative zones."""
+    warm_search_cache(client, normalize_zone_name(zone_name))
+
+
+def prewarm_search_zone_from_env() -> str | None:
+    """Read the hidden prewarm scope used by detached zone-use cache warmers."""
+    zone_name = os.environ.get(PREWARM_SEARCH_ZONE_ENV, "").strip()
+    return normalize_zone_name(zone_name) if zone_name else None
+
+
+def carry_session_view_for_prewarm(env: dict[str, str]) -> None:
+    """Pass the caller's session view to detached prewarmers whose parent PID changes."""
+    if env.get(DEFAULT_VIEW_ENV):
+        return
+    session_view = read_session_view()
+    if session_view:
+        env[DEFAULT_VIEW_ENV] = session_view
+
+
 def run_search_cache_prewarm() -> None:
     """Run the background prewarm entrypoint with lock handling and best-effort config loading."""
     lock: tuple[int, str] | None = None
@@ -4548,10 +4612,14 @@ def run_search_cache_prewarm() -> None:
         if not config:
             return
         client = InfobloxClient(config)
+        root_zone = prewarm_search_zone_from_env()
         lock = acquire_search_cache_prewarm_lock()
         if lock is None:
             return
-        warm_global_search_cache(client)
+        if root_zone:
+            warm_zone_search_cache(client, root_zone)
+        else:
+            warm_global_search_cache(client)
     except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
         return
     finally:
@@ -4559,11 +4627,15 @@ def run_search_cache_prewarm() -> None:
             release_search_cache_prewarm_lock(lock)
 
 
-def start_search_cache_prewarm() -> None:
+def start_search_cache_prewarm(zone_name: str | None = None) -> None:
     """Start a detached cache warmer so foreground DNS writes are not delayed."""
     env = os.environ.copy()
     env.pop("_IB_COMPLETE", None)
+    env.pop(PREWARM_SEARCH_ZONE_ENV, None)
+    carry_session_view_for_prewarm(env)
     try:
+        if zone_name:
+            env[PREWARM_SEARCH_ZONE_ENV] = normalize_zone_name(zone_name)
         subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "_prewarm-search-cache"],
             stdin=subprocess.DEVNULL,
@@ -4572,7 +4644,7 @@ def start_search_cache_prewarm() -> None:
             close_fds=True,
             env=env,
         )
-    except (OSError, ValueError):
+    except (CliError, OSError, ValueError):
         return
 
 
@@ -5262,6 +5334,7 @@ def run_dns_zone_use(zone_name: str) -> None:
     default_zone = normalize_zone_name(zone_name)
     profile_name = session_profile_name()
     write_session_zone(default_zone, profile_name)
+    start_search_cache_prewarm(default_zone)
     if not output_is_table():
         emit_action_result(
             status="success",
@@ -6136,8 +6209,8 @@ def completion(shell: str | None) -> None:
         Panel.fit(
             "Enable tab completion for ib commands, options, DNS record types, "
             "and active zone hints.\n"
-            "Bash uses plain completion by default. Set IB_COMPLETION_LAYOUT=rich "
-            "to enable the colored candidate table.",
+            "Bash shows a Rich-colored candidate table by default while keeping "
+            "inserted values plain.",
             title="ib shell completion setup",
             border_style="cyan",
         )
@@ -6157,8 +6230,8 @@ def completion(shell: str | None) -> None:
             console.print("[bold]Current shell only[/bold]")
             print_command_block(['eval "$(_IB_COMPLETE=bash_source ib)"'])
             console.print(
-                "Plain completion is the default. To enable the colored table, export "
-                "[cyan]IB_COMPLETION_LAYOUT=rich[/cyan]. Use "
+                "Rich completion is the default. Set "
+                "[cyan]IB_COMPLETION_LAYOUT=plain[/cyan] to use plain Bash completion, "
                 "[cyan]IB_COMPLETION_COLOR=always[/cyan] to force color, or "
                 "[cyan]IB_COMPLETION_COLOR=never[/cyan] to disable color."
             )

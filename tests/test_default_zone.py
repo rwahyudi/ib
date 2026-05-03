@@ -892,7 +892,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("plain,-o", result.output.splitlines())
         self.assertIn("plain,--output", result.output.splitlines())
 
-    def test_bash_completion_source_defaults_to_plain_layout(self):
+    def test_bash_completion_source_defaults_to_rich_layout(self):
         runner = CliRunner()
 
         result = runner.invoke(
@@ -904,7 +904,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("IB_COMPLETION_RENDER=1", result.output)
-        self.assertIn('IB_COMPLETION_LAYOUT="${IB_COMPLETION_LAYOUT:-plain}"', result.output)
+        self.assertIn('IB_COMPLETION_LAYOUT="${IB_COMPLETION_LAYOUT:-rich}"', result.output)
         self.assertIn('IB_COMPLETION_COLOR="${IB_COMPLETION_COLOR:-auto}"', result.output)
         self.assertIn('COMPREPLY+=("$value")', result.output)
 
@@ -941,6 +941,7 @@ class DefaultZoneTests(unittest.TestCase):
         items = [
             ib.CompletionItem("active-zone=example.com", help="Active zone: example.com"),
             ib.CompletionItem("dns", help="Manage Infoblox DNS records."),
+            ib.CompletionItem("-o", help="Output format."),
             ib.CompletionItem("--output", help="Output format."),
             ib.CompletionItem("a"),
             ib.CompletionItem("app.example.com", help="A | 192.0.2.10 | zone=example.com"),
@@ -962,19 +963,27 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIn("Option", output)
         self.assertIn("Record type", output)
         self.assertIn("A record", output)
-        self.assertIn("--output", output)
+        self.assertIn("-o, --output", output)
+        self.assertEqual(output.count("Output format."), 1)
 
-    def test_bash_completion_rich_table_can_be_disabled(self):
+    def test_bash_completion_rich_table_only_renders_for_list_requests(self):
         items = [ib.CompletionItem("one"), ib.CompletionItem("two")]
 
         with patch.dict(
             os.environ,
-            {ib.COMPLETION_RENDER_ENV: "1"},
+            {
+                ib.COMPLETION_RENDER_ENV: "1",
+                ib.COMPLETION_LAYOUT_ENV: "rich",
+                "COMP_TYPE": "9",
+            },
             clear=True,
         ):
             with patch("builtins.open") as open_file:
                 self.assertFalse(ib.render_bash_completion_table_to_tty(items, ""))
         open_file.assert_not_called()
+
+    def test_bash_completion_rich_table_can_be_disabled(self):
+        items = [ib.CompletionItem("one"), ib.CompletionItem("two")]
 
         with patch.dict(
             os.environ,
@@ -982,6 +991,7 @@ class DefaultZoneTests(unittest.TestCase):
                 ib.COMPLETION_RENDER_ENV: "1",
                 ib.COMPLETION_LAYOUT_ENV: "plain",
                 ib.COMPLETION_COLOR_ENV: "auto",
+                "COMP_TYPE": "63",
             },
             clear=True,
         ):
@@ -995,6 +1005,7 @@ class DefaultZoneTests(unittest.TestCase):
                 ib.COMPLETION_RENDER_ENV: "1",
                 ib.COMPLETION_LAYOUT_ENV: "rich",
                 ib.COMPLETION_COLOR_ENV: "never",
+                "COMP_TYPE": "63",
             },
             clear=True,
         ):
@@ -2349,11 +2360,13 @@ class DefaultZoneTests(unittest.TestCase):
     def test_zone_use_writes_session_zone(self):
         with patch.object(ib, "write_session_zone") as write_session_zone:
             with patch.object(ib, "session_profile_name", return_value="prod"):
-                with patch.object(ib, "print_success") as print_success:
-                    with patch.object(ib, "print_note") as print_note:
-                        ib.run_dns_zone_use("test.local.")
+                with patch.object(ib, "start_search_cache_prewarm") as start_prewarm:
+                    with patch.object(ib, "print_success") as print_success:
+                        with patch.object(ib, "print_note") as print_note:
+                            ib.run_dns_zone_use("test.local.")
 
         write_session_zone.assert_called_once_with("test.local", "prod")
+        start_prewarm.assert_called_once_with("test.local")
         print_success.assert_called_once()
         print_note.assert_called_once()
 
@@ -2443,6 +2456,40 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(options["stderr"], ib.subprocess.DEVNULL)
         self.assertNotIn("_IB_COMPLETE", options["env"])
         self.assertEqual(options["env"]["KEEP_ME"], "1")
+        self.assertNotIn(ib.PREWARM_SEARCH_ZONE_ENV, options["env"])
+
+    def test_start_search_cache_prewarm_can_scope_to_selected_zone(self):
+        with patch.dict(
+            os.environ,
+            {"_IB_COMPLETE": "bash_complete", ib.PREWARM_SEARCH_ZONE_ENV: "old.example.com"},
+            clear=False,
+        ):
+            with patch.object(ib.subprocess, "Popen") as popen:
+                ib.start_search_cache_prewarm("test.local.")
+
+        command = popen.call_args.args[0]
+        options = popen.call_args.kwargs
+        self.assertEqual(command[-1], "_prewarm-search-cache")
+        self.assertNotIn("_IB_COMPLETE", options["env"])
+        self.assertEqual(options["env"][ib.PREWARM_SEARCH_ZONE_ENV], "test.local")
+
+    def test_start_search_cache_prewarm_carries_session_view(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch.object(ib, "read_session_view", return_value="Lab View"):
+                with patch.object(ib.subprocess, "Popen") as popen:
+                    ib.start_search_cache_prewarm("test.local")
+
+        options = popen.call_args.kwargs
+        self.assertEqual(options["env"][ib.DEFAULT_VIEW_ENV], "Lab View")
+
+    def test_start_search_cache_prewarm_keeps_explicit_view_env(self):
+        with patch.dict(os.environ, {ib.DEFAULT_VIEW_ENV: "Env View"}, clear=True):
+            with patch.object(ib, "read_session_view", return_value="Lab View"):
+                with patch.object(ib.subprocess, "Popen") as popen:
+                    ib.start_search_cache_prewarm("test.local")
+
+        options = popen.call_args.kwargs
+        self.assertEqual(options["env"][ib.DEFAULT_VIEW_ENV], "Env View")
 
     def test_hidden_prewarm_command_calls_runner(self):
         self.assertTrue(ib.cli.commands["_prewarm-search-cache"].hidden)
@@ -2554,6 +2601,35 @@ class DefaultZoneTests(unittest.TestCase):
                                 ib.run_search_cache_prewarm()
 
         search_zones.assert_called_once_with(client, None)
+        warm_zone.assert_called_once_with(client, zones[0])
+        release_lock.assert_called_once_with((123, "token"))
+
+    def test_search_cache_prewarm_uses_selected_zone_scope(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        zones = [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 1}]
+        with patch.dict(os.environ, {ib.PREWARM_SEARCH_ZONE_ENV: "example.com."}, clear=False):
+            with patch.object(ib, "load_config", return_value={"server": "ignored"}):
+                with patch.object(ib, "InfobloxClient", return_value=client):
+                    with patch.object(
+                        ib,
+                        "acquire_search_cache_prewarm_lock",
+                        return_value=(123, "token"),
+                    ):
+                        with patch.object(ib, "release_search_cache_prewarm_lock") as release_lock:
+                            with patch.object(ib, "search_zones", return_value=zones) as search_zones:
+                                with patch.object(
+                                    ib,
+                                    "allrecords_search_entries_for_zone",
+                                    return_value=[],
+                                ) as warm_zone:
+                                    ib.run_search_cache_prewarm()
+
+        search_zones.assert_called_once_with(client, "example.com")
         warm_zone.assert_called_once_with(client, zones[0])
         release_lock.assert_called_once_with((123, "token"))
 
@@ -3225,7 +3301,11 @@ class DefaultZoneTests(unittest.TestCase):
 
         with patch.object(ib, "write_session_zone") as write_session_zone:
             with patch.object(ib, "session_profile_name", return_value="prod"):
-                result = runner.invoke(ib.cli, ["-o", "jq", "dns", "zone", "use", "example.com"])
+                with patch.object(ib, "start_search_cache_prewarm") as start_prewarm:
+                    result = runner.invoke(
+                        ib.cli,
+                        ["-o", "jq", "dns", "zone", "use", "example.com"],
+                    )
 
         self.assertEqual(result.exit_code, 0, result.output)
         data = json.loads(result.output)
@@ -3235,6 +3315,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(data["zone"], "example.com")
         self.assertNotIn("ref", data)
         write_session_zone.assert_called_once_with("example.com", "prod")
+        start_prewarm.assert_called_once_with("example.com")
 
     def test_dns_view_use_outputs_json_with_global_output_option(self):
         class FakeClient:

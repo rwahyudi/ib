@@ -197,6 +197,9 @@ Set a zone only for the current shell session:
 ib dns zone use test.local
 ```
 
+This also starts a silent background prewarm for searches under that zone and
+its child authoritative zones.
+
 A new shell session falls back to `IB_ZONE` or the configured default zone.
 Switching profiles also falls back to that profile's default zone unless you
 set an active zone for that profile.
@@ -342,9 +345,11 @@ missing, `ib` fetches fresh `allrecords` with WAPI paging and rewrites that
 zone's cached rows.
 
 `ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
-Successful DNS record or zone updates clear the DNS caches and start a silent
-background prewarm. Cache failures are treated as performance misses: foreground
-commands fall back to live WAPI calls, while shell completion fails quietly.
+`ib dns zone use <zone>` starts a silent scoped warm for that zone and its child
+authoritative zones. Successful DNS record or zone updates clear the DNS caches
+and start a silent background prewarm. Cache failures are treated as performance
+misses: foreground commands fall back to live WAPI calls, while shell completion
+fails quietly.
 
 For the full performance flow, parallel worker model, and cache diagram, see
 [Performance architecture](docs/performance-architecture.md).
@@ -418,6 +423,9 @@ Set the active zone for the current shell:
 ib dns zone use test.local
 ```
 
+This command also starts a silent background prewarm for search and record
+completion under the selected zone.
+
 Existing zone names support shell completion for `ib dns zone view` and
 `ib dns zone use` when completion is enabled.
 
@@ -436,10 +444,10 @@ For Bash in the current shell:
 eval "$(_IB_COMPLETE=bash_source ib)"
 ```
 
-Bash completion is plain by default. To enable the colored candidate table,
-export `IB_COMPLETION_LAYOUT=rich`; use `IB_COMPLETION_COLOR=always` to force
-color or `IB_COMPLETION_COLOR=never` to disable color. Inserted completion
-values remain plain text.
+Bash completion shows a Rich-colored candidate table by default while inserted
+completion values remain plain text. Set `IB_COMPLETION_LAYOUT=plain` to use
+plain Bash completion, `IB_COMPLETION_COLOR=always` to force color, or
+`IB_COMPLETION_COLOR=never` to disable color.
 
 For persistent Bash completion:
 
