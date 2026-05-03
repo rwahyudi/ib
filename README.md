@@ -372,14 +372,22 @@ address while table and structured output still display the target hostname.
 Each record-cache key includes the Infoblox server, WAPI version, DNS view, and
 zone name, so cached data does not cross profiles, views, or zones. When a zone
 serial matches, `ib` searches local SQLite even if the cached record rows are
-old; record rows have no separate time-based expiry. When the serial changes or
-the cache is missing, `ib` fetches fresh `allrecords` with WAPI paging and
-rewrites that zone's cached rows.
+old; record rows have no separate time-based expiry. Background prewarm refreshes
+the row `updated_at` timestamp when it validates that cached rows still match the
+current serial. When the serial changes or the cache is missing, `ib` fetches
+fresh `allrecords` with WAPI paging and rewrites that zone's cached rows. If a
+background prewarm is already running, foreground searches stay cache-only: they
+serve existing cached rows, including stale rows, and skip live `allrecords`
+fetches while the warmer owns refresh.
 
 `ib <TAB><TAB>` starts a silent background warm of the global DNS search cache.
 `ib dns zone use <zone>` starts a silent scoped warm for that zone and its child
-authoritative zones. Successful DNS record or zone updates clear the DNS caches
-and start a silent background prewarm. Cache failures are treated as performance
+authoritative zones. Warmers use the same zone serial stale-while-revalidate
+path as foreground search, so a hidden serial-only metadata refresh starts only
+when the cached serial metadata is stale enough to revalidate. While that hidden
+serial refresh is running, new requests keep serving the existing cached zone
+list immediately. Successful DNS record or zone updates clear the DNS caches and
+start a silent background prewarm. Cache failures are treated as performance
 misses: foreground commands fall back to live WAPI calls, while shell completion
 fails quietly. Zone-name completion can serve stale cached names for 48 hours
 after the 300-second fresh window while a hidden refresh updates the cache.

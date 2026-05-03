@@ -122,7 +122,7 @@ PROFILE_NAME_COMPLETION_SUGGESTIONS = (
 ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
 COMMENT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9 .,_:;@#%+=/()[\]'&-]*$")
 WAPI_PAGE_SIZE = 2000
-DNS_SEARCH_WORKERS = 8
+DNS_SEARCH_WORKERS = 10
 WAPI_CONNECTION_POOL_SIZE = DNS_SEARCH_WORKERS
 FUZZY_SEARCH_MIN_KEYWORD_LENGTH = 3
 FUZZY_SEARCH_SHORT_KEYWORD_LENGTH = 4
@@ -3673,7 +3673,11 @@ def normalize_zone_serial_cache(zones: Any) -> list[dict[str, Any]] | None:
     return zones
 
 
-def read_zone_serial_cache(client: InfobloxClient) -> ZoneSerialCacheRead | None:
+def read_zone_serial_cache(
+    client: InfobloxClient,
+    *,
+    allow_expired: bool = False,
+) -> ZoneSerialCacheRead | None:
     """Read zone serials and flag slightly stale entries for background refresh."""
     try:
         with connect_search_cache_db() as conn:
@@ -3692,7 +3696,7 @@ def read_zone_serial_cache(client: InfobloxClient) -> ZoneSerialCacheRead | None
     except (TypeError, ValueError):
         return None
     max_age = ZONE_SERIAL_CACHE_TTL + ZONE_SERIAL_CACHE_STALE_WHILE_REVALIDATE_SECONDS
-    if age > max_age:
+    if age > max_age and not allow_expired:
         return None
 
     try:
@@ -3706,6 +3710,11 @@ def read_zone_serial_cache(client: InfobloxClient) -> ZoneSerialCacheRead | None
         zones=normalized_zones,
         should_revalidate=age > ZONE_SERIAL_CACHE_TTL,
     )
+
+
+def zone_serial_cache_revalidation_is_running(client: InfobloxClient) -> bool:
+    """Return whether a live serial refresh should own zone metadata updates."""
+    return not search_cache_prewarm_lock_is_stale(zone_serial_cache_revalidate_lock_file(client))
 
 
 def write_zone_serial_cache(client: InfobloxClient, zones: list[dict[str, Any]]) -> None:
@@ -3744,6 +3753,39 @@ def sqlite_zone_record_cache_is_valid(
     return row is not None and str(row["serial_number"]) == serial_number
 
 
+def sqlite_zone_record_cache_exists(conn: sqlite3.Connection, cache_key: str) -> bool:
+    """Check whether any cache metadata exists for a zone, regardless of serial."""
+    row = conn.execute(
+        "SELECT 1 FROM zone_record_cache WHERE cache_key = ?",
+        (cache_key,),
+    ).fetchone()
+    return row is not None
+
+
+def touch_allrecords_cache_freshness(
+    client: InfobloxClient,
+    zone_name: str,
+    serial_number: str | None,
+) -> bool:
+    """Refresh cache freshness metadata after prewarm validates a still-current zone."""
+    if serial_number is None:
+        return False
+    cache_key = allrecords_cache_key(client, zone_name)
+    try:
+        with connect_search_cache_db() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE zone_record_cache
+                SET updated_at = ?
+                WHERE cache_key = ? AND serial_number = ?
+                """,
+                (time.time(), cache_key, str(serial_number)),
+            )
+            return cursor.rowcount > 0
+    except (OSError, sqlite3.Error):
+        return False
+
+
 def sqlite_search_entry_from_row(row: sqlite3.Row) -> dict[str, Any] | None:
     """Convert one SQLite row into a cached search entry while dropping corrupt JSON rows."""
     try:
@@ -3772,14 +3814,19 @@ def read_sqlite_allrecords_search_entries(
     client: InfobloxClient,
     zone_name: str,
     serial_number: str | None,
+    *,
+    allow_stale: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Read cached allrecords entries for one zone when the serial proves them current."""
-    if serial_number is None:
+    if serial_number is None and not allow_stale:
         return None
     cache_key = allrecords_cache_key(client, zone_name)
     try:
         with connect_search_cache_db() as conn:
-            if not sqlite_zone_record_cache_is_valid(conn, cache_key, serial_number):
+            if allow_stale:
+                if not sqlite_zone_record_cache_exists(conn, cache_key):
+                    return []
+            elif not sqlite_zone_record_cache_is_valid(conn, cache_key, str(serial_number)):
                 return None
             rows = conn.execute(
                 """
@@ -3859,16 +3906,28 @@ def search_sqlite_allrecords_cache(
     keyword: str,
     case_sensitive: bool,
     fuzzy_search: bool = False,
+    *,
+    allow_stale: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Search cached entries, scanning all valid rows when fuzzy matching is enabled."""
-    if serial_number is None:
+    if serial_number is None and not allow_stale:
         return None
     cache_key = allrecords_cache_key(client, zone_name)
     if not keyword:
-        return read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+        return read_sqlite_allrecords_search_entries(
+            client,
+            zone_name,
+            serial_number,
+            allow_stale=allow_stale,
+        )
 
     if fuzzy_search:
-        entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+        entries = read_sqlite_allrecords_search_entries(
+            client,
+            zone_name,
+            serial_number,
+            allow_stale=allow_stale,
+        )
         if entries is None:
             return None
         return matching_allrecord_search_entries(
@@ -3881,7 +3940,10 @@ def search_sqlite_allrecords_cache(
     condition, params = sqlite_exact_search_condition(keyword, case_sensitive)
     try:
         with connect_search_cache_db() as conn:
-            if not sqlite_zone_record_cache_is_valid(conn, cache_key, serial_number):
+            if allow_stale:
+                if not sqlite_zone_record_cache_exists(conn, cache_key):
+                    return []
+            elif not sqlite_zone_record_cache_is_valid(conn, cache_key, str(serial_number)):
                 return None
             rows = conn.execute(
                 f"""
@@ -4026,11 +4088,20 @@ def read_allrecords_search_cache(
     client: InfobloxClient,
     zone_name: str,
     serial_number: str | None,
+    *,
+    allow_stale: bool = False,
 ) -> list[dict[str, Any]] | None:
     """Read all cached search entries for a zone, preferring SQLite and falling back to legacy cache."""
-    cached_entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
+    cached_entries = read_sqlite_allrecords_search_entries(
+        client,
+        zone_name,
+        serial_number,
+        allow_stale=allow_stale,
+    )
     if cached_entries is not None:
         return cached_entries
+    if allow_stale:
+        return None
 
     cache = read_legacy_allrecords_cache_payload(client, zone_name, serial_number)
     if not cache:
@@ -4133,9 +4204,14 @@ def query_zone_serials(client: InfobloxClient) -> list[dict[str, Any]]:
     """Return cached zone serials, refreshing synchronously only outside the SWR window."""
     cached_zones = read_zone_serial_cache(client)
     if cached_zones is not None:
-        if cached_zones.should_revalidate:
+        if cached_zones.should_revalidate and not zone_serial_cache_revalidation_is_running(client):
             start_zone_serial_cache_revalidation()
         return cached_zones.zones
+
+    if zone_serial_cache_revalidation_is_running(client):
+        expired_zones = read_zone_serial_cache(client, allow_expired=True)
+        if expired_zones is not None:
+            return expired_zones.zones
 
     zones = fetch_zone_serials(client)
     write_zone_serial_cache(client, zones)
@@ -4189,13 +4265,25 @@ def allrecords_for_zone(client: InfobloxClient, zone_info: dict[str, Any]) -> li
 def allrecords_search_entries_for_zone(
     client: InfobloxClient,
     zone_info: dict[str, Any],
+    *,
+    refresh_freshness: bool = False,
 ) -> list[dict[str, Any]]:
     """Return cached or freshly queried search entries for a zone based on SOA serial checks."""
     zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
     serial_number = zone_serial(zone_info)
     cached_entries = read_allrecords_search_cache(client, zone_name, serial_number)
     if cached_entries is not None:
+        if refresh_freshness:
+            touch_allrecords_cache_freshness(client, zone_name, serial_number)
         return cached_entries
+    if not refresh_freshness and search_cache_prewarm_is_running():
+        stale_entries = read_allrecords_search_cache(
+            client,
+            zone_name,
+            serial_number,
+            allow_stale=True,
+        )
+        return stale_entries if stale_entries is not None else []
 
     records = paged_query(client, ALLRECORDS_OBJECT, allrecords_query_params(client, zone_name))
     search_entries = allrecord_search_entries(records, zone_name)
@@ -4823,6 +4911,17 @@ def load_search_entries_for_zone(
     if entries is None:
         entries = read_allrecords_search_cache(client, zone_name, serial_number)
     if entries is None:
+        if search_cache_prewarm_is_running():
+            entries = search_sqlite_allrecords_cache(
+                client,
+                zone_name,
+                serial_number,
+                keyword,
+                case_sensitive,
+                fuzzy_search,
+                allow_stale=True,
+            )
+            return entries if entries is not None else []
         records = paged_query(
             client,
             ALLRECORDS_OBJECT,
@@ -4958,6 +5057,11 @@ def search_cache_prewarm_lock_is_stale(lock_file: Path) -> bool:
         return time.time() - lock_file.stat().st_mtime > PREWARM_LOCK_STALE_SECONDS
     except OSError:
         return True
+
+
+def search_cache_prewarm_is_running() -> bool:
+    """Return whether a live background prewarmer should own record-cache refreshes."""
+    return not search_cache_prewarm_lock_is_stale(search_cache_prewarm_lock_file())
 
 
 def write_search_cache_prewarm_lock(lock_file: Path) -> tuple[int, str]:
@@ -5105,7 +5209,11 @@ def warm_search_cache(client: InfobloxClient, root_zone: str | None = None) -> N
     def warm_zone(zone_info: dict[str, Any]) -> None:
         """Warm cache for one zone in the background prewarm pool so later completions/searches are faster."""
         try:
-            allrecords_search_entries_for_zone(clone_infoblox_client(client), zone_info)
+            allrecords_search_entries_for_zone(
+                clone_infoblox_client(client),
+                zone_info,
+                refresh_freshness=True,
+            )
         except (CliError, WapiError, OSError, sqlite3.Error, ValueError):
             return
 

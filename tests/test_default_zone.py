@@ -2931,16 +2931,18 @@ class DefaultZoneTests(unittest.TestCase):
             with patch.object(ib, "InfobloxClient", return_value=client):
                 with patch.object(ib, "acquire_search_cache_prewarm_lock", return_value=(123, "token")):
                     with patch.object(ib, "release_search_cache_prewarm_lock") as release_lock:
-                        with patch.object(ib, "search_zones", return_value=zones) as search_zones:
-                            with patch.object(
-                                ib,
-                                "allrecords_search_entries_for_zone",
-                                return_value=[],
-                            ) as warm_zone:
-                                ib.run_search_cache_prewarm()
+                        with patch.object(ib, "start_zone_serial_cache_revalidation") as start_refresh:
+                            with patch.object(ib, "search_zones", return_value=zones) as search_zones:
+                                with patch.object(
+                                    ib,
+                                    "allrecords_search_entries_for_zone",
+                                    return_value=[],
+                                ) as warm_zone:
+                                    ib.run_search_cache_prewarm()
 
+        start_refresh.assert_not_called()
         search_zones.assert_called_once_with(client, None)
-        warm_zone.assert_called_once_with(client, zones[0])
+        warm_zone.assert_called_once_with(client, zones[0], refresh_freshness=True)
         release_lock.assert_called_once_with((123, "token"))
 
     def test_search_cache_prewarm_uses_selected_zone_scope(self):
@@ -2960,17 +2962,66 @@ class DefaultZoneTests(unittest.TestCase):
                         return_value=(123, "token"),
                     ):
                         with patch.object(ib, "release_search_cache_prewarm_lock") as release_lock:
-                            with patch.object(ib, "search_zones", return_value=zones) as search_zones:
-                                with patch.object(
-                                    ib,
-                                    "allrecords_search_entries_for_zone",
-                                    return_value=[],
-                                ) as warm_zone:
-                                    ib.run_search_cache_prewarm()
+                            with patch.object(ib, "start_zone_serial_cache_revalidation") as start_refresh:
+                                with patch.object(ib, "search_zones", return_value=zones) as search_zones:
+                                    with patch.object(
+                                        ib,
+                                        "allrecords_search_entries_for_zone",
+                                        return_value=[],
+                                    ) as warm_zone:
+                                        ib.run_search_cache_prewarm()
 
+        start_refresh.assert_not_called()
         search_zones.assert_called_once_with(client, "example.com")
-        warm_zone.assert_called_once_with(client, zones[0])
+        warm_zone.assert_called_once_with(client, zones[0], refresh_freshness=True)
         release_lock.assert_called_once_with((123, "token"))
+
+    def test_warm_search_cache_refreshes_valid_record_cache_freshness(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        zones = [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 99}]
+        cached_records = [
+            {
+                "_ref": "allrecords/cached",
+                "type": "record:a",
+                "name": "cached.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.55",
+            }
+        ]
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            if object_type == ib.ZONE_OBJECT:
+                return zones
+            if object_type == ib.ALLRECORDS_OBJECT:
+                raise AssertionError("valid prewarm cache hit should not query allrecords")
+            raise AssertionError(f"unexpected object type: {object_type}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_allrecords_cache(client, "example.com", "99", cached_records)
+                cache_key = ib.allrecords_cache_key(client, "example.com")
+                with ib.connect_search_cache_db() as conn:
+                    conn.execute(
+                        "UPDATE zone_record_cache SET updated_at = ? WHERE cache_key = ?",
+                        (1.0, cache_key),
+                    )
+
+                with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                    with patch.object(ib.time, "time", return_value=200.0):
+                        ib.warm_search_cache(client)
+
+                with ib.connect_search_cache_db() as conn:
+                    row = conn.execute(
+                        "SELECT updated_at FROM zone_record_cache WHERE cache_key = ?",
+                        (cache_key,),
+                    ).fetchone()
+
+        self.assertEqual(float(row["updated_at"]), 200.0)
 
     def test_zone_serial_cache_revalidation_refreshes_serials_under_lock(self):
         class FakeClient:
@@ -4410,9 +4461,15 @@ class DefaultZoneTests(unittest.TestCase):
                                         with patch.object(ib, "dns_context_panel", return_value="context"):
                                             with patch.object(ib.console, "print") as print_mock:
                                                 ib.run_dns_search("cached")
+                with ib.connect_search_cache_db() as conn:
+                    row = conn.execute(
+                        "SELECT updated_at FROM zone_record_cache WHERE cache_key = ?",
+                        (cache_key,),
+                    ).fetchone()
 
         result_refs = {item["_ref"] for _record_type, item in table_records}
         self.assertEqual(result_refs, {"allrecords/cached"})
+        self.assertEqual(float(row["updated_at"]), 1.0)
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "records"])
 
@@ -4933,6 +4990,75 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result_refs, {"allrecords/new"})
         printed = [call.args[0] for call in print_mock.call_args_list]
         self.assertEqual(printed, ["context", "records"])
+
+    def test_dns_search_serves_stale_cache_while_prewarm_is_running(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        zones = [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 2}]
+        stale_records = [
+            {
+                "_ref": "allrecords/old",
+                "type": "record:a",
+                "name": "old.example.com",
+                "zone": "example.com",
+                "address": "192.0.2.57",
+            }
+        ]
+        table_records = []
+
+        def fake_paged_query(client, object_type, params, warn_on_skip=True):
+            raise AssertionError(f"active prewarm should serve cache instead of querying {object_type}")
+
+        def fake_record_table(records):
+            table_records.extend(records)
+            return "records"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.write_zone_serial_cache(client, zones)
+                ib.write_allrecords_cache(client, "example.com", "1", stale_records)
+                ib.search_cache_prewarm_lock_file().write_text("running\n", encoding="utf-8")
+                with patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(ib.DEFAULT_ZONE_ENV, None)
+                    with patch.object(ib, "load_config", return_value={"default_zone": "example.com"}):
+                        with patch.object(ib, "read_session_zone", return_value=None):
+                            with patch.object(ib, "InfobloxClient", return_value=client):
+                                with patch.object(ib, "paged_query", side_effect=fake_paged_query):
+                                    with patch.object(ib, "record_table", side_effect=fake_record_table):
+                                        with patch.object(ib, "dns_context_panel", return_value="context"):
+                                            with patch.object(ib.console, "print") as print_mock:
+                                                ib.run_dns_search("old")
+
+        result_refs = {item["_ref"] for _record_type, item in table_records}
+        self.assertEqual(result_refs, {"allrecords/old"})
+        printed = [call.args[0] for call in print_mock.call_args_list]
+        self.assertEqual(printed, ["context", "records"])
+
+    def test_dns_search_skips_live_fetch_for_uncached_zone_while_prewarm_is_running(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                ib.ensure_allrecords_cache_dir()
+                ib.search_cache_prewarm_lock_file().write_text("running\n", encoding="utf-8")
+                with patch.object(ib, "paged_query") as paged_query:
+                    entries = ib.load_search_entries_for_zone(
+                        client,
+                        {"fqdn": "example.com", "soa_serial_number": 9},
+                        "missing",
+                        False,
+                    )
+
+        self.assertEqual(entries, [])
+        paged_query.assert_not_called()
 
     def test_dns_search_rebuilds_normalized_cache_when_serial_changes(self):
         class FakeClient:
@@ -5875,6 +6001,30 @@ class DefaultZoneTests(unittest.TestCase):
         paged_query.assert_called_once()
         start_refresh.assert_called_once_with()
 
+    def test_zone_serial_query_uses_swr_cache_when_refresh_is_running(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        zones = [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 1}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.object(ib, "paged_query", return_value=zones) as paged_query:
+                    with patch.object(ib, "start_zone_serial_cache_revalidation") as start_refresh:
+                        with patch.object(ib.time, "time", return_value=100):
+                            self.assertEqual(ib.query_zone_serials(client), zones)
+                        ib.zone_serial_cache_revalidate_lock_file(client).write_text(
+                            "running\n",
+                            encoding="utf-8",
+                        )
+                        with patch.object(ib.time, "time", return_value=131):
+                            self.assertEqual(ib.query_zone_serials(client), zones)
+
+        paged_query.assert_called_once()
+        start_refresh.assert_not_called()
+
     def test_zone_serial_query_refreshes_after_swr_window_expires(self):
         class FakeClient:
             server = "https://infoblox.example.com"
@@ -5895,8 +6045,32 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(paged_query.call_count, 2)
         start_refresh.assert_not_called()
 
-    def test_dns_search_worker_count_defaults_to_8(self):
-        self.assertEqual(ib.DNS_SEARCH_WORKERS, 8)
+    def test_zone_serial_query_uses_expired_cache_when_refresh_is_running(self):
+        class FakeClient:
+            server = "https://infoblox.example.com"
+            wapi_version = "v2.12.3"
+            view = "corp"
+
+        client = FakeClient()
+        zones = [{"fqdn": "example.com", "primary_type": "Grid", "soa_serial_number": 1}]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.object(ib, "ALLRECORDS_CACHE_DIR", Path(tmpdir)):
+                with patch.object(ib, "paged_query", return_value=zones) as paged_query:
+                    with patch.object(ib, "start_zone_serial_cache_revalidation") as start_refresh:
+                        with patch.object(ib.time, "time", return_value=100):
+                            self.assertEqual(ib.query_zone_serials(client), zones)
+                        ib.zone_serial_cache_revalidate_lock_file(client).write_text(
+                            "running\n",
+                            encoding="utf-8",
+                        )
+                        with patch.object(ib.time, "time", return_value=431):
+                            self.assertEqual(ib.query_zone_serials(client), zones)
+
+        paged_query.assert_called_once()
+        start_refresh.assert_not_called()
+
+    def test_dns_search_worker_count_defaults_to_10(self):
+        self.assertEqual(ib.DNS_SEARCH_WORKERS, 10)
 
     def test_zone_detail_table_includes_soa_settings(self):
         table = ib.zone_detail_table(

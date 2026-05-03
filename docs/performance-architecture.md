@@ -41,8 +41,8 @@ the list of zones to inspect. If there is more than one zone, it starts a
 min(DNS_SEARCH_WORKERS, number_of_zones)
 ```
 
-`DNS_SEARCH_WORKERS` is currently `8`, so a search across 20 zones can have up to
-8 zones being processed at the same time. As each worker finishes, the executor
+`DNS_SEARCH_WORKERS` is currently `10`, so a search across 20 zones can have up to
+10 zones being processed at the same time. As each worker finishes, the executor
 assigns it another zone until the zone list is complete.
 
 Each worker gets its own cloned Infoblox client. Clones share the same
@@ -60,7 +60,9 @@ duplicates so output remains stable.
 Background prewarm uses the same zone-level worker model. The hidden
 `ib _prewarm-search-cache` command scans either the global forward-zone set or
 the scoped zone set selected by `ib dns zone use <zone>`, then warms each zone
-cache concurrently, also capped by `DNS_SEARCH_WORKERS`.
+cache concurrently, also capped by `DNS_SEARCH_WORKERS`. It uses the normal zone
+serial stale-while-revalidate path, so a hidden serial-only refresh starts only
+when cached serial metadata is stale enough to revalidate.
 
 ## WAPI Connection Pooling
 
@@ -72,7 +74,7 @@ workers share that pool. The pool size follows the search worker limit:
 WAPI_CONNECTION_POOL_SIZE = DNS_SEARCH_WORKERS
 ```
 
-That is currently `8`, matching the maximum number of concurrent zone workers.
+That is currently `10`, matching the maximum number of concurrent zone workers.
 The pool creates HTTP or HTTPS connections lazily as requests need them, then
 keeps healthy idle connections available for later WAPI calls in the same CLI
 process.
@@ -126,8 +128,10 @@ ib _refresh-zone-serial-cache
 ```
 
 That hidden refresh updates only serial metadata. It does not rebuild record
-caches and does not use the 8-worker search pool because the serial refresh is a
-single zone-list query.
+caches and does not use the 10-worker search pool because the serial refresh is a
+single zone-list query. While that refresh lock is active, new foreground zone
+serial reads keep serving the existing cached zone list immediately, even if that
+cache has just passed the normal stale-while-revalidate max age.
 
 If the serial cache is missing, corrupt, or older than 330 seconds, `ib` refreshes
 serial metadata synchronously before continuing. This prevents very old serial
@@ -156,9 +160,17 @@ still displays the PTR target hostname.
 For a zone, cached records are trusted only when the stored `zone_record_cache`
 serial matches the current serial metadata for that zone. If the serial matches,
 `ib` searches local SQLite regardless of row age; `updated_at` is diagnostic
-metadata, not an expiry field. If the serial differs, is missing, or cannot be
-read, `ib` fetches fresh `allrecords` with WAPI paging, normalizes the records,
-and replaces that zone's cached rows.
+metadata, not an expiry field. Background prewarm updates `updated_at` after it
+validates a matching serial so operators can see when the cache was last warmed.
+If the serial differs, is missing, or cannot be read, `ib` fetches fresh
+`allrecords` with WAPI paging, normalizes the records, and replaces that zone's
+cached rows.
+
+When `prewarm.lock` shows a live background warmer, foreground allrecords-backed
+commands do not start their own live record fetches. They serve whatever cached
+SQLite rows are already available, even if the row serial is older than current
+zone metadata, and return no matches for zones that are not cached yet. The
+prewarmer remains responsible for bringing those rows current.
 
 ## Completion Performance
 
@@ -197,7 +209,8 @@ prewarm to finish.
 
 The prewarmer uses `prewarm.lock` to avoid duplicate warmers. If another
 prewarmer is already running, the new one exits. If the lock is older than 600
-seconds, it is considered stale and can be replaced.
+seconds, it is considered stale and can be replaced. Foreground commands also use
+that non-stale lock as the signal to avoid duplicate live allrecords refreshes.
 
 ## Failure Behavior
 
@@ -217,6 +230,6 @@ empty candidate list so the shell remains clean.
 - Secondary zones are skipped during global search and warmup.
 - Cold searches and background warmup process multiple zones concurrently, up to
   the configured worker limit.
-- Zone serial metadata can lag for up to 300 stale-while-revalidate seconds
-  after the 30-second fresh window; record data is still validated against the
-  SOA serial supplied by that serial metadata before reuse.
+- Foreground commands can use zone serial metadata for up to 300
+  stale-while-revalidate seconds after the 30-second fresh window; background
+  prewarm follows the same rule instead of forcing a metadata refresh.
