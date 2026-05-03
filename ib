@@ -26,8 +26,11 @@ Script logic:
    with color-coded DNS record types; -o jq and -o csv use structured emitters,
    while help always remains normal operator-facing help.
 6. Keep shell completion quiet and best-effort. Completion helpers use cached
-   DNS data where possible and return no candidates instead of surfacing
-   network/configuration failures to the shell.
+   DNS data where possible, return no candidates instead of surfacing
+   network/configuration failures to the shell, and append visible command
+   options at command and argument positions so global options such as -o stay
+   discoverable everywhere. Bash completion defaults to the plain shell list,
+   with an opt-in Rich-rendered table for colored candidate browsing.
 7. Convert expected Click, configuration, and WAPI failures into concise
    messages. Tracebacks are reserved for unexpected programming errors.
 
@@ -69,7 +72,7 @@ from typing import Any, Callable, NamedTuple
 try:
     import click
     from cryptography.fernet import Fernet, InvalidToken
-    from click.shell_completion import CompletionItem
+    from click.shell_completion import BashComplete, CompletionItem, add_completion_class
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
@@ -92,6 +95,10 @@ DEFAULT_WAPI_VERSION = "v2.12.3"
 DEFAULT_TIMEOUT = 30
 DEFAULT_ZONE_ENV = "IB_ZONE"
 DEFAULT_VIEW_ENV = "IB_VIEW"
+COMPLETION_LAYOUT_ENV = "IB_COMPLETION_LAYOUT"
+COMPLETION_COLOR_ENV = "IB_COMPLETION_COLOR"
+COMPLETION_MAX_ROWS_ENV = "IB_COMPLETION_MAX_ROWS"
+COMPLETION_RENDER_ENV = "IB_COMPLETION_RENDER"
 CONFIG_META_SECTION = "meta"
 PROFILE_SECTION_PREFIX = "profile:"
 DEFAULT_PROFILE_NAME = "default"
@@ -2037,7 +2044,11 @@ class UsageContextHelpMixin:
 
 class UsageContextCommand(UsageContextHelpMixin, click.Command):
     """Click command base class that includes DNS context in help output."""
-    pass
+
+    def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        """Add command options to empty completions while preserving normal Click suggestions."""
+        items = super().shell_complete(ctx, incomplete)
+        return append_command_option_completion_items(self, ctx, incomplete, items)
 
 
 class DnsCreateCommand(UsageContextCommand):
@@ -2069,6 +2080,101 @@ class DnsDeleteCommand(UsageContextCommand):
         self.format_help_text(ctx, formatter)
         self.format_options(ctx, formatter)
         self.format_epilog(ctx, formatter)
+
+
+def command_option_completion_items(
+    command: click.Command,
+    ctx: click.Context,
+    incomplete: str,
+) -> list[CompletionItem]:
+    """Return visible option names for completions that land in free-form arguments."""
+    prefix = incomplete or "-"
+    items: list[CompletionItem] = []
+    for param in command.params:
+        if not isinstance(param, click.Option) or param.hidden:
+            continue
+        help_text = param.help or None
+        for opt in [*param.opts, *param.secondary_opts]:
+            if opt.startswith(prefix):
+                items.append(CompletionItem(opt, help=help_text))
+
+    help_option = command.get_help_option(ctx)
+    if help_option is not None:
+        help_text = help_option.help or None
+        for opt in [*help_option.opts, *help_option.secondary_opts]:
+            if opt.startswith(prefix):
+                items.append(CompletionItem(opt, help=help_text))
+    return items
+
+
+def option_completion_is_relevant(incomplete: str) -> bool:
+    """Offer options for empty completion and for values already starting with a dash."""
+    return not incomplete or incomplete.startswith("-")
+
+
+def append_command_option_completion_items(
+    command: click.Command,
+    ctx: click.Context,
+    incomplete: str,
+    items: list[CompletionItem],
+) -> list[CompletionItem]:
+    """Append command options to completion results without duplicating values."""
+    if not option_completion_is_relevant(incomplete):
+        return items
+
+    seen = {str(item.value) for item in items}
+    for item in command_option_completion_items(command, ctx, incomplete):
+        if str(item.value) not in seen:
+            items.append(item)
+            seen.add(str(item.value))
+    return items
+
+
+def normalize_completion_items(items: list[Any]) -> list[CompletionItem]:
+    """Convert Click's legacy string completion results to CompletionItem objects."""
+    if items and isinstance(items[0], str):
+        return [CompletionItem(str(item)) for item in items]
+    return items
+
+
+def argument_completion_with_command_options(
+    original_complete: Callable[[click.Context, click.Parameter, str], list[Any]] | None,
+) -> Callable[[click.Context, click.Parameter, str], list[CompletionItem]]:
+    """Wrap argument completion so command options remain visible at argument positions."""
+
+    def complete(
+        ctx: click.Context,
+        param: click.Parameter,
+        incomplete: str,
+    ) -> list[CompletionItem]:
+        if original_complete is not None:
+            items = normalize_completion_items(original_complete(ctx, param, incomplete))
+        else:
+            items = param.type.shell_complete(ctx, param, incomplete)
+        return append_command_option_completion_items(ctx.command, ctx, incomplete, items)
+
+    return complete
+
+
+def register_argument_option_completion(command: click.Command) -> None:
+    """Wrap command arguments once so options complete consistently everywhere."""
+    for param in command.params:
+        if not isinstance(param, click.Argument):
+            continue
+        if getattr(param, "_ib_option_completion_registered", False):
+            continue
+        original_complete = param._custom_shell_complete
+        param._ib_original_shell_complete = original_complete
+        param._custom_shell_complete = argument_completion_with_command_options(original_complete)
+        param._ib_option_completion_registered = True
+
+
+def register_argument_option_completion_everywhere(command: click.Command) -> None:
+    """Attach option-aware argument completion recursively to the command tree."""
+    register_argument_option_completion(command)
+    if isinstance(command, click.Group):
+        for subcommand in command.commands.values():
+            register_argument_option_completion_everywhere(subcommand)
 
 
 def dns_create_click_error_help(exc: click.ClickException) -> str | None:
@@ -2160,6 +2266,11 @@ class UsageContextGroup(UsageContextHelpMixin, click.Group):
     command_class = UsageContextCommand
     group_class = type
 
+    def shell_complete(self, ctx: click.Context, incomplete: str) -> list[CompletionItem]:
+        """Add group options to command-name completions so globals are visible everywhere."""
+        items = super().shell_complete(ctx, incomplete)
+        return append_command_option_completion_items(self, ctx, incomplete, items)
+
 
 def print_click_error_dns_context(exc: click.ClickException) -> None:
     """Add DNS context to command errors so operators can see the target view and zone."""
@@ -2181,6 +2292,225 @@ def append_active_zone_help(item_help: str | None, active_zone_help: str) -> str
     if not item_help:
         return active_zone_help
     return f"{item_help} {active_zone_help}."
+
+
+RICH_BASH_SOURCE = """%(complete_func)s() {
+    local IFS=$'\\n'
+    local response
+
+    response=$(env \\
+        COMP_WORDS="${COMP_WORDS[*]}" \\
+        COMP_CWORD=$COMP_CWORD \\
+        COMP_TYPE="${COMP_TYPE:-9}" \\
+        COLUMNS="${COLUMNS:-80}" \\
+        %(complete_var)s=bash_complete \\
+        IB_COMPLETION_RENDER=1 \\
+        IB_COMPLETION_LAYOUT="${IB_COMPLETION_LAYOUT:-plain}" \\
+        IB_COMPLETION_COLOR="${IB_COMPLETION_COLOR:-auto}" \\
+        IB_COMPLETION_MAX_ROWS="${IB_COMPLETION_MAX_ROWS:-40}" \\
+        "$1")
+
+    for completion in $response; do
+        IFS=',' read -r type value <<< "$completion"
+
+        if [[ $type == 'dir' ]]; then
+            COMPREPLY=()
+            compopt -o dirnames
+        elif [[ $type == 'file' ]]; then
+            COMPREPLY=()
+            compopt -o default
+        elif [[ $type == 'plain' ]]; then
+            COMPREPLY+=("$value")
+        fi
+    done
+
+    return 0
+}
+
+%(complete_func)s_setup() {
+    complete -o nosort -F %(complete_func)s %(prog_name)s
+}
+
+%(complete_func)s_setup;
+"""
+
+
+def completion_layout_mode() -> str:
+    """Return the requested completion layout mode, defaulting to plain Bash completion."""
+    return os.environ.get(COMPLETION_LAYOUT_ENV, "plain").strip().lower()
+
+
+def completion_color_mode() -> str:
+    """Return the requested completion color mode so shell users can disable table rendering."""
+    return os.environ.get(COMPLETION_COLOR_ENV, "auto").strip().lower()
+
+
+def completion_max_rows() -> int:
+    """Limit the Rich completion table so broad cached DNS completions do not flood the terminal."""
+    raw_value = os.environ.get(COMPLETION_MAX_ROWS_ENV, "40")
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return 40
+    return max(1, value)
+
+
+def completion_rich_layout_enabled(items: list[CompletionItem]) -> bool:
+    """Decide whether Bash completion should render a separate Rich candidate table."""
+    if os.environ.get(COMPLETION_RENDER_ENV) != "1":
+        return False
+    if completion_layout_mode() != "rich":
+        return False
+    if completion_color_mode() == "never":
+        return False
+    plain_items = [item for item in items if item.type == "plain"]
+    return len(plain_items) > 1
+
+
+def completion_terminal_width() -> int | None:
+    """Read shell width for completion tables without failing in unusual environments."""
+    raw_columns = os.environ.get("COLUMNS")
+    try:
+        columns = int(raw_columns) if raw_columns else 0
+    except (TypeError, ValueError):
+        return None
+    return columns if columns >= 40 else None
+
+
+def command_completion_values() -> set[str]:
+    """Collect command names so completion tables can label commands consistently."""
+    root = globals().get("cli")
+    if not isinstance(root, click.Group):
+        return set()
+
+    names: set[str] = set()
+    pending = [root]
+    while pending:
+        command = pending.pop()
+        for name, subcommand in command.commands.items():
+            names.add(name)
+            if isinstance(subcommand, click.Group):
+                pending.append(subcommand)
+    return names
+
+
+def completion_record_type_from_help(help_text: str | None) -> str | None:
+    """Extract record type hints from DNS record completion descriptions when present."""
+    if not help_text or help_text == "_":
+        return None
+    token = help_text.split("|", 1)[0].strip().split(" ", 1)[0].lower()
+    if token in RECORD_TYPE_STYLES:
+        return token
+    return None
+
+
+def completion_item_kind_and_style(item: CompletionItem) -> tuple[str, str]:
+    """Classify completion candidates so the Rich table can use stable colors."""
+    value = str(item.value)
+    normalized_value = value.lower()
+
+    if value.startswith("active-zone="):
+        return "Context", "bold yellow"
+    if value.startswith("-"):
+        return "Option", "bold cyan"
+    if normalized_value in RECORD_TYPES:
+        return "Record type", record_type_style(normalized_value)
+
+    record_type = completion_record_type_from_help(item.help)
+    if record_type:
+        return f"{record_type.upper()} record", record_type_style(record_type)
+
+    if value in command_completion_values():
+        return "Command", "bold green"
+    if "." in value:
+        return "Zone/name", "bold blue"
+    return "Value", "white"
+
+
+def completion_item_help(item: CompletionItem) -> str:
+    """Normalize Click's no-description sentinel before rendering completion details."""
+    help_text = item.help or ""
+    return "" if help_text == "_" else str(help_text)
+
+
+def render_bash_completion_table(
+    items: list[CompletionItem],
+    incomplete: str,
+    output_console: Console,
+    max_rows: int | None = None,
+) -> bool:
+    """Render a colored Bash completion table without changing the values Bash inserts."""
+    plain_items = [item for item in items if item.type == "plain"]
+    if len(plain_items) <= 1:
+        return False
+
+    row_limit = max_rows if max_rows is not None else completion_max_rows()
+    shown_items = plain_items[:row_limit]
+    title = "ib completions"
+    if incomplete:
+        title = f"{title} for {incomplete}"
+
+    table = Table(title=title, header_style="bold cyan")
+    table.add_column("Kind", no_wrap=True)
+    table.add_column("Complete", overflow="fold")
+    table.add_column("Details", overflow="fold", style="dim")
+
+    for item in shown_items:
+        kind, style = completion_item_kind_and_style(item)
+        table.add_row(
+            Text(kind, style=style),
+            Text(str(item.value), style=style),
+            completion_item_help(item),
+        )
+
+    hidden_count = len(plain_items) - len(shown_items)
+    if hidden_count > 0:
+        table.caption = (
+            f"Showing {len(shown_items)} of {len(plain_items)} matches. "
+            "Keep typing to narrow results."
+        )
+
+    output_console.print()
+    output_console.print(table)
+    return True
+
+
+def render_bash_completion_table_to_tty(
+    items: list[CompletionItem],
+    incomplete: str,
+) -> bool:
+    """Write the Rich completion table to the terminal while stdout stays reserved for Bash."""
+    if not completion_rich_layout_enabled(items):
+        return False
+
+    color_mode = completion_color_mode()
+    try:
+        with open("/dev/tty", "w", encoding="utf-8", errors="replace") as tty:
+            tty_console = Console(
+                file=tty,
+                force_terminal=color_mode == "always",
+                color_system="standard" if color_mode == "always" else None,
+                width=completion_terminal_width(),
+            )
+            return render_bash_completion_table(items, incomplete, tty_console)
+    except OSError:
+        return False
+
+
+class RichBashComplete(BashComplete):
+    """Bash completion that keeps protocol output plain and renders a Rich side table."""
+
+    source_template = RICH_BASH_SOURCE
+
+    def complete(self) -> str:
+        """Return standard Bash completions after optionally drawing a colored table to the TTY."""
+        args, incomplete = self.get_completion_args()
+        completions = self.get_completions(args, incomplete)
+        render_bash_completion_table_to_tty(completions, incomplete)
+        return "\n".join(self.format_completion(item) for item in completions)
+
+
+add_completion_class(RichBashComplete, "bash")
 
 
 class DnsGroup(UsageContextGroup):
@@ -3143,13 +3473,61 @@ def read_sqlite_allrecords_search_entries(
     except (OSError, sqlite3.Error):
         return None
 
-    entries = []
+    return sqlite_search_entries_from_rows(rows)
+
+
+def sqlite_search_entries_from_rows(
+    rows: list[sqlite3.Row],
+) -> list[dict[str, Any]] | None:
+    """Convert SQLite rows to entries, treating corrupt rows as cache misses."""
+    entries: list[dict[str, Any]] = []
     for row in rows:
         entry = sqlite_search_entry_from_row(row)
         if entry is None:
             return None
         entries.append(entry)
     return entries
+
+
+def sqlite_exact_search_condition(
+    keyword: str,
+    case_sensitive: bool,
+) -> tuple[str, tuple[str, str, str]]:
+    """Build the SQL predicate for the normal exact search path."""
+    if case_sensitive:
+        condition = (
+            "instr(name, ?) > 0 OR "
+            "instr(value, ?) > 0 OR "
+            "instr(comment, ?) > 0"
+        )
+        return condition, (keyword, keyword, keyword)
+
+    needle = keyword.lower()
+    condition = (
+        "instr(lower(name), ?) > 0 OR "
+        "instr(lower(value), ?) > 0 OR "
+        "instr(lower(comment), ?) > 0"
+    )
+    return condition, (needle, needle, needle)
+
+
+def matching_allrecord_search_entries(
+    entries: list[dict[str, Any]],
+    keyword: str,
+    case_sensitive: bool,
+    fuzzy_search: bool,
+) -> list[dict[str, Any]]:
+    """Filter cached entries with the same logic used after live fetches."""
+    return [
+        entry
+        for entry in entries
+        if allrecord_search_entry_matches_keyword(
+            entry,
+            keyword,
+            case_sensitive,
+            fuzzy_search,
+        )
+    ]
 
 
 def search_sqlite_allrecords_cache(
@@ -3171,29 +3549,14 @@ def search_sqlite_allrecords_cache(
         entries = read_sqlite_allrecords_search_entries(client, zone_name, serial_number)
         if entries is None:
             return None
-        return [
-            entry
-            for entry in entries
-            if allrecord_search_entry_matches_keyword(
-                entry,
-                keyword,
-                case_sensitive,
-                fuzzy_search=True,
-            )
-        ]
-
-    if case_sensitive:
-        condition = "instr(name, ?) > 0 OR instr(value, ?) > 0 OR instr(comment, ?) > 0"
-        params = (keyword, keyword, keyword)
-    else:
-        needle = keyword.lower()
-        condition = (
-            "instr(lower(name), ?) > 0 OR "
-            "instr(lower(value), ?) > 0 OR "
-            "instr(lower(comment), ?) > 0"
+        return matching_allrecord_search_entries(
+            entries,
+            keyword,
+            case_sensitive,
+            fuzzy_search=True,
         )
-        params = (needle, needle, needle)
 
+    condition, params = sqlite_exact_search_condition(keyword, case_sensitive)
     try:
         with connect_search_cache_db() as conn:
             if not sqlite_zone_record_cache_is_valid(conn, cache_key, serial_number):
@@ -3209,14 +3572,15 @@ def search_sqlite_allrecords_cache(
     except (OSError, sqlite3.Error):
         return None
 
-    entries = []
-    for row in rows:
-        entry = sqlite_search_entry_from_row(row)
-        if entry is None:
-            return None
-        if allrecord_search_entry_matches_exact_keyword(entry, keyword, case_sensitive):
-            entries.append(entry)
-    return entries
+    entries = sqlite_search_entries_from_rows(rows)
+    if entries is None:
+        return None
+    return matching_allrecord_search_entries(
+        entries,
+        keyword,
+        case_sensitive,
+        fuzzy_search=False,
+    )
 
 
 def read_legacy_allrecords_cache_payload(
@@ -3734,6 +4098,34 @@ def fuzzy_search_windows(candidate: str, keyword: str) -> list[str]:
     return windows
 
 
+def fuzzy_search_comparison_candidates(
+    candidate: str,
+    keyword: str,
+    case_sensitive: bool,
+) -> list[str]:
+    """Return the direct token or sliding windows worth comparing."""
+    normalized_candidate = normalized_search_text(candidate, case_sensitive)
+    if not normalized_candidate:
+        return []
+    if fuzzy_search_length_is_close(keyword, normalized_candidate):
+        return [normalized_candidate]
+    return [
+        normalized_search_text(window, case_sensitive)
+        for window in fuzzy_search_windows(candidate, keyword)
+    ]
+
+
+def fuzzy_search_candidate_matches(
+    keyword: str,
+    candidate: str,
+    threshold: float,
+) -> bool:
+    """Compare one normalized candidate after the length guard."""
+    if not fuzzy_search_length_is_close(keyword, candidate):
+        return False
+    return difflib.SequenceMatcher(None, keyword, candidate).ratio() >= threshold
+
+
 def search_value_fuzzy_match(value: str, keyword: str, case_sensitive: bool) -> bool:
     """Return typo-tolerant matches against useful tokens without making search too broad."""
     needle = normalized_search_text(keyword, case_sensitive)
@@ -3742,19 +4134,13 @@ def search_value_fuzzy_match(value: str, keyword: str, case_sensitive: bool) -> 
 
     threshold = fuzzy_search_threshold(needle)
     for candidate in fuzzy_search_candidates(value):
-        normalized_candidate = normalized_search_text(candidate, case_sensitive)
-        if not normalized_candidate:
-            continue
-        comparison_candidates = [normalized_candidate]
-        if not fuzzy_search_length_is_close(needle, normalized_candidate):
-            comparison_candidates = [
-                normalized_search_text(window, case_sensitive)
-                for window in fuzzy_search_windows(candidate, keyword)
-            ]
+        comparison_candidates = fuzzy_search_comparison_candidates(
+            candidate,
+            needle,
+            case_sensitive,
+        )
         for comparison_candidate in comparison_candidates:
-            if not fuzzy_search_length_is_close(needle, comparison_candidate):
-                continue
-            if difflib.SequenceMatcher(None, needle, comparison_candidate).ratio() >= threshold:
+            if fuzzy_search_candidate_matches(needle, comparison_candidate, threshold):
                 return True
     return False
 
@@ -3863,7 +4249,15 @@ def allrecord_search_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, st
 
 def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
     """Create a per-thread client so concurrent zone queries do not share HTTPS connections."""
-    attrs = ("server", "wapi_version", "username", "password", "view", "timeout", "verify_ssl")
+    attrs = (
+        "server",
+        "wapi_version",
+        "username",
+        "password",
+        "view",
+        "timeout",
+        "verify_ssl",
+    )
     if not all(hasattr(client, attr) for attr in attrs):
         return client
 
@@ -3880,17 +4274,14 @@ def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
     )
 
 
-def matching_search_entries_for_zone(
+def load_search_entries_for_zone(
     client: InfobloxClient,
     zone_info: dict[str, Any],
     keyword: str,
     case_sensitive: bool,
-    root_zone: str | None,
-    exclude_keywords: tuple[str, ...] = (),
     fuzzy_search: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return matching entries for one zone using cache first, then local keyword filtering."""
-    exclude_keywords = normalize_search_exclude_keywords(exclude_keywords)
+    """Load normalized search entries for one zone, preferring valid cache rows."""
     zone_name = normalize_zone_name(str(zone_info.get("fqdn", "")))
     serial_number = zone_serial(zone_info)
     entries = search_sqlite_allrecords_cache(
@@ -3904,30 +4295,75 @@ def matching_search_entries_for_zone(
     if entries is None:
         entries = read_allrecords_search_cache(client, zone_name, serial_number)
     if entries is None:
-        records = paged_query(client, ALLRECORDS_OBJECT, allrecords_query_params(client, zone_name))
+        records = paged_query(
+            client,
+            ALLRECORDS_OBJECT,
+            allrecords_query_params(client, zone_name),
+        )
         entries = allrecord_search_entries(records, zone_name)
         write_allrecords_cache(client, zone_name, serial_number, records, entries)
+    return entries
 
-    matches = []
-    for entry in entries:
-        if not allrecord_search_entry_matches_keyword(
+
+def search_entry_matches_request(
+    entry: dict[str, Any],
+    keyword: str,
+    case_sensitive: bool,
+    root_zone: str | None,
+    exclude_keywords: tuple[str, ...],
+    fuzzy_search: bool,
+) -> bool:
+    """Apply keyword, root-zone, and exclusion filters to one search entry."""
+    if not allrecord_search_entry_matches_keyword(
+        entry,
+        keyword,
+        case_sensitive,
+        fuzzy_search,
+    ):
+        return False
+
+    record = allrecord_search_entry_record(entry)
+    if root_zone and not record_in_zone_scope(record, root_zone):
+        return False
+    if exclude_keywords and allrecord_search_entry_matches_any_keyword(
+        entry,
+        exclude_keywords,
+        case_sensitive,
+    ):
+        return False
+    return True
+
+
+def matching_search_entries_for_zone(
+    client: InfobloxClient,
+    zone_info: dict[str, Any],
+    keyword: str,
+    case_sensitive: bool,
+    root_zone: str | None,
+    exclude_keywords: tuple[str, ...] = (),
+    fuzzy_search: bool = False,
+) -> list[dict[str, Any]]:
+    """Return entries in one zone that satisfy the requested search filters."""
+    exclude_keywords = normalize_search_exclude_keywords(exclude_keywords)
+    entries = load_search_entries_for_zone(
+        client,
+        zone_info,
+        keyword,
+        case_sensitive,
+        fuzzy_search,
+    )
+    return [
+        entry
+        for entry in entries
+        if search_entry_matches_request(
             entry,
             keyword,
             case_sensitive,
-            fuzzy_search,
-        ):
-            continue
-        record = allrecord_search_entry_record(entry)
-        if root_zone and not record_in_zone_scope(record, root_zone):
-            continue
-        if exclude_keywords and allrecord_search_entry_matches_any_keyword(
-            entry,
+            root_zone,
             exclude_keywords,
-            case_sensitive,
-        ):
-            continue
-        matches.append(entry)
-    return matches
+            fuzzy_search,
+        )
+    ]
 
 
 def collect_dns_search_results(
@@ -5698,7 +6134,10 @@ def completion(shell: str | None) -> None:
     shells = (shell,) if shell else COMPLETION_SHELLS
     console.print(
         Panel.fit(
-            "Enable tab completion for ib commands, options, DNS record types, and active zone hints.",
+            "Enable tab completion for ib commands, options, DNS record types, "
+            "and active zone hints.\n"
+            "Bash uses plain completion by default. Set IB_COMPLETION_LAYOUT=rich "
+            "to enable the colored candidate table.",
             title="ib shell completion setup",
             border_style="cyan",
         )
@@ -5717,6 +6156,12 @@ def completion(shell: str | None) -> None:
             console.rule("[bold cyan]Bash[/bold cyan]")
             console.print("[bold]Current shell only[/bold]")
             print_command_block(['eval "$(_IB_COMPLETE=bash_source ib)"'])
+            console.print(
+                "Plain completion is the default. To enable the colored table, export "
+                "[cyan]IB_COMPLETION_LAYOUT=rich[/cyan]. Use "
+                "[cyan]IB_COMPLETION_COLOR=always[/cyan] to force color, or "
+                "[cyan]IB_COMPLETION_COLOR=never[/cyan] to disable color."
+            )
             console.print("[bold]Persistent setup[/bold]")
             print_command_block(
                 [
@@ -6057,6 +6502,7 @@ def delete(record_name: str, zone: str | None) -> None:
 
 
 register_output_option_everywhere(cli)
+register_argument_option_completion_everywhere(cli)
 
 
 def main() -> int:

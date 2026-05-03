@@ -43,27 +43,7 @@ Push-Location $env:TEMP; pipx upgrade ib; Pop-Location
 Running the upgrade from a neutral directory avoids `pipx` treating a local
 `./ib` checkout or executable as a path instead of the installed package name.
 
-If `pipx` is not installed, install it with your OS package manager first:
-
-```bash
-# Debian / Ubuntu
-sudo apt install pipx
-
-# Fedora / RHEL-like systems
-sudo dnf install pipx
-
-# Arch
-sudo pacman -S python-pipx
-
-# macOS with Homebrew
-brew install pipx
-
-# Windows PowerShell
-py -m pip install --user pipx
-py -m pipx ensurepath
-```
-
-Without `pipx`, use the Python user install path:
+If `pipx` is unavailable, use the Python user install path:
 
 ```bash
 python3 -m pip install --user git+https://github.com/rwahyudi/ib.git
@@ -129,15 +109,6 @@ key files are kept at `0600`.
 
 ## Usage
 
-Start with the built-in help when you want the exact command shape:
-
-```bash
-ib --help
-ib dns --help
-ib dns create --help
-ib dns zone --help
-```
-
 Common workflow:
 
 ```bash
@@ -152,37 +123,6 @@ ib dns create host app 192.0.2.10 -t 300 -c "Application host"
 ib dns edit app host 192.0.2.20 -t 300 -c "Application host"
 ib dns delete app
 ```
-
-Command overview:
-
-- `ib configure` edits the current default Infoblox profile.
-- `ib configure new <profile> [--default]` creates a new profile and lets you
-  choose from the DNS views returned by Infoblox.
-- `ib configure edit [profile] [--default]` edits an existing profile.
-- `ib configure delete <profile>` deletes a non-default profile.
-- `ib configure use <profile>` selects the default profile.
-- `ib configure list` lists configured profiles.
-- Profile names complete in shells with completion enabled; `delete` suggests
-  only non-default profiles, while `new` suggests unused common names.
-- `ib completion [bash|zsh|fish]` prints shell completion setup instructions.
-- `ib dns list [zone]` lists all DNS records in the active or specified zone.
-- `ib dns create <a|aaaa|cname|host|mx|ptr|srv|txt> <name> <value>` creates DNS
-  records.
-- `ib dns edit <name> [a|aaaa|cname|host|mx|ptr|srv|txt] [value]` updates one
-  existing DNS record.
-- `ib dns search [-i] [-g] [-f] [-e <keyword>]... <keyword>` searches records by
-  name, value, or comment. Use `-f` to enable fuzzy matching.
-- `ib dns delete <record-name> [zone]` deletes a single matching A, AAAA,
-  CNAME, TXT, MX, or HOST record.
-- `ib dns delete ptr <ip-address>` deletes a reverse DNS PTR record by full IP address.
-- `ib dns view list` lists DNS views available to the configured Infoblox profile.
-- `ib dns view use <view>` sets the active DNS view for the current shell session.
-- `ib dns zone list [search]` lists authoritative zones in the active view.
-- `ib dns zone view <zone>` shows zone details, network associations, and SOA settings.
-- `ib dns zone create <zone> [--format forward|ipv4|ipv6] [--comment TEXT]
-  [--ns-group TEXT]` creates a zone.
-- `ib dns zone delete <zone>` deletes a zone.
-- `ib dns zone use <zone>` sets the active zone for the current shell session.
 
 Use the global `-o/--output` option to produce structured output. It can be
 placed at the root, on a command group, or after command arguments. Omitting it
@@ -411,15 +351,8 @@ For the full performance flow, parallel worker model, and cache diagram, see
 
 ## List Records
 
-List every record in the active zone:
-
 ```bash
 ib dns list
-```
-
-List every record in a specific zone:
-
-```bash
 ib dns list example.com
 ```
 
@@ -490,8 +423,6 @@ Existing zone names support shell completion for `ib dns zone view` and
 
 ## Completion
 
-Print setup instructions:
-
 ```bash
 ib completion
 ib completion bash
@@ -505,6 +436,11 @@ For Bash in the current shell:
 eval "$(_IB_COMPLETE=bash_source ib)"
 ```
 
+Bash completion is plain by default. To enable the colored candidate table,
+export `IB_COMPLETION_LAYOUT=rich`; use `IB_COMPLETION_COLOR=always` to force
+color or `IB_COMPLETION_COLOR=never` to disable color. Inserted completion
+values remain plain text.
+
 For persistent Bash completion:
 
 ```bash
@@ -513,29 +449,11 @@ printf '\n# ib completion\n. ~/.ib-complete.bash\n' >> ~/.bashrc
 exec bash
 ```
 
-Verify:
-
-```bash
-ib <TAB><TAB>
-ib dns create <TAB><TAB>
-ib dns edit <TAB><TAB>
-ib dns list <TAB><TAB>
-ib dns delete <TAB><TAB>
-ib dns zone view <TAB><TAB>
-```
-
 ## Troubleshooting
 
 Run `ib configure` if you see a missing configuration or credential error. Use
 `ib configure list` and `ib configure use <profile>` to inspect or switch the
 default profile.
-
-Check the active context:
-
-```bash
-ib --help
-ib dns --help
-```
 
 Use `--zone` with `ib dns create`, or pass the optional positional zone to
 `ib dns delete`, when the active zone is not the target zone.

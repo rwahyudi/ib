@@ -52,6 +52,9 @@ class DefaultZoneTests(unittest.TestCase):
         for name, subcommand in getattr(command, "commands", {}).items():
             self.assert_command_tree_has_output_option(subcommand, f"{path} {name}")
 
+    def original_shell_complete(self, param):
+        return getattr(param, "_ib_original_shell_complete", param._custom_shell_complete)
+
     def test_pyproject_installs_existing_ib_script(self):
         pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
 
@@ -764,6 +767,240 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertNotIn("plain,-n", result.output.splitlines())
         self.assertNotIn("plain,--name", result.output.splitlines())
+
+    def test_root_completion_includes_global_options(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib ",
+                "COMP_CWORD": "1",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,dns", output_lines)
+        self.assertIn("plain,-o", output_lines)
+        self.assertIn("plain,--output", output_lines)
+
+    def test_dns_group_completion_includes_global_options_and_context(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "IB_ZONE": "example.com",
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns ",
+                "COMP_CWORD": "2",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,active-zone=example.com", output_lines)
+        self.assertIn("plain,create", output_lines)
+        self.assertIn("plain,-o", output_lines)
+        self.assertIn("plain,--output", output_lines)
+
+    def test_dns_create_completion_includes_options_before_record_type(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns create ",
+                "COMP_CWORD": "3",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,a", output_lines)
+        self.assertIn("plain,--zone", output_lines)
+        self.assertIn("plain,-o", output_lines)
+        self.assertIn("plain,--output", output_lines)
+        self.assertNotIn("plain,-n", output_lines)
+        self.assertNotIn("plain,--name", output_lines)
+
+    def test_custom_argument_completion_keeps_options_available(self):
+        runner = CliRunner()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                result = runner.invoke(
+                    ib.cli,
+                    [],
+                    prog_name="ib",
+                    env={
+                        "_IB_COMPLETE": "bash_complete",
+                        "COMP_WORDS": "ib configure new ",
+                        "COMP_CWORD": "3",
+                    },
+                )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        output_lines = result.output.splitlines()
+        self.assertIn("plain,default", output_lines)
+        self.assertIn("plain,--default", output_lines)
+        self.assertIn("plain,-o", output_lines)
+        self.assertIn("plain,--output", output_lines)
+
+    def test_dns_search_completion_includes_options_before_keyword(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns search ",
+                "COMP_CWORD": "3",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("plain,-o", result.output.splitlines())
+        self.assertIn("plain,--output", result.output.splitlines())
+
+    def test_dns_search_completion_includes_options_after_keyword(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={
+                "_IB_COMPLETE": "bash_complete",
+                "COMP_WORDS": "ib dns search app ",
+                "COMP_CWORD": "4",
+            },
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("plain,-o", result.output.splitlines())
+        self.assertIn("plain,--output", result.output.splitlines())
+
+    def test_bash_completion_source_defaults_to_plain_layout(self):
+        runner = CliRunner()
+
+        result = runner.invoke(
+            ib.cli,
+            [],
+            prog_name="ib",
+            env={"_IB_COMPLETE": "bash_source"},
+        )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("IB_COMPLETION_RENDER=1", result.output)
+        self.assertIn('IB_COMPLETION_LAYOUT="${IB_COMPLETION_LAYOUT:-plain}"', result.output)
+        self.assertIn('IB_COMPLETION_COLOR="${IB_COMPLETION_COLOR:-auto}"', result.output)
+        self.assertIn('COMPREPLY+=("$value")', result.output)
+
+    def test_bash_completion_protocol_stays_plain_without_ansi(self):
+        runner = CliRunner()
+
+        with patch.object(ib, "render_bash_completion_table_to_tty") as render_table:
+            result = runner.invoke(
+                ib.cli,
+                [],
+                prog_name="ib",
+                env={
+                    "_IB_COMPLETE": "bash_complete",
+                    "COMP_WORDS": "ib dns ",
+                    "COMP_CWORD": "2",
+                    "IB_ZONE": "example.com",
+                },
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        render_table.assert_called_once()
+        self.assertIn("plain,active-zone=example.com", result.output.splitlines())
+        self.assertIn("plain,--output", result.output.splitlines())
+        self.assertNotIn("\x1b[", result.output)
+
+    def test_bash_completion_rich_table_groups_and_colors_items(self):
+        buffer = io.StringIO()
+        completion_console = ib.Console(
+            file=buffer,
+            force_terminal=True,
+            color_system="standard",
+            width=100,
+        )
+        items = [
+            ib.CompletionItem("active-zone=example.com", help="Active zone: example.com"),
+            ib.CompletionItem("dns", help="Manage Infoblox DNS records."),
+            ib.CompletionItem("--output", help="Output format."),
+            ib.CompletionItem("a"),
+            ib.CompletionItem("app.example.com", help="A | 192.0.2.10 | zone=example.com"),
+        ]
+
+        rendered = ib.render_bash_completion_table(
+            items,
+            "",
+            completion_console,
+            max_rows=10,
+        )
+
+        output = buffer.getvalue()
+        self.assertTrue(rendered)
+        self.assertIn("\x1b[", output)
+        self.assertIn("ib completions", output)
+        self.assertIn("Context", output)
+        self.assertIn("Command", output)
+        self.assertIn("Option", output)
+        self.assertIn("Record type", output)
+        self.assertIn("A record", output)
+        self.assertIn("--output", output)
+
+    def test_bash_completion_rich_table_can_be_disabled(self):
+        items = [ib.CompletionItem("one"), ib.CompletionItem("two")]
+
+        with patch.dict(
+            os.environ,
+            {ib.COMPLETION_RENDER_ENV: "1"},
+            clear=True,
+        ):
+            with patch("builtins.open") as open_file:
+                self.assertFalse(ib.render_bash_completion_table_to_tty(items, ""))
+        open_file.assert_not_called()
+
+        with patch.dict(
+            os.environ,
+            {
+                ib.COMPLETION_RENDER_ENV: "1",
+                ib.COMPLETION_LAYOUT_ENV: "plain",
+                ib.COMPLETION_COLOR_ENV: "auto",
+            },
+            clear=True,
+        ):
+            with patch("builtins.open") as open_file:
+                self.assertFalse(ib.render_bash_completion_table_to_tty(items, ""))
+        open_file.assert_not_called()
+
+        with patch.dict(
+            os.environ,
+            {
+                ib.COMPLETION_RENDER_ENV: "1",
+                ib.COMPLETION_LAYOUT_ENV: "rich",
+                ib.COMPLETION_COLOR_ENV: "never",
+            },
+            clear=True,
+        ):
+            with patch("builtins.open") as open_file:
+                self.assertFalse(ib.render_bash_completion_table_to_tty(items, ""))
+        open_file.assert_not_called()
 
     def test_dns_create_rejects_non_integer_ttl(self):
         runner = CliRunner()
@@ -4626,17 +4863,17 @@ class DefaultZoneTests(unittest.TestCase):
     def test_dns_zone_view_uses_zone_name_completion(self):
         zone_view = ib.zone.commands["view"]
 
-        self.assertIs(zone_view.params[0]._custom_shell_complete, ib.complete_zone_names)
+        self.assertIs(self.original_shell_complete(zone_view.params[0]), ib.complete_zone_names)
 
     def test_dns_list_uses_zone_name_completion(self):
         dns_list = ib.dns.commands["list"]
 
-        self.assertIs(dns_list.params[0]._custom_shell_complete, ib.complete_zone_names)
+        self.assertIs(self.original_shell_complete(dns_list.params[0]), ib.complete_zone_names)
 
     def test_dns_view_use_uses_view_name_completion(self):
         view_use = ib.view.commands["use"]
 
-        self.assertIs(view_use.params[0]._custom_shell_complete, ib.complete_dns_view_names)
+        self.assertIs(self.original_shell_complete(view_use.params[0]), ib.complete_dns_view_names)
 
     def test_configure_commands_use_profile_name_completion(self):
         configure_new = ib.configure.commands["new"]
@@ -4644,16 +4881,34 @@ class DefaultZoneTests(unittest.TestCase):
         configure_delete = ib.configure.commands["delete"]
         configure_use = ib.configure.commands["use"]
 
-        self.assertIs(configure_new.params[0]._custom_shell_complete, ib.complete_new_profile_names)
-        self.assertIs(configure_edit.params[0]._custom_shell_complete, ib.complete_existing_profile_names)
-        self.assertIs(configure_delete.params[0]._custom_shell_complete, ib.complete_deletable_profile_names)
-        self.assertIs(configure_use.params[0]._custom_shell_complete, ib.complete_existing_profile_names)
+        self.assertIs(
+            self.original_shell_complete(configure_new.params[0]),
+            ib.complete_new_profile_names,
+        )
+        self.assertIs(
+            self.original_shell_complete(configure_edit.params[0]),
+            ib.complete_existing_profile_names,
+        )
+        self.assertIs(
+            self.original_shell_complete(configure_delete.params[0]),
+            ib.complete_deletable_profile_names,
+        )
+        self.assertIs(
+            self.original_shell_complete(configure_use.params[0]),
+            ib.complete_existing_profile_names,
+        )
 
     def test_dns_edit_uses_record_name_completion(self):
         dns_edit = ib.dns.commands["edit"]
 
-        self.assertIs(dns_edit.params[0]._custom_shell_complete, ib.complete_dns_edit_records)
-        self.assertIs(dns_edit.params[1]._custom_shell_complete, ib.complete_dns_edit_record_types)
+        self.assertIs(
+            self.original_shell_complete(dns_edit.params[0]),
+            ib.complete_dns_edit_records,
+        )
+        self.assertIs(
+            self.original_shell_complete(dns_edit.params[1]),
+            ib.complete_dns_edit_record_types,
+        )
 
     def test_dns_edit_type_completion_only_suggests_existing_record_type(self):
         class FakeClient:
