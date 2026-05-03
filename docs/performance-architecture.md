@@ -1,8 +1,9 @@
 # Performance Architecture
 
 `ib` is designed to make repeated DNS work feel fast even when Infoblox has many
-authoritative zones and records. The speed comes from combining scoped caching,
-SOA serial validation, zone-level parallelism, and background warming.
+authoritative zones and records. The speed comes from combining pooled WAPI
+keep-alive connections, scoped caching, SOA serial validation, zone-level
+parallelism, and background warming.
 
 The important rule is: `ib` can avoid live `allrecords` calls only when it has a
 safe reason to trust local data. Record data is reused when the cached zone
@@ -20,9 +21,10 @@ possible:
 2. Read short-lived zone serial metadata.
 3. Split work by authoritative zone.
 4. Process multiple zones concurrently when more than one zone is in scope.
-5. For each zone, search local SQLite if the cached serial still matches.
-6. Fetch live `allrecords` only for zones that miss cache validation.
-7. Sort and deduplicate records once all zone workers finish.
+5. Borrow pooled keep-alive WAPI connections only for zones that need live data.
+6. For each zone, search local SQLite if the cached serial still matches.
+7. Fetch live `allrecords` only for zones that miss cache validation.
+8. Sort and deduplicate records once all zone workers finish.
 
 This keeps the common hot path local: SQLite lookup, normalized exact field
 matching, optional fuzzy matching, and table/JSON/CSV rendering. Live WAPI calls
@@ -43,9 +45,11 @@ min(DNS_SEARCH_WORKERS, number_of_zones)
 8 zones being processed at the same time. As each worker finishes, the executor
 assigns it another zone until the zone list is complete.
 
-Each worker gets its own cloned Infoblox client. That avoids sharing one HTTPS
-connection object across threads while keeping the same server, WAPI version,
-credentials, DNS view, timeout, and SSL settings.
+Each worker gets its own cloned Infoblox client. Clones share the same
+thread-safe WAPI connection pool, but each request borrows a single checked-out
+HTTP(S) connection while it is in flight. That avoids sharing one connection
+object across threads while still allowing workers to reuse idle keep-alive
+sockets for the same server, WAPI version, DNS view, timeout, and SSL settings.
 
 Threads help here because the expensive parts are I/O-bound: waiting for WAPI,
 reading SQLite, and writing refreshed cache rows. While one worker is waiting on
@@ -57,6 +61,37 @@ Background prewarm uses the same zone-level worker model. The hidden
 `ib _prewarm-search-cache` command scans either the global forward-zone set or
 the scoped zone set selected by `ib dns zone use <zone>`, then warms each zone
 cache concurrently, also capped by `DNS_SEARCH_WORKERS`.
+
+## WAPI Connection Pooling
+
+Live Infoblox calls use a small in-process connection pool. Each
+`InfobloxClient` owns a `WapiConnectionPool`; cloned clients created for search
+workers share that pool. The pool size follows the search worker limit:
+
+```text
+WAPI_CONNECTION_POOL_SIZE = DNS_SEARCH_WORKERS
+```
+
+That is currently `8`, matching the maximum number of concurrent zone workers.
+The pool creates HTTP or HTTPS connections lazily as requests need them, then
+keeps healthy idle connections available for later WAPI calls in the same CLI
+process.
+
+Every WAPI request sends:
+
+```text
+Connection: keep-alive
+```
+
+After reading the full response body, `ib` checks whether the server still allows
+the connection to be reused. If the response says `Connection: close`, or Python's
+HTTP response object marks the socket as closing, the connection is discarded
+instead of being returned to the pool.
+
+Stale keep-alive sockets are handled conservatively. If a borrowed pooled socket
+fails during a `GET`, `ib` closes that socket, opens or borrows another one, and
+retries the `GET` once. Non-`GET` operations are not retried automatically,
+because replaying record or zone mutations could duplicate a write.
 
 ## Cache Layers
 

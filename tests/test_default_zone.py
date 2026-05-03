@@ -1917,12 +1917,16 @@ class DefaultZoneTests(unittest.TestCase):
     def test_infoblox_client_reuses_https_connection(self):
         class FakeResponse:
             status = 200
+            will_close = False
 
             def __init__(self, body):
                 self.body = body
 
             def read(self):
                 return self.body
+
+            def getheader(self, name, default=None):
+                return default
 
         class FakeHTTPSConnection:
             instances = []
@@ -1977,8 +1981,9 @@ class DefaultZoneTests(unittest.TestCase):
             ["/wapi/v2.12.3/record:a?view=corp", "/wapi/v2.12.3/record:host"],
         )
         self.assertIn("Authorization", connection.requests[0]["headers"])
+        self.assertEqual(connection.requests[0]["headers"]["Connection"], "keep-alive")
 
-    def test_cloned_infoblox_client_does_not_share_connection(self):
+    def test_cloned_infoblox_client_shares_connection_pool(self):
         config = {
             "server": "https://infoblox.example.com",
             "username": "admin",
@@ -1989,16 +1994,124 @@ class DefaultZoneTests(unittest.TestCase):
             "timeout": "17",
         }
         client = ib.InfobloxClient(config)
-        client._connection = object()
 
         clone = ib.clone_infoblox_client(client)
 
         self.assertIsInstance(clone, ib.InfobloxClient)
-        self.assertIsNone(clone._connection)
+        self.assertIs(clone._connection_pool, client._connection_pool)
         self.assertEqual(clone.server, client.server)
         self.assertEqual(clone.view, client.view)
         self.assertEqual(clone.timeout, client.timeout)
         self.assertEqual(clone.verify_ssl, client.verify_ssl)
+
+    def test_cloned_infoblox_client_reuses_pooled_connection(self):
+        class FakeResponse:
+            status = 200
+            will_close = False
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def getheader(self, name, default=None):
+                return default
+
+        class FakeHTTPSConnection:
+            instances = []
+
+            def __init__(self, host, port=None, timeout=None, context=None):
+                self.requests = []
+                FakeHTTPSConnection.instances.append(self)
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests.append(path)
+
+            def getresponse(self):
+                return FakeResponse(json.dumps({"request_count": len(self.requests)}).encode("utf-8"))
+
+            def close(self):
+                pass
+
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+        with patch.object(ib.http.client, "HTTPSConnection", FakeHTTPSConnection):
+            client = ib.InfobloxClient(config)
+            clone = ib.clone_infoblox_client(client)
+            first = client.request("GET", "record:a")
+            second = clone.request("GET", "record:host")
+
+        self.assertEqual(first, {"request_count": 1})
+        self.assertEqual(second, {"request_count": 2})
+        self.assertEqual(len(FakeHTTPSConnection.instances), 1)
+        self.assertEqual(
+            FakeHTTPSConnection.instances[0].requests,
+            ["/wapi/v2.12.3/record:a", "/wapi/v2.12.3/record:host"],
+        )
+
+    def test_infoblox_client_retries_stale_pooled_get_connection(self):
+        class FakeResponse:
+            status = 200
+            will_close = False
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def getheader(self, name, default=None):
+                return default
+
+        class FakeHTTPSConnection:
+            instances = []
+
+            def __init__(self, host, port=None, timeout=None, context=None):
+                self.requests = []
+                self.closed = False
+                FakeHTTPSConnection.instances.append(self)
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests.append(path)
+                if len(self.requests) == 2:
+                    raise OSError("stale keep-alive socket")
+
+            def getresponse(self):
+                return FakeResponse(json.dumps({"path": self.requests[-1]}).encode("utf-8"))
+
+            def close(self):
+                self.closed = True
+
+        config = {
+            "server": "https://infoblox.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+        with patch.object(ib.http.client, "HTTPSConnection", FakeHTTPSConnection):
+            client = ib.InfobloxClient(config)
+            client.request("GET", "record:a")
+            result = client.request("GET", "record:host")
+
+        self.assertEqual(result, {"path": "/wapi/v2.12.3/record:host"})
+        self.assertEqual(len(FakeHTTPSConnection.instances), 2)
+        self.assertTrue(FakeHTTPSConnection.instances[0].closed)
+        self.assertEqual(
+            FakeHTTPSConnection.instances[0].requests,
+            ["/wapi/v2.12.3/record:a", "/wapi/v2.12.3/record:host"],
+        )
+        self.assertEqual(FakeHTTPSConnection.instances[1].requests, ["/wapi/v2.12.3/record:host"])
 
     def test_dns_create_rejects_negative_ttl_option(self):
         runner = CliRunner()

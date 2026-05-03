@@ -16,12 +16,12 @@ Script logic:
    exact name/value/comment matching by default; -f adds typo-tolerant fuzzy
    matching when the operator wants broader results. Validation stays local
    where possible so operators get actionable errors before WAPI calls.
-4. Use WAPI paging for list/search operations and cache allrecords data in
-   SQLite. SOA serial checks decide whether cached data is still valid; the
-   short-lived serial list uses stale-while-revalidate so foreground reads stay
-   responsive while a hidden refresh updates slightly old serial metadata.
-   Writes clear and prewarm the cache so later search/completion calls stay
-   fast.
+4. Use pooled keep-alive WAPI connections, WAPI paging for list/search
+   operations, and cached allrecords data in SQLite. SOA serial checks decide
+   whether cached data is still valid; the short-lived serial list uses
+   stale-while-revalidate so foreground reads stay responsive while a hidden
+   refresh updates slightly old serial metadata. Writes clear and prewarm the
+   cache so later search/completion calls stay fast.
 5. Render output according to the active mode. The default is Rich table output
    with color-coded DNS record types; -o jq and -o csv use structured emitters,
    while help always remains normal operator-facing help.
@@ -63,8 +63,10 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -119,6 +121,7 @@ ENCRYPTED_PASSWORD_PREFIX = "enc:v1:"
 COMMENT_ALLOWED_RE = re.compile(r"^[A-Za-z0-9 .,_:;@#%+=/()[\]'&-]*$")
 WAPI_PAGE_SIZE = 2000
 DNS_SEARCH_WORKERS = 8
+WAPI_CONNECTION_POOL_SIZE = DNS_SEARCH_WORKERS
 FUZZY_SEARCH_MIN_KEYWORD_LENGTH = 3
 FUZZY_SEARCH_SHORT_KEYWORD_LENGTH = 4
 FUZZY_SEARCH_SHORT_RATIO = 0.75
@@ -1269,9 +1272,117 @@ def load_config(required: bool = True) -> dict[str, str] | None:
     return cfg
 
 
+class PooledWapiConnection(NamedTuple):
+    """One borrowed WAPI connection plus whether it came from the idle pool."""
+
+    connection: http.client.HTTPConnection
+    reused: bool
+
+
+class WapiConnectionPool:
+    """Small thread-safe keep-alive pool for WAPI HTTP connections."""
+
+    def __init__(
+        self,
+        server_url: urllib.parse.SplitResult,
+        server_port: int | None,
+        timeout: int,
+        verify_ssl: bool,
+        max_size: int = WAPI_CONNECTION_POOL_SIZE,
+    ) -> None:
+        self.server_url = server_url
+        self.server_port = server_port
+        self.timeout = timeout
+        self.verify_ssl = verify_ssl
+        self.max_size = max(1, max_size)
+        self._idle: deque[http.client.HTTPConnection] = deque()
+        self._active_count = 0
+        self._condition = threading.Condition()
+
+    def create_connection(self) -> http.client.HTTPConnection:
+        """Create one HTTP(S) connection configured for the target Infoblox server."""
+        if self.server_url.scheme == "https":
+            context = None if self.verify_ssl else ssl._create_unverified_context()
+            return http.client.HTTPSConnection(
+                self.server_url.hostname,
+                port=self.server_port,
+                timeout=self.timeout,
+                context=context,
+            )
+        return http.client.HTTPConnection(
+            self.server_url.hostname,
+            port=self.server_port,
+            timeout=self.timeout,
+        )
+
+    def acquire(self) -> PooledWapiConnection:
+        """Borrow an idle keep-alive connection or create one when the pool has capacity."""
+        while True:
+            with self._condition:
+                if self._idle:
+                    return PooledWapiConnection(self._idle.pop(), True)
+                if self._active_count < self.max_size:
+                    self._active_count += 1
+                    break
+                self._condition.wait()
+
+        try:
+            return PooledWapiConnection(self.create_connection(), False)
+        except Exception:
+            with self._condition:
+                self._active_count -= 1
+                self._condition.notify()
+            raise
+
+    def release(self, conn: http.client.HTTPConnection) -> None:
+        """Return a healthy keep-alive connection to the idle pool."""
+        with self._condition:
+            self._idle.append(conn)
+            self._condition.notify()
+
+    def discard(self, conn: http.client.HTTPConnection) -> None:
+        """Close a broken or non-reusable connection and free its pool slot."""
+        try:
+            conn.close()
+        finally:
+            with self._condition:
+                self._active_count = max(0, self._active_count - 1)
+                self._condition.notify()
+
+    def close_idle(self) -> None:
+        """Close idle pooled sockets without interrupting requests already in flight."""
+        with self._condition:
+            idle_connections = list(self._idle)
+            self._idle.clear()
+            self._active_count = max(0, self._active_count - len(idle_connections))
+            self._condition.notify_all()
+
+        for conn in idle_connections:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
+def response_allows_keepalive(response: http.client.HTTPResponse) -> bool:
+    """Return whether an HTTP response left the socket reusable for another request."""
+    connection_header = ""
+    getheader = getattr(response, "getheader", None)
+    if callable(getheader):
+        connection_header = str(getheader("Connection", "") or "")
+    if connection_header.lower() == "close":
+        return False
+    return not bool(getattr(response, "will_close", False))
+
+
 class InfobloxClient:
     """Wrap Infoblox WAPI HTTPS calls so command logic stays focused on DNS behavior."""
-    def __init__(self, config: dict[str, str]) -> None:
+
+    def __init__(
+        self,
+        config: dict[str, str],
+        connection_pool: WapiConnectionPool | None = None,
+    ) -> None:
         """Initialize the instance with state used by the surrounding class methods."""
         self.server = normalize_server(config["server"])
         self.wapi_version = config.get("wapi_version", DEFAULT_WAPI_VERSION).strip().lstrip("/")
@@ -1288,36 +1399,16 @@ class InfobloxClient:
         except ValueError as exc:
             raise CliError(f"ERROR: invalid Infoblox server URL: {self.server}") from exc
         self._server_path = self._server_url.path.rstrip("/")
-        self._connection: http.client.HTTPConnection | None = None
+        self._connection_pool = connection_pool or WapiConnectionPool(
+            self._server_url,
+            self._server_port,
+            self.timeout,
+            self.verify_ssl,
+        )
 
     def close(self) -> None:
-        """Close the cached HTTPS connection so callers can release network resources explicitly."""
-        if self._connection is None:
-            return
-        try:
-            self._connection.close()
-        finally:
-            self._connection = None
-
-    def connection(self) -> http.client.HTTPConnection:
-        """Return an HTTPS connection, reusing it so repeated WAPI requests avoid reconnect overhead."""
-        if self._connection is not None:
-            return self._connection
-        if self._server_url.scheme == "https":
-            context = None if self.verify_ssl else ssl._create_unverified_context()
-            self._connection = http.client.HTTPSConnection(
-                self._server_url.hostname,
-                port=self._server_port,
-                timeout=self.timeout,
-                context=context,
-            )
-        else:
-            self._connection = http.client.HTTPConnection(
-                self._server_url.hostname,
-                port=self._server_port,
-                timeout=self.timeout,
-            )
-        return self._connection
+        """Close idle pooled HTTPS connections so callers can release network resources explicitly."""
+        self._connection_pool.close_idle()
 
     def request_path(self, path: str, params: dict[str, Any] | None = None) -> str:
         """Build the WAPI request path with query parameters encoded once for consistent requests."""
@@ -1337,18 +1428,15 @@ class InfobloxClient:
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Any:
-        """Execute one WAPI request and retry once after connection resets to handle stale keep-alive sockets."""
-        had_connection = self._connection is not None
+        """Execute one WAPI request and retry once after a pooled GET socket goes stale."""
         try:
             return self.request_once(method, path, params, payload)
         except (OSError, http.client.HTTPException) as exc:
-            self.close()
-            if method.upper() != "GET" or not had_connection:
+            if method.upper() != "GET" or not getattr(exc, "_ib_reused_connection", False):
                 raise self.connection_error(exc) from exc
             try:
                 return self.request_once(method, path, params, payload)
             except (OSError, http.client.HTTPException) as retry_exc:
-                self.close()
                 raise self.connection_error(retry_exc) from retry_exc
 
     def request_once(
@@ -1362,6 +1450,7 @@ class InfobloxClient:
         body = None
         headers = {
             "Accept": "application/json",
+            "Connection": "keep-alive",
             "Authorization": "Basic "
             + base64.b64encode(f"{self.username}:{self.password}".encode()).decode(),
         }
@@ -1369,21 +1458,39 @@ class InfobloxClient:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        conn = self.connection()
-        conn.request(method, self.request_path(path, params), body=body, headers=headers)
-        response = conn.getresponse()
-        raw_bytes = response.read()
-        if response.status >= 400:
-            raw_error = raw_bytes.decode("utf-8", errors="replace")
-            raise WapiError(
-                f"ERROR: Infoblox WAPI {response.status}: {format_wapi_error(raw_error)}",
-                status=response.status,
-            )
+        pooled = self._connection_pool.acquire()
+        conn = pooled.connection
+        keep_connection = False
+        try:
+            conn.request(method, self.request_path(path, params), body=body, headers=headers)
+            response = conn.getresponse()
+            raw_bytes = response.read()
+            keep_connection = response_allows_keepalive(response)
+            if response.status >= 400:
+                raw_error = raw_bytes.decode("utf-8", errors="replace")
+                raise WapiError(
+                    f"ERROR: Infoblox WAPI {response.status}: {format_wapi_error(raw_error)}",
+                    status=response.status,
+                )
 
-        raw = raw_bytes.decode("utf-8")
-        if not raw:
-            return None
-        return json.loads(raw)
+            raw = raw_bytes.decode("utf-8")
+            result = None if not raw else json.loads(raw)
+        except (OSError, http.client.HTTPException) as exc:
+            setattr(exc, "_ib_reused_connection", pooled.reused)
+            self._connection_pool.discard(conn)
+            raise
+        except Exception:
+            if keep_connection:
+                self._connection_pool.release(conn)
+            else:
+                self._connection_pool.discard(conn)
+            raise
+
+        if keep_connection:
+            self._connection_pool.release(conn)
+        else:
+            self._connection_pool.discard(conn)
+        return result
 
 
 def format_wapi_error(raw: str) -> str:
@@ -4355,7 +4462,7 @@ def allrecord_search_entry_sort_key(entry: dict[str, Any]) -> tuple[str, str, st
 
 
 def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
-    """Create a per-thread client so concurrent zone queries do not share HTTPS connections."""
+    """Create a per-thread client that shares the WAPI connection pool safely."""
     attrs = (
         "server",
         "wapi_version",
@@ -4377,7 +4484,8 @@ def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
             "dns_view": client.view,
             "timeout": str(client.timeout),
             "verify_ssl": "true" if client.verify_ssl else "false",
-        }
+        },
+        connection_pool=getattr(client, "_connection_pool", None),
     )
 
 
