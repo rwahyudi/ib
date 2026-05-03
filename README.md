@@ -365,7 +365,7 @@ address while table and structured output still display the target hostname.
 | Cache | Location | Freshness rule |
 | --- | --- | --- |
 | Zone completion names | `~/.ib/zone-completion-cache.json` | 300 seconds fresh, then 48 hours stale-while-revalidate, scoped to the active DNS view |
-| Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | 30 seconds fresh, then 90 seconds stale-while-revalidate |
+| Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | 30 seconds fresh, then 300 seconds stale-while-revalidate |
 | Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | reused only when the zone SOA serial matches |
 | Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | prevents duplicate warmers; stale after 600 seconds |
 
@@ -513,5 +513,5 @@ ib dns zone info example.com
 The record cache refreshes from Infoblox when the serial number changes.
 Successful record or zone updates clear the DNS caches and start a silent
 background cache warm. Zone serial metadata is fresh for 30 seconds, then may
-lag for up to 90 more seconds while `ib` serves the cached serial list and
+lag for up to 300 more seconds while `ib` serves the cached serial list and
 refreshes it in the background.

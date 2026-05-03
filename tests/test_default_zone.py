@@ -5885,7 +5885,7 @@ class DefaultZoneTests(unittest.TestCase):
                     with patch.object(ib, "start_zone_serial_cache_revalidation") as start_refresh:
                         with patch.object(ib.time, "time", return_value=100):
                             self.assertEqual(ib.query_zone_serials(FakeClient()), first)
-                        with patch.object(ib.time, "time", return_value=221):
+                        with patch.object(ib.time, "time", return_value=431):
                             self.assertEqual(ib.query_zone_serials(FakeClient()), second)
 
         self.assertEqual(paged_query.call_count, 2)
