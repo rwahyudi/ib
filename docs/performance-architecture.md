@@ -97,7 +97,7 @@ because replaying record or zone mutations could duplicate a write.
 
 | Cache | Location | Scope | Freshness rule |
 | --- | --- | --- | --- |
-| Zone completion names | `~/.ib/zone-completion-cache.json` | Active DNS view | 300 seconds |
+| Zone completion names | `~/.ib/zone-completion-cache.json` | Active DNS view | 300 seconds fresh, then 48 hours stale-while-revalidate |
 | Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view | 30 seconds fresh, then 90 seconds stale-while-revalidate |
 | Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | Server, WAPI version, DNS view, zone | SOA serial match |
 | Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | Local machine | Stale after 600 seconds |
@@ -159,9 +159,14 @@ that zone's cached rows.
 ## Completion Performance
 
 Zone-name completion uses the small JSON cache and filters zone names locally by
-the typed prefix. If completion cannot read config, connect to Infoblox, parse
-the cache, or write the cache, it returns no candidates instead of printing
-errors into the shell.
+the typed prefix. Names are fresh for 300 seconds. After that, completion still
+returns the cached names for up to 48 hours and starts the hidden
+`ib _refresh-zone-completion-cache` command to refill the JSON cache in the
+background. If the JSON file is missing, corrupt, scoped to a different DNS
+view, or older than the 48-hour stale window, completion refreshes synchronously
+when possible. If completion cannot read config, connect to Infoblox, parse the
+cache, or write the cache, it returns no candidates instead of printing errors
+into the shell.
 
 Record-name completion for `ib dns delete` and `ib dns edit` uses the DNS search
 cache. It can suggest records outside the active zone because it searches the
@@ -179,9 +184,11 @@ Successful DNS mutations call the shared cache refresh path. That includes:
 - zone delete
 
 The refresh path removes the allrecords cache directory and the zone completion
-JSON file, then starts detached background prewarm. `ib dns zone use <zone>`
-does not clear caches, but it starts detached prewarm scoped to the selected
-zone and its child authoritative zones. Foreground commands do not wait for
+JSON file, then starts detached background prewarm. Zone completion serves stale
+names for up to 48 hours after its 300-second fresh window while a hidden
+refresh updates the JSON file. `ib dns zone use <zone>` does not clear caches,
+but it starts detached prewarm scoped to the selected zone and its child
+authoritative zones. Foreground commands do not wait for
 prewarm to finish.
 
 The prewarmer uses `prewarm.lock` to avoid duplicate warmers. If another

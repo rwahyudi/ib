@@ -905,7 +905,10 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(
                     ib,
                     "read_zone_completion_cache",
-                    return_value=["alpha.example.com", "beta.example.com"],
+                    return_value=ib.ZoneCompletionCacheRead(
+                        ["alpha.example.com", "beta.example.com"],
+                        False,
+                    ),
                 ):
                     result = runner.invoke(
                         ib.cli,
@@ -2797,6 +2800,29 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertTrue(ib.cli.commands["_refresh-zone-serial-cache"].hidden)
         with patch.object(ib, "run_zone_serial_cache_revalidation") as run_refresh:
             ib.cli.commands["_refresh-zone-serial-cache"].callback()
+
+        run_refresh.assert_called_once_with()
+
+    def test_start_zone_completion_cache_revalidation_runs_hidden_command_without_completion_env(self):
+        with patch.dict(os.environ, {"_IB_COMPLETE": "bash_complete", "KEEP_ME": "1"}, clear=False):
+            with patch.object(ib.subprocess, "Popen") as popen:
+                ib.start_zone_completion_cache_revalidation("Lab View")
+
+        command = popen.call_args.args[0]
+        options = popen.call_args.kwargs
+        self.assertEqual(command[0], ib.sys.executable)
+        self.assertEqual(command[-1], "_refresh-zone-completion-cache")
+        self.assertEqual(options["stdin"], ib.subprocess.DEVNULL)
+        self.assertEqual(options["stdout"], ib.subprocess.DEVNULL)
+        self.assertEqual(options["stderr"], ib.subprocess.DEVNULL)
+        self.assertNotIn("_IB_COMPLETE", options["env"])
+        self.assertEqual(options["env"]["KEEP_ME"], "1")
+        self.assertEqual(options["env"][ib.DEFAULT_VIEW_ENV], "Lab View")
+
+    def test_hidden_zone_completion_refresh_command_calls_runner(self):
+        self.assertTrue(ib.cli.commands["_refresh-zone-completion-cache"].hidden)
+        with patch.object(ib, "run_zone_completion_cache_revalidation") as run_refresh:
+            ib.cli.commands["_refresh-zone-completion-cache"].callback()
 
         run_refresh.assert_called_once_with()
 
@@ -5356,6 +5382,166 @@ class DefaultZoneTests(unittest.TestCase):
 
         print_mock.assert_called_once_with("details")
         self.assertIn("Unavailable: Infoblox WAPI 500", table_inputs[0]["network_associations"])
+
+    def test_zone_completion_cache_is_fresh_for_300_seconds(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "zone-completion-cache.json"
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "created_at": 100,
+                        "view": "corp",
+                        "zones": ["beta.example.com", "alpha.example.com"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(ib, "ZONE_COMPLETION_CACHE_FILE", cache_file):
+                with patch.object(ib.time, "time", return_value=399):
+                    cached = ib.read_zone_completion_cache("corp")
+
+        self.assertEqual(cached.names, ["alpha.example.com", "beta.example.com"])
+        self.assertFalse(cached.should_revalidate)
+
+    def test_zone_completion_cache_serves_stale_entries_inside_swr_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "zone-completion-cache.json"
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "created_at": 100,
+                        "view": "corp",
+                        "zones": ["alpha.example.com"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.object(ib, "ZONE_COMPLETION_CACHE_FILE", cache_file):
+                with patch.object(ib.time, "time", return_value=401):
+                    cached = ib.read_zone_completion_cache("corp")
+
+        self.assertEqual(cached.names, ["alpha.example.com"])
+        self.assertTrue(cached.should_revalidate)
+
+    def test_zone_completion_cache_expires_after_48_hour_swr_window(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "zone-completion-cache.json"
+            cache_file.write_text(
+                json.dumps(
+                    {
+                        "created_at": 100,
+                        "view": "corp",
+                        "zones": ["alpha.example.com"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            expired_time = (
+                100
+                + ib.ZONE_COMPLETION_CACHE_TTL
+                + ib.ZONE_COMPLETION_CACHE_STALE_WHILE_REVALIDATE_SECONDS
+                + 1
+            )
+            with patch.object(ib, "ZONE_COMPLETION_CACHE_FILE", cache_file):
+                with patch.object(ib.time, "time", return_value=expired_time):
+                    self.assertIsNone(ib.read_zone_completion_cache("corp"))
+
+    def test_complete_zone_names_returns_stale_cache_and_revalidates_in_background(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "read_zone_completion_cache",
+                    return_value=ib.ZoneCompletionCacheRead(["alpha.example.com"], True),
+                ):
+                    with patch.object(ib, "start_zone_completion_cache_revalidation") as start_refresh:
+                        with patch.object(ib, "refresh_zone_completion_names") as refresh_names:
+                            names = ib.complete_zone_names(None, None, "a")
+
+        self.assertEqual(names, ["alpha.example.com"])
+        start_refresh.assert_called_once_with("corp")
+        refresh_names.assert_not_called()
+
+    def test_search_zone_completion_revalidates_overridden_view(self):
+        class FakeClient:
+            view = "Lab View"
+
+        class FakeContext:
+            params = {"view_name": "Lab View"}
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "read_zone_completion_cache",
+                    return_value=ib.ZoneCompletionCacheRead(["lab.example.com"], True),
+                ):
+                    with patch.object(ib, "start_zone_completion_cache_revalidation") as start_refresh:
+                        names = ib.complete_search_zone_names(FakeContext(), None, "lab")
+
+        self.assertEqual(names, ["lab.example.com"])
+        start_refresh.assert_called_once_with("Lab View")
+
+    def test_complete_zone_names_refreshes_synchronously_when_cache_is_unusable(self):
+        class FakeClient:
+            view = "corp"
+
+        client = FakeClient()
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=client):
+                with patch.object(ib, "read_zone_completion_cache", return_value=None):
+                    with patch.object(
+                        ib,
+                        "refresh_zone_completion_names",
+                        return_value=["alpha.example.com"],
+                    ) as refresh_names:
+                        names = ib.complete_zone_names(None, None, "a")
+
+        self.assertEqual(names, ["alpha.example.com"])
+        refresh_names.assert_called_once_with(client)
+
+    def test_run_zone_completion_cache_revalidation_refreshes_names_under_lock(self):
+        class FakeClient:
+            view = "corp"
+
+        client = FakeClient()
+        lock = (123, "token")
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=client):
+                with patch.object(
+                    ib,
+                    "acquire_zone_completion_cache_revalidate_lock",
+                    return_value=lock,
+                ) as acquire_lock:
+                    with patch.object(
+                        ib,
+                        "release_zone_completion_cache_revalidate_lock",
+                    ) as release_lock:
+                        with patch.object(ib, "refresh_zone_completion_names") as refresh_names:
+                            ib.run_zone_completion_cache_revalidation()
+
+        acquire_lock.assert_called_once_with("corp")
+        refresh_names.assert_called_once_with(client)
+        release_lock.assert_called_once_with("corp", lock)
+
+    def test_run_zone_completion_cache_revalidation_skips_when_fresh_lock_exists(self):
+        class FakeClient:
+            view = "corp"
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(
+                    ib,
+                    "acquire_zone_completion_cache_revalidate_lock",
+                    return_value=None,
+                ):
+                    with patch.object(ib, "refresh_zone_completion_names") as refresh_names:
+                        ib.run_zone_completion_cache_revalidation()
+
+        refresh_names.assert_not_called()
 
     def test_zone_serial_query_includes_primary_type(self):
         class FakeClient:

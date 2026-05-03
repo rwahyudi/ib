@@ -348,7 +348,7 @@ and stored in SQLite.
 
 | Cache | Location | Freshness rule |
 | --- | --- | --- |
-| Zone completion names | `~/.ib/zone-completion-cache.json` | 300 seconds, scoped to the active DNS view |
+| Zone completion names | `~/.ib/zone-completion-cache.json` | 300 seconds fresh, then 48 hours stale-while-revalidate, scoped to the active DNS view |
 | Zone serial metadata | `~/.ib/allrecords-cache/cache.sqlite3` | 30 seconds fresh, then 90 seconds stale-while-revalidate |
 | Record search entries | `~/.ib/allrecords-cache/cache.sqlite3` | reused only when the zone SOA serial matches |
 | Prewarm lock | `~/.ib/allrecords-cache/prewarm.lock` | prevents duplicate warmers; stale after 600 seconds |
@@ -364,7 +364,8 @@ zone's cached rows.
 authoritative zones. Successful DNS record or zone updates clear the DNS caches
 and start a silent background prewarm. Cache failures are treated as performance
 misses: foreground commands fall back to live WAPI calls, while shell completion
-fails quietly.
+fails quietly. Zone-name completion can serve stale cached names for 48 hours
+after the 300-second fresh window while a hidden refresh updates the cache.
 
 For the full performance flow, parallel worker model, and cache diagram, see
 [Performance architecture](docs/performance-architecture.md).
