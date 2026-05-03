@@ -819,6 +819,27 @@ def filter_default_zone_candidates(
     return sorted(matches, key=lambda zone: default_zone_sort_key(zone, search))
 
 
+def default_zone_selection_index(zones: list[dict[str, Any]], default_zone: str = "") -> int:
+    """Return the index of the current default zone so edit prompts can highlight it."""
+    if not default_zone:
+        return 0
+    try:
+        normalized_default = normalize_zone_name(default_zone)
+    except CliError:
+        normalized_default = default_zone.strip().rstrip(".")
+    if not normalized_default:
+        return 0
+
+    for index, zone in enumerate(zones):
+        try:
+            zone_name = normalize_zone_name(default_zone_name(zone))
+        except CliError:
+            continue
+        if zone_name == normalized_default:
+            return index
+    return 0
+
+
 def query_default_zone_candidates_for_config(config_values: dict[str, str]) -> list[dict[str, Any]]:
     """Connect with unsaved profile values and fetch forward authoritative zones for local live filtering."""
     client = InfobloxClient(config_values)
@@ -925,13 +946,13 @@ def normalize_zone_picker_key(sequence: str) -> str:
     return sequence
 
 
-def prompt_default_zone_realtime(zones: list[dict[str, Any]]) -> str:
+def prompt_default_zone_realtime(zones: list[dict[str, Any]], default_zone: str = "") -> str:
     """Let users type-filter the forward-zone list with immediate updates before selecting a zone."""
     import termios
     import tty
 
     search = ""
-    selected_index = 0
+    selected_index = default_zone_selection_index(zones, default_zone)
     stdin_fd = sys.stdin.fileno()
     old_settings = termios.tcgetattr(stdin_fd)
     try:
@@ -990,7 +1011,7 @@ def terminal_supports_realtime_zone_picker() -> bool:
     return True
 
 
-def prompt_default_zone_from_list(zones: list[dict[str, Any]]) -> str:
+def prompt_default_zone_from_list(zones: list[dict[str, Any]], default_zone: str = "") -> str:
     """Fallback zone selector for non-terminal sessions where live key handling is unavailable."""
     search = Prompt.ask("Search DNS zone (leave blank to list all)", default="").strip()
     matches = filter_default_zone_candidates(zones, search)
@@ -1000,29 +1021,30 @@ def prompt_default_zone_from_list(zones: list[dict[str, Any]]) -> str:
 
     render_default_zone_choices(matches)
     choices = [str(index) for index in range(1, len(matches) + 1)]
-    selected = Prompt.ask("Select default DNS zone", choices=choices, default=choices[0])
+    default_index = default_zone_selection_index(matches, default_zone)
+    selected = Prompt.ask("Select default DNS zone", choices=choices, default=choices[default_index])
     zone_name = default_zone_name(matches[int(selected) - 1])
     return normalize_zone_name(zone_name)
 
 
-def prompt_default_zone_from_infoblox(config_values: dict[str, str]) -> str:
-    """Optionally fetch forward zones and select one as the new profile's default zone."""
+def prompt_default_zone_from_infoblox(config_values: dict[str, str], default_zone: str = "") -> str:
+    """Optionally fetch forward zones and select one as the profile's default zone."""
     if not Confirm.ask("Configure a default DNS zone for this profile", default=True):
-        return ""
+        return normalize_zone_name(default_zone) if default_zone else ""
 
     try:
         zones = query_default_zone_candidates_for_config(config_values)
     except (CliError, OSError, ValueError) as exc:
         print_warning(f"WARNING: could not load DNS zones from Infoblox: {exc}")
-        return prompt_manual_default_zone()
+        return prompt_manual_default_zone(default_zone)
 
     if not zones:
         print_warning("WARNING: Infoblox returned no forward DNS zones. Enter the default zone manually.")
-        return prompt_manual_default_zone()
+        return prompt_manual_default_zone(default_zone)
 
     if terminal_supports_realtime_zone_picker():
-        return prompt_default_zone_realtime(zones)
-    return prompt_default_zone_from_list(zones)
+        return prompt_default_zone_realtime(zones, default_zone)
+    return prompt_default_zone_from_list(zones, default_zone)
 
 
 def save_config_interactive(
@@ -1077,34 +1099,31 @@ def save_config_interactive(
     wapi_version = Prompt.ask(
         "WAPI version", default=current.get("wapi_version", DEFAULT_WAPI_VERSION)
     )
+    verify_ssl = Confirm.ask(
+        "Verify SSL certificates",
+        default=parse_bool(current.get("verify_ssl", "true")),
+    )
+    probe_config = {
+        "server": server,
+        "username": username,
+        "password": password,
+        "wapi_version": wapi_version,
+        "dns_view": current.get("dns_view", "default"),
+        "verify_ssl": "true" if verify_ssl else "false",
+        "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
+    }
     if is_new_profile:
-        verify_ssl = Confirm.ask(
-            "Verify SSL certificates",
-            default=parse_bool(current.get("verify_ssl", "true")),
-        )
-        probe_config = {
-            "server": server,
-            "username": username,
-            "password": password,
-            "wapi_version": wapi_version,
-            "dns_view": current.get("dns_view", "default"),
-            "verify_ssl": "true" if verify_ssl else "false",
-            "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
-        }
         dns_view = prompt_dns_view_from_infoblox(
             probe_config,
             current.get("dns_view", "default"),
         )
-        probe_config["dns_view"] = dns_view
-        default_zone = prompt_default_zone_from_infoblox(probe_config)
     else:
         dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
-        default_zone = prompt_manual_default_zone(current.get("default_zone", ""))
-    if not is_new_profile:
-        verify_ssl = Confirm.ask(
-            "Verify SSL certificates",
-            default=parse_bool(current.get("verify_ssl", "true")),
-        )
+    probe_config["dns_view"] = dns_view
+    default_zone = prompt_default_zone_from_infoblox(
+        probe_config,
+        current.get("default_zone", ""),
+    )
 
     default_config = {
         "server": server,
@@ -3141,7 +3160,7 @@ def run_dns_create(
         resolved_zone = resolve_dns_create_zone(config, client, record_type, name, zone)
         warn_if_cname_target_unresolved(record_type, value)
         object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
-        ref = client.request("POST", object_type, payload=payload)
+        client.request("POST", object_type, payload=payload)
     except CliError as exc:
         error_message = str(exc)
         context = dns_create_error_context(
@@ -3169,12 +3188,10 @@ def run_dns_create(
             name=payload.get("name") or dns_create_target_name(name, resolved_zone),
             zone=resolved_zone,
             view=view,
-            ref=ref,
             message=f"created {record_type.upper()} record",
         )
         return
     print_success(f"SUCCESS: created {record_type.upper()} record")
-    print_note(f"Reference: {ref}")
 
 
 def update_value_payload(record_type: str, value: str) -> dict[str, Any]:
@@ -5166,7 +5183,7 @@ def run_dns_edit(
     if value is not None:
         warn_if_cname_target_unresolved(actual_type, value)
     payload = update_payload(actual_type, value, ttl, comment)
-    updated_ref = client.request("PUT", ref, payload=payload)
+    client.request("PUT", ref, payload=payload)
 
     if noptr and actual_type not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
@@ -5179,12 +5196,10 @@ def run_dns_edit(
             name=target,
             zone=str(item.get("zone", "")),
             view=client.view,
-            ref=updated_ref or ref,
             message=f"updated {actual_type.upper()} record",
         )
         return
     print_success(f"SUCCESS: updated {actual_type.upper()} record {target}")
-    print_note(f"Reference: {updated_ref or ref}")
 
 
 def ptr_delete_ip_address(ip_value: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
@@ -5290,7 +5305,6 @@ def run_dns_delete_ptr(ip_value: str | None) -> None:
             name=str(address),
             zone=reverse_zone,
             view=client.view,
-            ref=ref,
             message=f"deleted PTR record {address}",
         )
         return
@@ -5371,7 +5385,6 @@ def run_dns_delete(record_name: str, zone: str | None) -> None:
             name=target,
             zone=str(item.get("zone", "")),
             view=client.view,
-            ref=ref,
             message=f"deleted {record_type.upper()} record {target}",
         )
         return
@@ -6367,12 +6380,12 @@ def refresh_zone_serial_cache() -> None:
 def configure(ctx: click.Context) -> None:
     """Create or update Infoblox connection profiles in ~/.ib/config.
 
-    Prompts for the Infoblox server, username, password, WAPI version, DNS view,
-    default DNS zone, and SSL verification preference.
+    Prompts for the Infoblox server, username, password, WAPI version, SSL
+    verification preference, DNS view, and default DNS zone.
     New profile setup connects with the entered credentials and lists available
-    Infoblox DNS views so the saved view can be selected from live data. It can
-    also open a live forward-zone picker and save one DNS zone as the profile
-    default.
+    Infoblox DNS views so the saved view can be selected from live data. Profile
+    setup can also open a live forward-zone picker and save one DNS zone as the
+    profile default.
 
     You can run this command multiple times. Without a subcommand, it edits the
     current default profile. Existing values are shown as defaults, so pressing

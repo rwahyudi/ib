@@ -72,19 +72,20 @@ ib configure
 - Infoblox server
 - Username and password
 - WAPI version
+- SSL verification preference
 - DNS view
 - Default DNS zone
-- SSL verification preference
 
 When a new profile is created, `ib configure` connects to Infoblox with the
 entered credentials and lists available DNS views so you can select one. If the
 DNS view lookup fails, the command falls back to manual DNS view entry and still
 saves the profile.
 
-New profile setup also asks whether to configure a default DNS zone, with yes
-as the default answer. If you choose yes, it loads forward zones from the
-selected DNS view, including subdomain zones, and shows a live search box where
-the zone list filters as you type. Reverse zones are excluded from selection.
+Profile setup also asks whether to configure a default DNS zone, with yes as the
+default answer. If you choose yes, it loads forward zones from the selected DNS
+view, including subdomain zones, and shows a live search box where the zone list
+filters as you type. Reverse zones are excluded from selection. This picker is
+used by `ib configure`, `ib configure new`, and `ib configure edit`.
 
 Manage multiple profiles with:
 

@@ -88,11 +88,12 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
                     with patch.object(ib, "create_payload", side_effect=fake_create_payload):
                         with patch.object(ib, "read_session_zone", return_value=None):
-                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note") as print_note:
                                 ib.run_dns_create("a", "192.0.2.10", "app", None, None, False, None)
 
         self.assertEqual(seen["zone"], "example.com")
         self.assertEqual(seen["request"][0], "POST")
+        print_note.assert_not_called()
         self.cache_refresh.assert_called_once_with()
 
     def test_dns_create_uses_matching_forward_zone_from_fqdn_name(self):
@@ -579,7 +580,7 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "read_session_zone", return_value=None):
                     with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
                         with patch.object(ib, "safe_query", side_effect=fake_safe_query):
-                            with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                            with patch.object(ib, "print_success"), patch.object(ib, "print_note") as print_note:
                                 ib.run_dns_edit(
                                     "app",
                                     "a",
@@ -612,6 +613,7 @@ class DefaultZoneTests(unittest.TestCase):
                 "comment": "Application host",
             },
         )
+        print_note.assert_not_called()
         self.cache_refresh.assert_called_once_with()
 
     def test_dns_edit_accepts_metadata_only_without_type_or_value(self):
@@ -1659,6 +1661,10 @@ class DefaultZoneTests(unittest.TestCase):
 
     def test_configure_edit_updates_existing_profile_and_keeps_blank_password(self):
         runner = CliRunner()
+        zones = [
+            {"fqdn": "new.example.com", "zone_format": "FORWARD", "comment": "New default"},
+            {"fqdn": "old.example.com", "zone_format": "FORWARD", "comment": "Old default"},
+        ]
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.config_path_patch(tmpdir):
                 ib.write_config_profiles(
@@ -1680,10 +1686,15 @@ class DefaultZoneTests(unittest.TestCase):
                     with patch.object(
                         ib.Prompt,
                         "ask",
-                        side_effect=["", "v2.13", "new-view", "new.example.com"],
+                        side_effect=["", "v2.13", "new-view", "new", "1"],
                     ):
-                        with patch.object(ib.Confirm, "ask", return_value=False):
-                            result = runner.invoke(ib.cli, ["configure", "edit", "prod"])
+                        with patch.object(ib.Confirm, "ask", side_effect=[False, True]):
+                            with patch.object(
+                                ib,
+                                "query_default_zone_candidates_for_config",
+                                return_value=ib.selectable_zone_records(zones),
+                            ) as query_zones:
+                                result = runner.invoke(ib.cli, ["configure", "edit", "prod"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1696,6 +1707,56 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(profiles["prod"]["dns_view"], "new-view")
         self.assertEqual(profiles["prod"]["default_zone"], "new.example.com")
         self.assertEqual(profiles["prod"]["verify_ssl"], "false")
+        query_config = query_zones.call_args.args[0]
+        self.assertEqual(query_config["dns_view"], "new-view")
+        self.assertEqual(query_config["verify_ssl"], "false")
+
+    def test_configure_existing_default_profile_uses_zone_search_picker(self):
+        runner = CliRunner()
+        zones = [
+            {"fqdn": "app.example.com", "zone_format": "FORWARD", "comment": "Apps"},
+            {"fqdn": "old.example.com", "zone_format": "FORWARD", "comment": "Old default"},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://prod.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "wapi_version": "v2.12.3",
+                            "dns_view": "old-view",
+                            "default_zone": "old.example.com",
+                            "verify_ssl": "true",
+                        }
+                    },
+                )
+
+                with patch.object(ib, "prompt_text", side_effect=["https://prod.example.com", "prod-user"]):
+                    with patch.object(
+                        ib.Prompt,
+                        "ask",
+                        side_effect=["", "v2.13", "corp", "app", "1"],
+                    ):
+                        with patch.object(ib.Confirm, "ask", side_effect=[True, True]):
+                            with patch.object(
+                                ib,
+                                "query_default_zone_candidates_for_config",
+                                return_value=ib.selectable_zone_records(zones),
+                            ) as query_zones:
+                                result = runner.invoke(ib.cli, ["configure"])
+
+                default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "prod")
+        self.assertEqual(profiles["prod"]["dns_view"], "corp")
+        self.assertEqual(profiles["prod"]["default_zone"], "app.example.com")
+        query_config = query_zones.call_args.args[0]
+        self.assertEqual(query_config["dns_view"], "corp")
+        self.assertEqual(query_config["verify_ssl"], "true")
 
     def test_configure_list_outputs_profiles_without_passwords(self):
         runner = CliRunner()
@@ -3135,10 +3196,12 @@ class DefaultZoneTests(unittest.TestCase):
                     with patch.object(ib, "InfobloxClient", return_value=client):
                         with patch.object(ib, "safe_query", side_effect=fake_safe_query):
                             with patch.object(ib, "print_success"):
-                                ib.run_dns_delete("app.other.example.net", None)
+                                with patch.object(ib, "print_note") as print_note:
+                                    ib.run_dns_delete("app.other.example.net", None)
 
         self.assertEqual(client.deleted_ref, "record:a/app")
         self.assertTrue(all(name == "app.other.example.net" for _object_type, name in queries))
+        print_note.assert_not_called()
         self.cache_refresh.assert_called_once_with()
 
     def test_dns_delete_no_match_for_ip_suggests_ptr_delete_command(self):
@@ -3217,7 +3280,8 @@ class DefaultZoneTests(unittest.TestCase):
                 with patch.object(ib, "query_zones", return_value=zones) as query_zones:
                     with patch.object(ib, "safe_query", side_effect=fake_safe_query):
                         with patch.object(ib, "print_success") as print_success:
-                            ib.run_dns_delete("ptr", "192.168.1.3")
+                            with patch.object(ib, "print_note") as print_note:
+                                ib.run_dns_delete("ptr", "192.168.1.3")
 
         query_zones.assert_called_once_with(client)
         self.assertEqual(seen_params["ipv4addr"], "192.168.1.3")
@@ -3225,6 +3289,7 @@ class DefaultZoneTests(unittest.TestCase):
         print_success.assert_called_once_with(
             "SUCCESS: deleted PTR record 192.168.1.3 from reverse zone 1.168.192.in-addr.arpa"
         )
+        print_note.assert_not_called()
         self.cache_refresh.assert_called_once_with()
 
     def test_dns_delete_ptr_requires_full_ip_address(self):
