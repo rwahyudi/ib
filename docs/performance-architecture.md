@@ -12,6 +12,8 @@ background prewarmer is running, search waits for that warmer, retries the cache
 and only then falls back to live WAPI. Other cold or invalid cache paths fetch
 fresh data and rebuild the local SQLite rows.
 
+![Animated ib cache lookup](assets/cache-animation.svg)
+
 ![ib DNS cache flow](assets/cache-flow.svg)
 
 ## Search Performance
