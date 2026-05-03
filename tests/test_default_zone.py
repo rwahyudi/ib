@@ -8,7 +8,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 from click.testing import CliRunner
 
@@ -3586,6 +3586,99 @@ class DefaultZoneTests(unittest.TestCase):
         )
         self.assertNotIn("not set (not set)", context_line.plain)
 
+    def test_infoblox_wait_spinner_uses_status_for_interactive_table_output(self):
+        events = []
+
+        class FakeStatus:
+            def __enter__(self):
+                events.append("enter")
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("exit")
+                return False
+
+        with patch.object(ib, "current_output_format", return_value=ib.TABLE_OUTPUT):
+            with patch.object(type(ib.console), "is_terminal", new_callable=PropertyMock) as is_terminal:
+                is_terminal.return_value = True
+                with patch.object(ib, "current_command_is_hidden", return_value=False):
+                    with patch.dict(os.environ, {}, clear=True):
+                        with patch.object(ib.console, "status", return_value=FakeStatus()) as status:
+                            with ib.infoblox_wait_spinner():
+                                events.append("body")
+
+        status.assert_called_once_with(ib.INFOBLOX_WAIT_MESSAGE, spinner="dots")
+        self.assertEqual(events, ["enter", "body", "exit"])
+
+    def test_infoblox_wait_spinner_stays_quiet_for_structured_output(self):
+        with patch.object(ib, "current_output_format", return_value="jq"):
+            with patch.object(type(ib.console), "is_terminal", new_callable=PropertyMock) as is_terminal:
+                is_terminal.return_value = True
+                with patch.object(ib, "current_command_is_hidden", return_value=False):
+                    with patch.dict(os.environ, {}, clear=True):
+                        with patch.object(ib.console, "status") as status:
+                            with ib.infoblox_wait_spinner():
+                                pass
+
+        status.assert_not_called()
+
+    def test_infoblox_wait_spinner_stays_quiet_for_shell_completion(self):
+        with patch.object(ib, "current_output_format", return_value=ib.TABLE_OUTPUT):
+            with patch.object(type(ib.console), "is_terminal", new_callable=PropertyMock) as is_terminal:
+                is_terminal.return_value = True
+                with patch.object(ib, "current_command_is_hidden", return_value=False):
+                    with patch.dict(os.environ, {"_IB_COMPLETE": "bash_complete"}, clear=True):
+                        with patch.object(ib.console, "status") as status:
+                            with ib.infoblox_wait_spinner():
+                                pass
+
+        status.assert_not_called()
+
+    def test_infoblox_wait_spinner_stays_quiet_for_hidden_commands(self):
+        with patch.object(ib, "current_output_format", return_value=ib.TABLE_OUTPUT):
+            with patch.object(type(ib.console), "is_terminal", new_callable=PropertyMock) as is_terminal:
+                is_terminal.return_value = True
+                with patch.object(ib, "current_command_is_hidden", return_value=True):
+                    with patch.dict(os.environ, {}, clear=True):
+                        with patch.object(ib.console, "status") as status:
+                            with ib.infoblox_wait_spinner():
+                                pass
+
+        status.assert_not_called()
+
+    def test_dns_search_collects_records_inside_wait_spinner(self):
+        class FakeClient:
+            view = "corp"
+
+        class FakeSpinner:
+            active = False
+
+            def __enter__(self):
+                self.active = True
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.active = False
+                return False
+
+        spinner = FakeSpinner()
+
+        def fake_collect(*args, **kwargs):
+            self.assertTrue(spinner.active)
+            return []
+
+        with patch.object(ib, "load_config", return_value={"dns_view": "corp", "default_zone": "example.com"}):
+            with patch.object(ib, "InfobloxClient", return_value=FakeClient()):
+                with patch.object(ib, "search_root_zone", return_value="example.com"):
+                    with patch.object(ib, "collect_dns_search_results", side_effect=fake_collect) as collect:
+                        with patch.object(ib, "infoblox_wait_spinner", return_value=spinner) as wait_spinner:
+                            with patch.object(ib.console, "print"):
+                                with patch.object(ib, "print_warning"):
+                                    ib.run_dns_search("app")
+
+        wait_spinner.assert_called_once_with()
+        collect.assert_called_once()
+
     def test_dns_zone_list_prints_context_before_zone_table(self):
         class FakeClient:
             view = "corp"
@@ -5052,7 +5145,7 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertNotIn(ns_item["_ref"], output)
 
     def test_record_type_style_maps_common_and_shared_types(self):
-        self.assertEqual(ib.record_type_style("A"), "bold green")
+        self.assertEqual(ib.record_type_style("A"), ib.LIGHT_GREEN_TEXT_STYLE)
         self.assertEqual(ib.record_type_style("aaaa"), "bold bright_green")
         self.assertEqual(ib.record_type_style("HOST"), "bold cyan")
         self.assertEqual(ib.record_type_style("shared-cname"), "bold magenta")
@@ -5078,7 +5171,7 @@ class DefaultZoneTests(unittest.TestCase):
         name_cell = table.columns[1]._cells[0]
         self.assertIsInstance(type_cell, ib.Text)
         self.assertEqual(type_cell.plain, "A")
-        self.assertEqual(str(type_cell.style), "bold green")
+        self.assertEqual(str(type_cell.style), ib.LIGHT_GREEN_TEXT_STYLE)
         self.assertEqual(name_cell, "app.example.com")
 
     def test_dns_search_formats_nested_ns_nameserver_value(self):

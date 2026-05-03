@@ -67,6 +67,7 @@ import threading
 import time
 import urllib.parse
 from collections import deque
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -160,6 +161,9 @@ STRUCTURED_OUTPUTS = ("jq", "csv")
 STRUCTURED_EXCLUDED_FIELDS = {"ref", "_ref"}
 console = Console()
 err_console = Console(stderr=True)
+LIGHT_GREEN_TEXT = "#4ade80"
+LIGHT_GREEN_TEXT_STYLE = f"bold {LIGHT_GREEN_TEXT}"
+INFOBLOX_WAIT_MESSAGE = "Waiting for Infoblox response"
 
 
 class ZoneSerialCacheRead(NamedTuple):
@@ -204,6 +208,38 @@ def current_output_format() -> str:
 def output_is_table() -> bool:
     """Return whether output should use the default Rich table mode so callers can branch once."""
     return current_output_format() == TABLE_OUTPUT
+
+
+def shell_completion_is_active() -> bool:
+    """Return whether Click is running a shell-completion helper that must stay silent."""
+    return bool(os.environ.get("_IB_COMPLETE"))
+
+
+def current_command_is_hidden() -> bool:
+    """Detect hidden maintenance commands so status UI does not leak into background helpers."""
+    ctx = click.get_current_context(silent=True)
+    while ctx is not None:
+        if getattr(ctx.command, "hidden", False):
+            return True
+        ctx = ctx.parent
+    return False
+
+
+def infoblox_spinner_enabled() -> bool:
+    """Show wait UI only for interactive Rich output where transient terminal status is safe."""
+    return (
+        output_is_table()
+        and console.is_terminal
+        and not shell_completion_is_active()
+        and not current_command_is_hidden()
+    )
+
+
+def infoblox_wait_spinner(message: str = INFOBLOX_WAIT_MESSAGE) -> Any:
+    """Return a transient Rich spinner context for foreground Infoblox waits."""
+    if infoblox_spinner_enabled():
+        return console.status(message, spinner="dots")
+    return nullcontext()
 
 
 def json_default(value: Any) -> str:
@@ -335,7 +371,7 @@ def register_output_option_everywhere(command: click.Command) -> None:
 
 def print_success(message: str) -> None:
     """Print success text with shared styling so command output remains visually consistent."""
-    console.print(Text(message, style="bold green"))
+    console.print(Text(message, style=LIGHT_GREEN_TEXT_STYLE))
 
 
 def print_warning(message: str) -> None:
@@ -356,7 +392,7 @@ def print_note(message: str) -> None:
 def print_command_block(commands: list[str]) -> None:
     """Render shell snippets as a syntax-highlighted block so setup instructions are copy-ready."""
     for command in commands:
-        console.print(Text(f"  {command}", style="green"))
+        console.print(Text(f"  {command}", style=LIGHT_GREEN_TEXT))
     console.print()
 
 
@@ -752,7 +788,8 @@ def prompt_dns_view_from_infoblox(
 ) -> str:
     """Prompt for a DNS view, preferring live Infoblox choices while keeping manual setup possible."""
     try:
-        view_names = query_dns_view_names_for_config(config_values)
+        with infoblox_wait_spinner():
+            view_names = query_dns_view_names_for_config(config_values)
     except (CliError, OSError, ValueError) as exc:
         print_warning(f"WARNING: could not load DNS views from Infoblox: {exc}")
         return Prompt.ask("DNS view", default=default_view)
@@ -1036,7 +1073,8 @@ def prompt_default_zone_from_infoblox(config_values: dict[str, str], default_zon
         return normalize_zone_name(default_zone) if default_zone else ""
 
     try:
-        zones = query_default_zone_candidates_for_config(config_values)
+        with infoblox_wait_spinner():
+            zones = query_default_zone_candidates_for_config(config_values)
     except (CliError, OSError, ValueError) as exc:
         print_warning(f"WARNING: could not load DNS zones from Infoblox: {exc}")
         return prompt_manual_default_zone(default_zone)
@@ -1917,7 +1955,7 @@ def active_zone_context_text(
 ) -> Text:
     """Format the active zone context and highlight whether a target zone is available."""
     context = status or dns_context_status()
-    zone_style = "bold green" if context["has_active_zone"] else "bold yellow"
+    zone_style = LIGHT_GREEN_TEXT_STYLE if context["has_active_zone"] else "bold yellow"
     return dns_context_value_text(
         context["active_zone"],
         context["active_zone_source"] if context["has_active_zone"] else None,
@@ -1956,23 +1994,23 @@ def dns_create_example_text() -> Text:
     return Text.assemble(
         ("Setup: ", "bold yellow"),
         ("ib dns zone use ", "bold white"),
-        ("example.com", "bold green"),
+        ("example.com", LIGHT_GREEN_TEXT_STYLE),
         ("\nCommand: ", "bold yellow"),
         ("ib dns create host ", "bold white"),
         ("app", "bold cyan"),
         (" 192.0.2.10 ", "bold blue"),
         ("-t 300 ", "bold cyan"),
         ("-c ", "bold cyan"),
-        ('"Application host"', "bold green"),
-        ("\nCreates: ", "bold green"),
+        ('"Application host"', LIGHT_GREEN_TEXT_STYLE),
+        ("\nCreates: ", LIGHT_GREEN_TEXT_STYLE),
         ("HOST record ", "bold yellow"),
-        ("app.example.com", "bold green"),
+        ("app.example.com", LIGHT_GREEN_TEXT_STYLE),
         (" with IPv4 address ", "white"),
         ("192.0.2.10", "bold blue"),
         (", TTL ", "white"),
         ("300", "bold cyan"),
         (", and comment ", "white"),
-        ('"Application host"', "bold green"),
+        ('"Application host"', LIGHT_GREEN_TEXT_STYLE),
         (".", "white"),
     )
 
@@ -2000,7 +2038,7 @@ def dns_create_target_text(zone_name: str | None) -> Text:
             (", ", "white"),
             ("app", "bold cyan"),
             (" creates ", "white"),
-            (f"app.{zone_name}", "bold green"),
+            (f"app.{zone_name}", LIGHT_GREEN_TEXT_STYLE),
             (".", "white"),
         )
 
@@ -2075,7 +2113,7 @@ def dns_create_usage_panel() -> Panel:
             ("ib dns create ", "bold white"),
             ("<type>", "bold yellow"),
             (" ", "white"),
-            ("<name>", "bold green"),
+            ("<name>", LIGHT_GREEN_TEXT_STYLE),
             (" ", "white"),
             ("<value>", "bold blue"),
         ),
@@ -2124,7 +2162,7 @@ def dns_delete_usage_panel() -> Panel:
         "Forward",
         Text.assemble(
             ("ib dns delete ", "bold white"),
-            ("<record-name>", "bold green"),
+            ("<record-name>", LIGHT_GREEN_TEXT_STYLE),
             (" [zone]", "bold magenta"),
         ),
     )
@@ -2143,9 +2181,9 @@ def dns_delete_usage_panel() -> Panel:
         Text.assemble(
             ("Command: ", "bold yellow"),
             ("ib dns delete app", "bold white"),
-            ("\nDeletes: ", "bold green"),
+            ("\nDeletes: ", LIGHT_GREEN_TEXT_STYLE),
             ("forward record ", "white"),
-            (forward_example, "bold green"),
+            (forward_example, LIGHT_GREEN_TEXT_STYLE),
             (".", "white"),
         ),
     )
@@ -2155,7 +2193,7 @@ def dns_delete_usage_panel() -> Panel:
             ("Command: ", "bold yellow"),
             ("ib dns delete ptr ", "bold white"),
             ("192.168.1.3", "bold blue"),
-            ("\nDeletes: ", "bold green"),
+            ("\nDeletes: ", LIGHT_GREEN_TEXT_STYLE),
             ("PTR/reverse record for ", "white"),
             ("192.168.1.3", "bold blue"),
             (" after finding the matching reverse zone.", "white"),
@@ -2627,7 +2665,7 @@ def completion_item_kind_and_style(item: CompletionItem) -> tuple[str, str]:
         return f"{record_type.upper()} record", record_type_style(record_type)
 
     if value in command_completion_values():
-        return "Command", "bold green"
+        return "Command", LIGHT_GREEN_TEXT_STYLE
     if "." in value:
         return "Zone/name", "bold blue"
     return "Value", "white"
@@ -3066,7 +3104,7 @@ def dns_create_error_value(value: Any) -> Text:
     if value is None or value == "":
         return Text("not set", style="yellow")
     if isinstance(value, bool):
-        return Text("true" if value else "false", style="green" if value else "dim")
+        return Text("true" if value else "false", style=LIGHT_GREEN_TEXT if value else "dim")
     return Text(str(value).replace("\n", "\\n"), style="white")
 
 
@@ -3160,10 +3198,19 @@ def run_dns_create(
         config = load_config()
         client = InfobloxClient(config)
         view = getattr(client, "view", config.get("dns_view", "default"))
-        resolved_zone = resolve_dns_create_zone(config, client, record_type, name, zone)
-        warn_if_cname_target_unresolved(record_type, value)
-        object_type, payload = create_payload(record_type, value, name, resolved_zone, ttl, comment, client)
-        client.request("POST", object_type, payload=payload)
+        with infoblox_wait_spinner():
+            resolved_zone = resolve_dns_create_zone(config, client, record_type, name, zone)
+            warn_if_cname_target_unresolved(record_type, value)
+            object_type, payload = create_payload(
+                record_type,
+                value,
+                name,
+                resolved_zone,
+                ttl,
+                comment,
+                client,
+            )
+            client.request("POST", object_type, payload=payload)
     except CliError as exc:
         error_message = str(exc)
         context = dns_create_error_context(
@@ -4933,14 +4980,15 @@ def run_dns_search(
                 dns_search_context_status(config, root_zone, zone_name, view_name),
             )
         )
-    records = collect_dns_search_results(
-        client,
-        keyword,
-        case_sensitive,
-        root_zone,
-        exclude_keywords,
-        fuzzy_search,
-    )
+    with infoblox_wait_spinner():
+        records = collect_dns_search_results(
+            client,
+            keyword,
+            case_sensitive,
+            root_zone,
+            exclude_keywords,
+            fuzzy_search,
+        )
 
     if not records:
         if output_is_table():
@@ -4999,8 +5047,9 @@ def run_dns_list(zone_name: str | None = None) -> None:
 
     if output_is_table():
         console.print(dns_context_panel("Current DNS Context"))
-    zone_info = dns_list_zone_info(client, target)
-    records = dns_list_records_for_zone(client, zone_info)
+    with infoblox_wait_spinner():
+        zone_info = dns_list_zone_info(client, target)
+        records = dns_list_records_for_zone(client, zone_info)
 
     if not records:
         if output_is_table():
@@ -5184,7 +5233,8 @@ def run_dns_edit(
         raise CliError("ERROR: record type is required when updating the record value.")
     config = load_config()
     client = InfobloxClient(config)
-    target, matches, all_matches = dns_edit_matches(config, client, requested_type, record_name, zone)
+    with infoblox_wait_spinner():
+        target, matches, all_matches = dns_edit_matches(config, client, requested_type, record_name, zone)
 
     if not matches:
         if requested_type and all_matches:
@@ -5201,10 +5251,11 @@ def run_dns_edit(
     if not ref:
         raise CliError("ERROR: matched record does not include an _ref.")
 
-    if value is not None:
-        warn_if_cname_target_unresolved(actual_type, value)
-    payload = update_payload(actual_type, value, ttl, comment)
-    client.request("PUT", ref, payload=payload)
+    with infoblox_wait_spinner():
+        if value is not None:
+            warn_if_cname_target_unresolved(actual_type, value)
+        payload = update_payload(actual_type, value, ttl, comment)
+        client.request("PUT", ref, payload=payload)
 
     if noptr and actual_type not in {"a", "aaaa"}:
         print_warning("WARNING: --noptr only applies to A/AAAA workflows and was ignored.")
@@ -5289,10 +5340,11 @@ def run_dns_delete_ptr(ip_value: str | None) -> None:
     address = ptr_delete_ip_address(ip_value)
     config = load_config()
     client = InfobloxClient(config)
-    reverse_zone = reverse_zone_for_ip(client, address)
-    spec = RECORD_TYPES["ptr"]
-    params = object_query_params(spec, client, {ptr_address_query_field(address): str(address)})
-    raw_matches = safe_query(client, spec["object"], params)
+    with infoblox_wait_spinner():
+        reverse_zone = reverse_zone_for_ip(client, address)
+        spec = RECORD_TYPES["ptr"]
+        params = object_query_params(spec, client, {ptr_address_query_field(address): str(address)})
+        raw_matches = safe_query(client, spec["object"], params)
     matches = [
         ("ptr", item)
         for item in raw_matches
@@ -5316,7 +5368,8 @@ def run_dns_delete_ptr(ip_value: str | None) -> None:
     ref = item.get("_ref")
     if not ref:
         raise CliError("ERROR: matched PTR record does not include an _ref.")
-    client.request("DELETE", ref)
+    with infoblox_wait_spinner():
+        client.request("DELETE", ref)
     refresh_dns_cache_after_update()
     if not output_is_table():
         emit_action_result(
@@ -5357,29 +5410,36 @@ def run_dns_delete(record_name: str, zone: str | None) -> None:
     matches: list[tuple[str, dict[str, Any]]] = []
     target = targets[0] if targets else record_name
 
-    for candidate in targets:
-        candidate_matches: list[tuple[str, dict[str, Any]]] = []
-        for record_type, spec in RECORD_TYPES.items():
-            if record_type == "ptr":
-                continue
-            params = object_query_params(spec, client, {"name": candidate})
-            candidate_matches.extend((record_type, item) for item in safe_query(client, spec["object"], params))
-        if candidate_matches:
-            target = candidate
-            matches = candidate_matches
-            break
-
-    if not matches and not zone:
-        active_target = fqdn(record_name, resolve_dns_zone(config))
-        if active_target not in targets:
-            targets.append(active_target)
+    with infoblox_wait_spinner():
+        for candidate in targets:
+            candidate_matches: list[tuple[str, dict[str, Any]]] = []
             for record_type, spec in RECORD_TYPES.items():
                 if record_type == "ptr":
                     continue
-                params = object_query_params(spec, client, {"name": active_target})
-                matches.extend((record_type, item) for item in safe_query(client, spec["object"], params))
-            if matches:
-                target = active_target
+                params = object_query_params(spec, client, {"name": candidate})
+                candidate_matches.extend(
+                    (record_type, item)
+                    for item in safe_query(client, spec["object"], params)
+                )
+            if candidate_matches:
+                target = candidate
+                matches = candidate_matches
+                break
+
+        if not matches and not zone:
+            active_target = fqdn(record_name, resolve_dns_zone(config))
+            if active_target not in targets:
+                targets.append(active_target)
+                for record_type, spec in RECORD_TYPES.items():
+                    if record_type == "ptr":
+                        continue
+                    params = object_query_params(spec, client, {"name": active_target})
+                    matches.extend(
+                        (record_type, item)
+                        for item in safe_query(client, spec["object"], params)
+                    )
+                if matches:
+                    target = active_target
 
     if not matches:
         target_description = " or ".join(targets)
@@ -5396,7 +5456,8 @@ def run_dns_delete(record_name: str, zone: str | None) -> None:
     ref = item.get("_ref")
     if not ref:
         raise CliError("ERROR: matched record does not include an _ref.")
-    client.request("DELETE", ref)
+    with infoblox_wait_spinner():
+        client.request("DELETE", ref)
     refresh_dns_cache_after_update()
     if not output_is_table():
         emit_action_result(
@@ -5430,7 +5491,8 @@ def run_dns_zone_create(
     if ns_group:
         payload["ns_group"] = ns_group
 
-    ref = client.request("POST", ZONE_OBJECT, payload=payload)
+    with infoblox_wait_spinner():
+        ref = client.request("POST", ZONE_OBJECT, payload=payload)
     refresh_dns_cache_after_update()
     if not output_is_table():
         emit_action_result(
@@ -5453,7 +5515,8 @@ def run_dns_zone_list(search: str | None = None) -> None:
     client = InfobloxClient(load_config())
     if output_is_table():
         console.print(dns_context_panel("Current DNS Context"))
-    zones = query_zones(client, search)
+    with infoblox_wait_spinner():
+        zones = query_zones(client, search)
     if not zones:
         if output_is_table():
             print_warning("No zones found.")
@@ -5500,11 +5563,12 @@ def run_dns_zone_view(zone_name: str) -> None:
     """Run zone detail lookup and render table or structured zone information."""
     client = InfobloxClient(load_config())
     target = normalize_zone_name(zone_name)
-    matches = safe_query(
-        client,
-        ZONE_OBJECT,
-        zone_query_params(client, {"fqdn": target}, return_fields=ZONE_DETAIL_RETURN_FIELDS),
-    )
+    with infoblox_wait_spinner():
+        matches = safe_query(
+            client,
+            ZONE_OBJECT,
+            zone_query_params(client, {"fqdn": target}, return_fields=ZONE_DETAIL_RETURN_FIELDS),
+        )
 
     if not matches:
         raise CliError(f"ERROR: no DNS zone found for {target} in view {client.view}")
@@ -5514,7 +5578,8 @@ def run_dns_zone_view(zone_name: str) -> None:
         raise CliError("ERROR: view target is ambiguous.")
 
     zone_info = dict(matches[0])
-    add_zone_network_association_details(client, target, zone_info)
+    with infoblox_wait_spinner():
+        add_zone_network_association_details(client, target, zone_info)
     if output_is_table():
         console.print(zone_detail_table(zone_info))
     else:
@@ -5525,7 +5590,8 @@ def run_dns_zone_delete(zone_name: str) -> None:
     """Run zone deletion only after resolving an unambiguous zone reference."""
     client = InfobloxClient(load_config())
     target = normalize_zone_name(zone_name)
-    matches = safe_query(client, ZONE_OBJECT, zone_query_params(client, {"fqdn": target}))
+    with infoblox_wait_spinner():
+        matches = safe_query(client, ZONE_OBJECT, zone_query_params(client, {"fqdn": target}))
 
     if not matches:
         raise CliError(f"ERROR: no DNS zone found for {target} in view {client.view}")
@@ -5537,7 +5603,8 @@ def run_dns_zone_delete(zone_name: str) -> None:
     ref = matches[0].get("_ref")
     if not ref:
         raise CliError("ERROR: matched zone does not include an _ref.")
-    client.request("DELETE", ref)
+    with infoblox_wait_spinner():
+        client.request("DELETE", ref)
     refresh_dns_cache_after_update()
     if not output_is_table():
         emit_action_result(
@@ -5615,7 +5682,8 @@ def run_dns_view_list() -> None:
     active_view = config.get("dns_view", "default")
     client = InfobloxClient(config)
     try:
-        view_names = query_dns_view_names(client)
+        with infoblox_wait_spinner():
+            view_names = query_dns_view_names(client)
     finally:
         client.close()
 
@@ -5631,7 +5699,8 @@ def run_dns_view_use(view_name: str) -> None:
     config = load_config()
     client = InfobloxClient(config)
     try:
-        view_names = query_dns_view_names(client)
+        with infoblox_wait_spinner():
+            view_names = query_dns_view_names(client)
     finally:
         client.close()
 
@@ -5950,7 +6019,7 @@ def record_name(item: dict[str, Any]) -> str:
 
 
 RECORD_TYPE_STYLES = {
-    "a": "bold green",
+    "a": LIGHT_GREEN_TEXT_STYLE,
     "aaaa": "bold bright_green",
     "host": "bold cyan",
     "cname": "bold magenta",
