@@ -554,12 +554,12 @@ def ensure_config_dir() -> None:
 def read_config_key() -> bytes:
     """Read the Fernet key from disk so encrypted config passwords can be decrypted."""
     if not CONFIG_KEY_FILE.exists():
-        raise CliError(f"ERROR: missing encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+        raise CliError(f"ERROR: missing encryption key file at {CONFIG_KEY_FILE}. Run: ib config")
     try:
         key = CONFIG_KEY_FILE.read_bytes().strip()
         Fernet(key)
     except (OSError, ValueError):
-        raise CliError(f"ERROR: invalid encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+        raise CliError(f"ERROR: invalid encryption key file at {CONFIG_KEY_FILE}. Run: ib config")
     try:
         os.chmod(CONFIG_KEY_FILE, 0o600)
     except OSError:
@@ -582,7 +582,7 @@ def get_or_create_config_key() -> bytes:
     except FileExistsError:
         return read_config_key()
     except OSError:
-        raise CliError(f"ERROR: cannot write encryption key file at {CONFIG_KEY_FILE}. Run: ib configure")
+        raise CliError(f"ERROR: cannot write encryption key file at {CONFIG_KEY_FILE}. Run: ib config")
     return key
 
 
@@ -601,7 +601,7 @@ def decrypt_password(password: str) -> str:
     try:
         return Fernet(read_config_key()).decrypt(token).decode("utf-8")
     except (InvalidToken, OSError, UnicodeEncodeError, UnicodeDecodeError, ValueError):
-        raise CliError(f"ERROR: cannot decrypt password in {CONFIG_FILE}. Run: ib configure")
+        raise CliError(f"ERROR: cannot decrypt password in {CONFIG_FILE}. Run: ib config")
 
 
 def is_encrypted_password(password: str) -> bool:
@@ -664,7 +664,7 @@ def read_config_profiles(
         profiles = {DEFAULT_PROFILE_NAME: dict(parser["default"])}
         legacy = True
     else:
-        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib configure")
+        raise CliError(f"ERROR: no profiles configured in {CONFIG_FILE}. Run: ib config")
 
     if decrypt_passwords:
         for profile_values in profiles.values():
@@ -759,7 +759,7 @@ def dns_view_names_from_records(view_records: list[dict[str, Any]]) -> list[str]
 
 
 def query_dns_view_records(client: InfobloxClient) -> list[dict[str, Any]]:
-    """Query all DNS views through WAPI so configure and dns view commands share retrieval behavior."""
+    """Query all DNS views through WAPI so config and dns view commands share retrieval behavior."""
     return paged_query(
         client,
         DNS_VIEW_OBJECT,
@@ -1229,7 +1229,7 @@ def delete_config_profile(profile_name: str) -> None:
     if selected_profile == default_profile:
         raise CliError(
             f"ERROR: cannot delete default profile '{selected_profile}'. "
-            "Run: ib configure use OTHER_PROFILE"
+            "Run: ib config use OTHER_PROFILE"
         )
     del profiles[selected_profile]
     write_config_profiles(default_profile, profiles)
@@ -1291,7 +1291,7 @@ def list_config_profiles() -> None:
     """List configured profiles and mark the default profile."""
     if not CONFIG_FILE.exists():
         if output_is_table():
-            print_warning("No profiles configured. Run: ib configure")
+            print_warning("No profiles configured. Run: ib config")
         else:
             emit_structured([], ["profile", "default", "server", "dns_view", "default_zone"])
         return
@@ -1302,10 +1302,10 @@ def list_config_profiles() -> None:
 def maybe_prompt_configure() -> None:
     """Offer configuration setup when required config is missing so users get a clear next step."""
     if not sys.stdin.isatty():
-        raise CliError("ERROR: no configuration file found. Run: ib configure")
+        raise CliError("ERROR: no configuration file found. Run: ib config")
     print_warning(f"No configuration file found at {CONFIG_FILE}.")
-    if not Confirm.ask("Run 'ib configure' now?", default=False):
-        raise CliError("ERROR: no configuration file found. Run: ib configure")
+    if not Confirm.ask("Run 'ib config' now?", default=False):
+        raise CliError("ERROR: no configuration file found. Run: ib config")
     save_config_interactive()
 
 
@@ -1784,7 +1784,7 @@ def resolve_dns_zone(config: dict[str, str], zone_name: str | None = None) -> st
 
     raise CliError(
         f"ERROR: DNS zone is required. Use --zone, ib dns zone use, export {DEFAULT_ZONE_ENV}, "
-        "or set a default zone with: ib configure"
+        "or set a default zone with: ib config"
     )
 
 
@@ -1860,7 +1860,7 @@ def current_view_status() -> tuple[str, str]:
 
     config_values = default_config_values()
     if not config_values:
-        return "not configured", "run ib configure"
+        return "not configured", "run ib config"
 
     dns_view = config_values.get("dns_view", "").strip()
     if dns_view:
@@ -1872,7 +1872,7 @@ def active_profile_status() -> tuple[str, str]:
     """Return display text for the selected default profile."""
     config_values = default_config_values()
     if not config_values:
-        return "not configured", "run ib configure"
+        return "not configured", "run ib config"
     profile_name = config_values.get("profile", DEFAULT_PROFILE_NAME).strip()
     return profile_name or DEFAULT_PROFILE_NAME, "default profile"
 
@@ -2034,7 +2034,7 @@ def dns_create_zone_rule_text() -> Text:
         (", ", "white"),
         (DEFAULT_ZONE_ENV, "bold cyan"),
         (", then ", "white"),
-        ("ib configure", "bold cyan"),
+        ("ib config", "bold cyan"),
         (".", "white"),
     )
 
@@ -2060,7 +2060,7 @@ def dns_create_target_text(zone_name: str | None) -> Text:
         (", ", "white"),
         (DEFAULT_ZONE_ENV, "bold cyan"),
         (", or ", "white"),
-        ("ib configure", "bold cyan"),
+        ("ib config", "bold cyan"),
         (".", "white"),
     )
 
@@ -6876,7 +6876,7 @@ def zone_detail_table(zone_info: dict[str, Any]) -> Table:
 def cli(ctx: click.Context, output_format: str | None) -> None:
     """Infoblox command line client.
 
-    Run `ib configure` first to save an Infoblox profile with server,
+    Run `ib config` first to save an Infoblox profile with server,
     credentials, DNS view, and default zone.
 
     \b
@@ -6916,9 +6916,9 @@ def refresh_zone_completion_cache() -> None:
     run_zone_completion_cache_revalidation()
 
 
-@cli.group(invoke_without_command=True)
+@cli.group("config", invoke_without_command=True)
 @click.pass_context
-def configure(ctx: click.Context) -> None:
+def config(ctx: click.Context) -> None:
     """Create or update Infoblox connection profiles in ~/.ib/config.
 
     Prompts for the Infoblox server, username, password, WAPI version, SSL
@@ -6937,7 +6937,7 @@ def configure(ctx: click.Context) -> None:
         save_config_interactive()
 
 
-@configure.command("new")
+@config.command("new")
 @click.argument("profile_name", shell_complete=complete_new_profile_names)
 @click.option("--default", "make_default", is_flag=True, help="Make this profile the default.")
 def configure_new(profile_name: str, make_default: bool) -> None:
@@ -6945,7 +6945,7 @@ def configure_new(profile_name: str, make_default: bool) -> None:
     save_config_interactive(profile_name, create=True, make_default=make_default)
 
 
-@configure.command("edit")
+@config.command("edit")
 @click.argument("profile_name", required=False, shell_complete=complete_existing_profile_names)
 @click.option("--default", "make_default", is_flag=True, help="Make this profile the default.")
 def configure_edit(profile_name: str | None, make_default: bool) -> None:
@@ -6953,21 +6953,21 @@ def configure_edit(profile_name: str | None, make_default: bool) -> None:
     save_config_interactive(profile_name, create=False, make_default=make_default)
 
 
-@configure.command("delete")
+@config.command("delete")
 @click.argument("profile_name", shell_complete=complete_deletable_profile_names)
 def configure_delete(profile_name: str) -> None:
     """Delete a non-default Infoblox profile."""
     delete_config_profile(profile_name)
 
 
-@configure.command("use")
+@config.command("use")
 @click.argument("profile_name", shell_complete=complete_existing_profile_names)
 def configure_use(profile_name: str) -> None:
     """Set the default Infoblox profile."""
     set_default_profile(profile_name)
 
 
-@configure.command("list")
+@config.command("list")
 def configure_list() -> None:
     """List configured Infoblox profiles."""
     list_config_profiles()
@@ -7093,7 +7093,7 @@ def view_use(view_name: str) -> None:
     """Set the active DNS view for this shell session.
 
     A new shell session falls back to IB_VIEW or the DNS view saved by
-    `ib configure`.
+    `ib config`.
     """
     run_dns_view_use(view_name)
 
@@ -7182,7 +7182,7 @@ def zone_use(zone_name: str) -> None:
     """Set the active DNS zone for this shell session and selected profile.
 
     A new shell session or different profile falls back to IB_ZONE or the
-    default zone saved by `ib configure`.
+    default zone saved by `ib config`.
     """
     run_dns_zone_use(zone_name)
 

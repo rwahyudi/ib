@@ -56,10 +56,10 @@ export PATH="$HOME/.local/bin:$PATH"
 Then configure Infoblox access:
 
 ```bash
-ib configure
+ib config
 ```
 
-`ib configure` edits the current default profile and prompts for:
+`ib config` edits the current default profile and prompts for:
 
 - Infoblox server
 - Username and password
@@ -68,7 +68,7 @@ ib configure
 - DNS view
 - Default DNS zone
 
-When a new profile is created, `ib configure` connects to Infoblox with the
+When a new profile is created, `ib config` connects to Infoblox with the
 entered credentials and lists available DNS views so you can select one. If the
 DNS view lookup fails, the command falls back to manual DNS view entry and still
 saves the profile.
@@ -77,20 +77,20 @@ Profile setup also asks whether to configure a default DNS zone, with yes as the
 default answer. If you choose yes, it loads forward zones from the selected DNS
 view, including subdomain zones, and shows a live search box where the zone list
 filters as you type. Reverse zones are excluded from selection. This picker is
-used by `ib configure`, `ib configure new`, and `ib configure edit`.
+used by `ib config`, `ib config new`, and `ib config edit`.
 
 Manage multiple profiles with:
 
 ```bash
-ib configure new prod --default
-ib configure new lab
-ib configure list
-ib configure use prod
-ib configure edit lab
-ib configure delete lab
+ib config new prod --default
+ib config new lab
+ib config list
+ib config use prod
+ib config edit lab
+ib config delete lab
 ```
 
-You can run `ib configure` multiple times. It will not wipe existing values just
+You can run `ib config` multiple times. It will not wipe existing values just
 because you rerun it: saved values are shown as defaults, pressing Enter keeps
 the current value, and leaving the password prompt blank keeps the current
 password.
@@ -105,7 +105,7 @@ key files are kept at `0600`.
 Common workflow:
 
 ```bash
-ib configure
+ib config
 ib dns view list
 ib dns view use "DNS Zone View"
 ib dns zone list
@@ -154,8 +154,8 @@ Help output and scoped search output show a compact `Current DNS Context` line.
 Profile selection is persistent:
 
 ```bash
-ib configure list
-ib configure use prod
+ib config list
+ib config use prod
 ```
 
 Active view precedence is:
@@ -492,8 +492,8 @@ exec bash
 
 ## Troubleshooting
 
-Run `ib configure` if you see a missing configuration or credential error. Use
-`ib configure list` and `ib configure use <profile>` to inspect or switch the
+Run `ib config` if you see a missing configuration or credential error. Use
+`ib config list` and `ib config use <profile>` to inspect or switch the
 default profile.
 
 Use `--zone` with `ib dns create`, or pass the optional positional zone to

@@ -846,7 +846,7 @@ class DefaultZoneTests(unittest.TestCase):
                     prog_name="ib",
                     env={
                         "_IB_COMPLETE": "bash_complete",
-                        "COMP_WORDS": "ib configure new ",
+                        "COMP_WORDS": "ib config new ",
                         "COMP_CWORD": "3",
                     },
                 )
@@ -1216,7 +1216,7 @@ class DefaultZoneTests(unittest.TestCase):
     def test_configure_help_explains_repeated_runs_keep_existing_values(self):
         runner = CliRunner()
 
-        result = runner.invoke(ib.cli, ["configure", "--help"])
+        result = runner.invoke(ib.cli, ["config", "--help"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("run this command multiple times", result.output)
@@ -1231,9 +1231,9 @@ class DefaultZoneTests(unittest.TestCase):
     def test_command_help_smoke_surfaces_registered_groups_and_output_option(self):
         runner = CliRunner()
         help_cases = [
-            (["--help"], ["Infoblox command line client", "configure", "dns", "--output"]),
+            (["--help"], ["Infoblox command line client", "config", "dns", "--output"]),
             (["dns", "--help"], ["Manage Infoblox DNS records", "create", "view", "zone", "--output"]),
-            (["configure", "--help"], ["new", "edit", "delete", "use", "--output"]),
+            (["config", "--help"], ["new", "edit", "delete", "use", "--output"]),
             (["dns", "view", "--help"], ["DNS views", "list", "use", "--output"]),
             (["dns", "zone", "--help"], ["DNS zones", "create", "list", "delete", "use", "--output"]),
         ]
@@ -1245,6 +1245,10 @@ class DefaultZoneTests(unittest.TestCase):
                 self.assertEqual(result.exit_code, 0, result.output)
                 for fragment in expected_fragments:
                     self.assertIn(fragment, result.output)
+
+    def test_config_replaces_configure_command_name(self):
+        self.assertIn("config", ib.cli.commands)
+        self.assertNotIn("configure", ib.cli.commands)
 
     def test_output_option_is_registered_on_all_commands(self):
         self.assert_command_tree_has_output_option(ib.cli)
@@ -1361,7 +1365,7 @@ class DefaultZoneTests(unittest.TestCase):
                     },
                 )
 
-                result = runner.invoke(ib.cli, ["configure", "use", "lab"])
+                result = runner.invoke(ib.cli, ["config", "use", "lab"])
                 default_profile, _profiles, _legacy = ib.read_config_profiles()
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -1413,7 +1417,7 @@ class DefaultZoneTests(unittest.TestCase):
                             ) as query_views:
                                 result = runner.invoke(
                                     ib.cli,
-                                    ["configure", "new", "new-prof", "--default"],
+                                    ["config", "new", "new-prof", "--default"],
                                 )
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
@@ -1449,7 +1453,7 @@ class DefaultZoneTests(unittest.TestCase):
                             ):
                                 result = runner.invoke(
                                     ib.cli,
-                                    ["configure", "new", "new-prof"],
+                                    ["config", "new", "new-prof"],
                                 )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
@@ -1474,7 +1478,7 @@ class DefaultZoneTests(unittest.TestCase):
                                 "query_dns_view_names_for_config",
                                 return_value=["corp", "default"],
                             ) as query_views:
-                                result = runner.invoke(ib.cli, ["configure"])
+                                result = runner.invoke(ib.cli, ["config"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1512,7 +1516,7 @@ class DefaultZoneTests(unittest.TestCase):
                                 ) as query_zones:
                                     result = runner.invoke(
                                         ib.cli,
-                                        ["configure", "new", "new-prof"],
+                                        ["config", "new", "new-prof"],
                                     )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
@@ -1552,7 +1556,7 @@ class DefaultZoneTests(unittest.TestCase):
                                 ):
                                     result = runner.invoke(
                                         ib.cli,
-                                        ["configure", "new", "new-prof"],
+                                        ["config", "new", "new-prof"],
                                     )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
@@ -1738,7 +1742,7 @@ class DefaultZoneTests(unittest.TestCase):
                                 "query_default_zone_candidates_for_config",
                                 return_value=ib.selectable_zone_records(zones),
                             ) as query_zones:
-                                result = runner.invoke(ib.cli, ["configure", "edit", "prod"])
+                                result = runner.invoke(ib.cli, ["config", "edit", "prod"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1790,7 +1794,7 @@ class DefaultZoneTests(unittest.TestCase):
                                 "query_default_zone_candidates_for_config",
                                 return_value=ib.selectable_zone_records(zones),
                             ) as query_zones:
-                                result = runner.invoke(ib.cli, ["configure"])
+                                result = runner.invoke(ib.cli, ["config"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1819,7 +1823,7 @@ class DefaultZoneTests(unittest.TestCase):
                     },
                 )
 
-                result = runner.invoke(ib.cli, ["configure", "list", "-o", "csv"])
+                result = runner.invoke(ib.cli, ["config", "list", "-o", "csv"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
@@ -1832,7 +1836,7 @@ class DefaultZoneTests(unittest.TestCase):
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.config_path_patch(tmpdir):
-                result = runner.invoke(ib.cli, ["-o", "jq", "configure", "list"])
+                result = runner.invoke(ib.cli, ["-o", "jq", "config", "list"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(json.loads(result.output), [])
@@ -1861,7 +1865,7 @@ class DefaultZoneTests(unittest.TestCase):
                     },
                 )
 
-                result = runner.invoke(ib.cli, ["configure", "list", "-o", "jq"])
+                result = runner.invoke(ib.cli, ["config", "list", "-o", "jq"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         data = json.loads(result.output)
@@ -1907,7 +1911,7 @@ class DefaultZoneTests(unittest.TestCase):
                     },
                 )
 
-                result = runner.invoke(ib.cli, ["configure", "use", "lab", "-o", "jq"])
+                result = runner.invoke(ib.cli, ["config", "use", "lab", "-o", "jq"])
                 default_profile, _profiles, _legacy = ib.read_config_profiles()
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -1943,7 +1947,7 @@ class DefaultZoneTests(unittest.TestCase):
                     },
                 )
 
-                result = runner.invoke(ib.cli, ["configure", "-o", "csv", "delete", "lab"])
+                result = runner.invoke(ib.cli, ["config", "-o", "csv", "delete", "lab"])
                 default_profile, profiles, _legacy = ib.read_config_profiles()
 
         self.assertEqual(result.exit_code, 0, result.output)
@@ -2293,7 +2297,7 @@ class DefaultZoneTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIsInstance(result.exception, ib.CliError)
-        self.assertIn("Run: ib configure", str(result.exception))
+        self.assertIn("Run: ib config", str(result.exception))
 
     def test_dns_delete_missing_record_name_error_prints_ptr_hint(self):
         with patch.object(ib.sys, "argv", ["ib", "dns", "delete"]):
@@ -5951,10 +5955,10 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertIs(self.original_shell_complete(view_use.params[0]), ib.complete_dns_view_names)
 
     def test_configure_commands_use_profile_name_completion(self):
-        configure_new = ib.configure.commands["new"]
-        configure_edit = ib.configure.commands["edit"]
-        configure_delete = ib.configure.commands["delete"]
-        configure_use = ib.configure.commands["use"]
+        configure_new = ib.config.commands["new"]
+        configure_edit = ib.config.commands["edit"]
+        configure_delete = ib.config.commands["delete"]
+        configure_use = ib.config.commands["use"]
 
         self.assertIs(
             self.original_shell_complete(configure_new.params[0]),
