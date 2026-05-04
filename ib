@@ -407,9 +407,10 @@ def print_gcm_read_only_api_disabled_warning(host_name: str) -> None:
     warning_text.append(f"WARNING: Grid Master Candidate {host_name}\n")
     warning_text.append("does not allow Read-Only API access.\n")
     warning_text.append("This GCM will not be used for WAPI GET queries.\n")
+    warning_text.append("If you want read traffic to GCM instead of Master,\n")
     warning_text.append(
-        "Enable Read-Only API access on that Grid Master Candidate member\n"
-        "(WAPI field enable_ro_api_access=true), then rerun ib config edit."
+        "Enable Read-Only API access on that GCM "
+        "(enable_ro_api_access=true), then rerun ib config edit."
     )
     err_console.print()
     err_console.print(
@@ -1105,17 +1106,17 @@ def prompt_dns_view_from_infoblox(
             view_names = query_dns_view_names_for_config(config_values)
     except (CliError, OSError, ValueError) as exc:
         print_warning(f"WARNING: could not load DNS views from Infoblox: {exc}")
-        return Prompt.ask("DNS view", default=default_view)
+        return Prompt.ask("Default DNS View", default=default_view)
 
     if not view_names:
         print_warning("WARNING: Infoblox returned no DNS views. Enter the DNS view manually.")
-        return Prompt.ask("DNS view", default=default_view)
+        return Prompt.ask("Default DNS View", default=default_view)
 
     render_dns_view_choices(view_names)
     # The temporary config's view is only a bootstrap default. The saved value is
     # whichever live view the user selects here.
     default_choice = default_view if default_view in view_names else view_names[0]
-    return Prompt.ask("DNS view", choices=view_names, default=default_choice)
+    return Prompt.ask("Default DNS View", choices=view_names, default=default_choice)
 
 
 def prompt_manual_default_zone(default_zone: str = "") -> str:
@@ -1466,6 +1467,10 @@ def save_config_interactive(
     wapi_version = Prompt.ask(
         "WAPI version", default=current.get("wapi_version", DEFAULT_WAPI_VERSION)
     )
+    verify_ssl = Confirm.ask(
+        "Verify SSL certificates",
+        default=parse_bool(current.get("verify_ssl", "true")),
+    )
     probe_config = {
         "server": server,
         "read_server": "",
@@ -1473,9 +1478,10 @@ def save_config_interactive(
         "password": password,
         "wapi_version": wapi_version,
         "dns_view": current.get("dns_view", "default"),
-        "verify_ssl": current.get("verify_ssl", "true"),
+        "verify_ssl": "true" if verify_ssl else "false",
         "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
     }
+    require_infoblox_connection_for_config(dict(probe_config))
     current_read_server = current.get("read_server", "")
     if current_read_server:
         try:
@@ -1490,14 +1496,8 @@ def save_config_interactive(
             current.get("dns_view", "default"),
         )
     else:
-        dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
+        dns_view = Prompt.ask("Default DNS View", default=current.get("dns_view", "default"))
     probe_config["dns_view"] = dns_view
-    verify_ssl = Confirm.ask(
-        "Verify SSL certificates",
-        default=parse_bool(current.get("verify_ssl", "true")),
-    )
-    probe_config["verify_ssl"] = "true" if verify_ssl else "false"
-    require_infoblox_connection_for_config(probe_config)
     default_zone = prompt_default_zone_from_infoblox(
         probe_config,
         current.get("default_zone", ""),

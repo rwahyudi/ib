@@ -1716,7 +1716,8 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(connection_config["username"], "new-user")
         self.assertEqual(connection_config["password"], "new-secret")
         self.assertEqual(connection_config["wapi_version"], "v2.12.3")
-        self.assertEqual(connection_config["dns_view"], "new-view")
+        self.assertEqual(connection_config["read_server"], "")
+        self.assertEqual(connection_config["dns_view"], "default")
         self.assertEqual(connection_config["verify_ssl"], "true")
 
     def test_configure_new_saves_gcm_read_server_after_acceptance(self):
@@ -1740,7 +1741,7 @@ class DefaultZoneTests(unittest.TestCase):
             events.append(label)
             values = {
                 "WAPI version": "v2.12.3",
-                "DNS view": "corp",
+                "Default DNS View": "corp",
             }
             return values[label]
 
@@ -1779,20 +1780,21 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(gcm_config["server"], "https://gm.example.com")
         self.assertEqual(gcm_config["read_server"], "")
         self.assertEqual(gcm_config["dns_view"], "default")
+        self.assertEqual(gcm_config["verify_ssl"], "true")
         self.assertEqual(current_read_server, "")
         gcm_prompt.assert_called_once()
         connection_config = connection_test.call_args.args[0]
-        self.assertEqual(connection_config["read_server"], "https://gcm.example.com")
-        self.assertEqual(connection_config["dns_view"], "corp")
+        self.assertEqual(connection_config["read_server"], "")
+        self.assertEqual(connection_config["dns_view"], "default")
         self.assertEqual(connection_config["verify_ssl"], "true")
         self.assertEqual(
             events,
             [
                 "WAPI version",
-                "gcm",
-                "DNS view",
                 "Verify SSL certificates",
                 "connection",
+                "gcm",
+                "Default DNS View",
                 "Configure a default DNS zone for this profile",
             ],
         )
@@ -1835,11 +1837,11 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIsInstance(result.exception, ib.CliError)
         self.assertIn("HTTP 401", str(result.exception))
-        query_views.assert_called_once()
-        gcm_prompt.assert_called_once()
+        query_views.assert_not_called()
+        gcm_prompt.assert_not_called()
         connection_config = connection_test.call_args.args[0]
-        self.assertEqual(connection_config["read_server"], "https://gcm.example.com")
-        self.assertEqual(connection_config["dns_view"], "corp")
+        self.assertEqual(connection_config["read_server"], "")
+        self.assertEqual(connection_config["dns_view"], "default")
         self.assertEqual(connection_config["verify_ssl"], "true")
         default_zone_prompt.assert_not_called()
         self.assertFalse(config_exists)
@@ -1913,9 +1915,9 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(default_profile, "default")
         self.assertEqual(profiles["default"]["dns_view"], "corp")
         query_config = query_views.call_args.args[0]
-        self.assertEqual(query_config["verify_ssl"], "true")
+        self.assertEqual(query_config["verify_ssl"], "false")
         connection_config = connection_test.call_args.args[0]
-        self.assertEqual(connection_config["dns_view"], "corp")
+        self.assertEqual(connection_config["dns_view"], "default")
         self.assertEqual(connection_config["verify_ssl"], "false")
 
     def test_configure_new_can_choose_default_zone_from_search_results(self):
