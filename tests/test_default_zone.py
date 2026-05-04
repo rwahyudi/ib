@@ -656,6 +656,89 @@ class DefaultZoneTests(unittest.TestCase):
         print_note.assert_not_called()
         self.cache_refresh.assert_called_once_with("example.com", client=client)
 
+    def test_dns_edit_update_uses_primary_server_when_read_server_is_configured(self):
+        class FakeResponse:
+            status = 200
+            will_close = False
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def getheader(self, name, default=None):
+                return default
+
+        class FakeHTTPSConnection:
+            instances = []
+
+            def __init__(self, host, port=None, timeout=None, context=None):
+                self.host = host
+                self.requests = []
+                FakeHTTPSConnection.instances.append(self)
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "body": body,
+                        "headers": headers,
+                    }
+                )
+
+            def getresponse(self):
+                return FakeResponse(json.dumps({"updated": True}).encode("utf-8"))
+
+            def close(self):
+                pass
+
+        def fake_safe_query(client, object_type, params):
+            if object_type == "record:a" and params.get("name") == "app.example.com":
+                return [
+                    {
+                        "_ref": "record:a/app",
+                        "name": "app.example.com",
+                        "zone": "example.com",
+                        "ipv4addr": "192.0.2.10",
+                    }
+                ]
+            return []
+
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "https://gcm.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "default_zone": "example.com",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+
+        with patch.object(ib, "load_config", return_value=config):
+            with patch.object(ib, "safe_query", side_effect=fake_safe_query):
+                with patch.object(ib.http.client, "HTTPSConnection", FakeHTTPSConnection):
+                    with patch.object(ib, "print_success"), patch.object(ib, "print_note"):
+                        ib.run_dns_edit(
+                            "app",
+                            "a",
+                            "192.0.2.20",
+                            "example.com",
+                            None,
+                            False,
+                            None,
+                        )
+
+        self.assertEqual(len(FakeHTTPSConnection.instances), 1)
+        connection = FakeHTTPSConnection.instances[0]
+        self.assertEqual(connection.host, "gm.example.com")
+        self.assertEqual(connection.requests[0]["method"], "PUT")
+        self.assertEqual(connection.requests[0]["path"], "/wapi/v2.12.3/record:a/app")
+        self.cache_refresh.assert_called_once()
+
     def test_dns_edit_accepts_metadata_only_without_type_or_value(self):
         runner = CliRunner()
 
@@ -1358,6 +1441,7 @@ class DefaultZoneTests(unittest.TestCase):
                     "profile": "prod",
                     "default": True,
                     "server": "https://prod.example.com",
+                    "read_server": "",
                     "dns_view": "corp",
                     "default_zone": "example.com",
                 }
@@ -1556,7 +1640,12 @@ class DefaultZoneTests(unittest.TestCase):
                                             "query_dns_view_names_for_config",
                                             return_value=["corp"],
                                         ):
-                                            result = runner.invoke(ib.cli, ["config", "new"])
+                                            with patch.object(
+                                                ib,
+                                                "prompt_gcm_read_server_for_config",
+                                                return_value="",
+                                            ):
+                                                result = runner.invoke(ib.cli, ["config", "new"])
 
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(events[:3], ["banner", "Profile name", "Infoblox server"])
@@ -1596,10 +1685,15 @@ class DefaultZoneTests(unittest.TestCase):
                                     "query_dns_view_names_for_config",
                                     return_value=["default", "new-view"],
                                 ) as query_views:
-                                    result = runner.invoke(
-                                        ib.cli,
-                                        ["config", "new", "new-prof", "--default"],
-                                    )
+                                    with patch.object(
+                                        ib,
+                                        "prompt_gcm_read_server_for_config",
+                                        return_value="",
+                                    ):
+                                        result = runner.invoke(
+                                            ib.cli,
+                                            ["config", "new", "new-prof", "--default"],
+                                        )
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1615,16 +1709,101 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(query_config["password"], "new-secret")
         self.assertEqual(query_config["wapi_version"], "v2.12.3")
         self.assertEqual(query_config["verify_ssl"], "true")
+        self.assertEqual(query_config["dns_view"], "default")
         connection_test.assert_called_once()
-        self.assertEqual(connection_test.call_args.args[0], query_config)
+        connection_config = connection_test.call_args.args[0]
+        self.assertEqual(connection_config["server"], "https://new.example.com")
+        self.assertEqual(connection_config["username"], "new-user")
+        self.assertEqual(connection_config["password"], "new-secret")
+        self.assertEqual(connection_config["wapi_version"], "v2.12.3")
+        self.assertEqual(connection_config["dns_view"], "new-view")
+        self.assertEqual(connection_config["verify_ssl"], "true")
 
-    def test_configure_new_connection_failure_exits_before_dns_view_prompt(self):
+    def test_configure_new_saves_gcm_read_server_after_acceptance(self):
+        runner = CliRunner()
+        gcm_prompt_configs = []
+        events = []
+
+        def fake_gcm_prompt(config_values, current_read_server=""):
+            events.append("gcm")
+            gcm_prompt_configs.append((dict(config_values), current_read_server))
+            return "https://gcm.example.com"
+
+        def fake_confirm(label, default=True):
+            events.append(label)
+            return label == "Verify SSL certificates"
+
+        def fake_connection_test(config_values):
+            events.append("connection")
+
+        def fake_prompt_ask(label, *args, **kwargs):
+            events.append(label)
+            values = {
+                "WAPI version": "v2.12.3",
+                "DNS view": "corp",
+            }
+            return values[label]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                with patch.object(ib, "prompt_text", side_effect=["https://gm.example.com", "new-user"]):
+                    with patch.object(ib, "prompt_password", return_value="new-secret"):
+                        with patch.object(ib.Prompt, "ask", side_effect=fake_prompt_ask):
+                            with patch.object(ib.Confirm, "ask", side_effect=fake_confirm):
+                                with patch.object(
+                                    ib,
+                                    "require_infoblox_connection_for_config",
+                                    side_effect=fake_connection_test,
+                                ) as connection_test:
+                                    with patch.object(
+                                        ib,
+                                        "query_dns_view_names_for_config",
+                                        return_value=["corp"],
+                                    ):
+                                        with patch.object(
+                                            ib,
+                                            "prompt_gcm_read_server_for_config",
+                                            side_effect=fake_gcm_prompt,
+                                        ) as gcm_prompt:
+                                            result = runner.invoke(
+                                                ib.cli,
+                                                ["config", "new", "new-prof", "--default"],
+                                            )
+
+                default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(default_profile, "new-prof")
+        self.assertEqual(profiles["new-prof"]["read_server"], "https://gcm.example.com")
+        gcm_config, current_read_server = gcm_prompt_configs[0]
+        self.assertEqual(gcm_config["server"], "https://gm.example.com")
+        self.assertEqual(gcm_config["read_server"], "")
+        self.assertEqual(gcm_config["dns_view"], "default")
+        self.assertEqual(current_read_server, "")
+        gcm_prompt.assert_called_once()
+        connection_config = connection_test.call_args.args[0]
+        self.assertEqual(connection_config["read_server"], "https://gcm.example.com")
+        self.assertEqual(connection_config["dns_view"], "corp")
+        self.assertEqual(connection_config["verify_ssl"], "true")
+        self.assertEqual(
+            events,
+            [
+                "WAPI version",
+                "gcm",
+                "DNS view",
+                "Verify SSL certificates",
+                "connection",
+                "Configure a default DNS zone for this profile",
+            ],
+        )
+
+    def test_configure_new_connection_failure_exits_before_default_zone_prompt(self):
         runner = CliRunner()
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.config_path_patch(tmpdir):
                 with patch.object(ib, "prompt_text", side_effect=["https://new.example.com", "new-user"]):
                     with patch.object(ib, "prompt_password", return_value="new-secret"):
-                        with patch.object(ib.Prompt, "ask", return_value="v2.12.3"):
+                        with patch.object(ib.Prompt, "ask", side_effect=["v2.12.3", "corp"]):
                             with patch.object(ib.Confirm, "ask", return_value=True):
                                 with patch.object(
                                     ib,
@@ -1632,20 +1811,38 @@ class DefaultZoneTests(unittest.TestCase):
                                     side_effect=ib.CliError(
                                         "ERROR: Infoblox connection test failed (HTTP 401): authentication failed"
                                     ),
-                                ):
+                                ) as connection_test:
                                     with patch.object(
                                         ib,
                                         "query_dns_view_names_for_config",
+                                        return_value=["corp"],
                                     ) as query_views:
-                                        result = runner.invoke(
-                                            ib.cli,
-                                            ["config", "new", "new-prof"],
-                                        )
+                                        with patch.object(
+                                            ib,
+                                            "prompt_gcm_read_server_for_config",
+                                            return_value="https://gcm.example.com",
+                                        ) as gcm_prompt:
+                                            with patch.object(
+                                                ib,
+                                                "prompt_default_zone_from_infoblox",
+                                            ) as default_zone_prompt:
+                                                result = runner.invoke(
+                                                    ib.cli,
+                                                    ["config", "new", "new-prof"],
+                                                )
+                config_exists = ib.CONFIG_FILE.exists()
 
         self.assertEqual(result.exit_code, 1, result.output)
         self.assertIsInstance(result.exception, ib.CliError)
         self.assertIn("HTTP 401", str(result.exception))
-        query_views.assert_not_called()
+        query_views.assert_called_once()
+        gcm_prompt.assert_called_once()
+        connection_config = connection_test.call_args.args[0]
+        self.assertEqual(connection_config["read_server"], "https://gcm.example.com")
+        self.assertEqual(connection_config["dns_view"], "corp")
+        self.assertEqual(connection_config["verify_ssl"], "true")
+        default_zone_prompt.assert_not_called()
+        self.assertFalse(config_exists)
 
     def test_configure_new_falls_back_to_manual_dns_view_when_lookup_fails(self):
         runner = CliRunner()
@@ -1664,10 +1861,15 @@ class DefaultZoneTests(unittest.TestCase):
                                     "query_dns_view_names_for_config",
                                     side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
                                 ):
-                                    result = runner.invoke(
-                                        ib.cli,
-                                        ["config", "new", "new-prof"],
-                                    )
+                                    with patch.object(
+                                        ib,
+                                        "prompt_gcm_read_server_for_config",
+                                        return_value="",
+                                    ):
+                                        result = runner.invoke(
+                                            ib.cli,
+                                            ["config", "new", "new-prof"],
+                                        )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1686,16 +1888,24 @@ class DefaultZoneTests(unittest.TestCase):
                         side_effect=["new-secret", "v2.12.3", "corp", "new.example.com"],
                     ):
                         with patch.object(ib.Confirm, "ask", return_value=False):
-                            with patch.object(ib, "require_infoblox_connection_for_config"):
+                            with patch.object(
+                                ib,
+                                "require_infoblox_connection_for_config",
+                            ) as connection_test:
                                 with patch.object(
                                     ib,
                                     "query_dns_view_names_for_config",
                                     return_value=["corp", "default"],
                                 ) as query_views:
-                                    result = runner.invoke(
-                                        ib.cli,
-                                        ["config", "new", "default", "--default"],
-                                    )
+                                    with patch.object(
+                                        ib,
+                                        "prompt_gcm_read_server_for_config",
+                                        return_value="",
+                                    ):
+                                        result = runner.invoke(
+                                            ib.cli,
+                                            ["config", "new", "default", "--default"],
+                                        )
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1703,7 +1913,10 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(default_profile, "default")
         self.assertEqual(profiles["default"]["dns_view"], "corp")
         query_config = query_views.call_args.args[0]
-        self.assertEqual(query_config["verify_ssl"], "false")
+        self.assertEqual(query_config["verify_ssl"], "true")
+        connection_config = connection_test.call_args.args[0]
+        self.assertEqual(connection_config["dns_view"], "corp")
+        self.assertEqual(connection_config["verify_ssl"], "false")
 
     def test_configure_new_can_choose_default_zone_from_search_results(self):
         runner = CliRunner()
@@ -1732,10 +1945,15 @@ class DefaultZoneTests(unittest.TestCase):
                                         "query_default_zone_candidates_for_config",
                                         return_value=ib.selectable_zone_records(zones),
                                     ) as query_zones:
-                                        result = runner.invoke(
-                                            ib.cli,
-                                            ["config", "new", "new-prof"],
-                                        )
+                                        with patch.object(
+                                            ib,
+                                            "prompt_gcm_read_server_for_config",
+                                            return_value="",
+                                        ):
+                                            result = runner.invoke(
+                                                ib.cli,
+                                                ["config", "new", "new-prof"],
+                                            )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -1773,10 +1991,15 @@ class DefaultZoneTests(unittest.TestCase):
                                         "query_default_zone_candidates_for_config",
                                         side_effect=ib.CliError("ERROR: cannot reach Infoblox: timed out"),
                                     ):
-                                        result = runner.invoke(
-                                            ib.cli,
-                                            ["config", "new", "new-prof"],
-                                        )
+                                        with patch.object(
+                                            ib,
+                                            "prompt_gcm_read_server_for_config",
+                                            return_value="",
+                                        ):
+                                            result = runner.invoke(
+                                                ib.cli,
+                                                ["config", "new", "new-prof"],
+                                            )
 
                 _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -2024,6 +2247,281 @@ class DefaultZoneTests(unittest.TestCase):
 
         print_success.assert_not_called()
 
+    def test_usable_gcm_read_servers_filters_and_zone_tests_candidates(self):
+        clients = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = dict(config)
+                self.requests = []
+                self.closed = False
+                clients.append(self)
+
+            def request(self, method, object_type, params=None, payload=None):
+                self.requests.append((method, object_type, params, payload))
+                if object_type == ib.GCM_MEMBER_OBJECT:
+                    return [
+                        {
+                            "host_name": "gcm-b.example.com",
+                            "master_candidate": True,
+                            "enable_ro_api_access": True,
+                        },
+                        {
+                            "host_name": "gcm-a.example.com",
+                            "master_candidate": "true",
+                            "enable_ro_api_access": "true",
+                        },
+                        {
+                            "host_name": "",
+                            "master_candidate": True,
+                            "enable_ro_api_access": True,
+                        },
+                    ]
+                if self.config["server"] == "https://gcm-a.example.com":
+                    return [{"fqdn": "example.com"}]
+                if self.config["server"] == "https://gcm-b.example.com":
+                    raise ib.CliError("ERROR: denied")
+                raise AssertionError(f"unexpected request to {self.config['server']}")
+
+            def close(self):
+                self.closed = True
+
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "https://old-gcm.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+
+        with patch.object(ib, "InfobloxClient", side_effect=FakeClient):
+            with patch.object(ib, "print_gcm_read_only_api_disabled_warning") as disabled_warning:
+                with patch.object(ib, "print_warning") as print_warning:
+                    read_servers = ib.usable_gcm_read_servers_for_config(config)
+
+        self.assertEqual(read_servers, ["https://gcm-a.example.com"])
+        self.assertEqual(
+            [client.config["server"] for client in clients],
+            ["https://gm.example.com", "https://gcm-a.example.com", "https://gcm-b.example.com"],
+        )
+        self.assertNotIn("https://disabled.example.com", [client.config["server"] for client in clients])
+        self.assertEqual(clients[0].config["read_server"], "")
+        self.assertEqual(
+            clients[0].requests,
+            [("GET", ib.GCM_MEMBER_OBJECT, ib.gcm_member_query_params(), None)],
+        )
+        self.assertEqual(
+            clients[1].requests,
+            [("GET", ib.ZONE_OBJECT, ib.gcm_zone_test_params("corp"), None)],
+        )
+        self.assertTrue(all(client.closed for client in clients))
+        disabled_warning.assert_not_called()
+        warning_text = "\n".join(call_args.args[0] for call_args in print_warning.call_args_list)
+        self.assertIn("failed zone-list test", warning_text)
+
+    def test_usable_gcm_read_servers_skips_all_gcm_when_any_candidate_read_only_disabled(self):
+        clients = []
+
+        class FakeClient:
+            def __init__(self, config):
+                self.config = dict(config)
+                self.requests = []
+                self.closed = False
+                clients.append(self)
+
+            def request(self, method, object_type, params=None, payload=None):
+                self.requests.append((method, object_type, params, payload))
+                if object_type == ib.GCM_MEMBER_OBJECT:
+                    return [
+                        {
+                            "host_name": "gcm-a.example.com",
+                            "master_candidate": True,
+                            "enable_ro_api_access": True,
+                        },
+                        {
+                            "host_name": "disabled.example.com",
+                            "master_candidate": True,
+                            "enable_ro_api_access": False,
+                        },
+                    ]
+                raise AssertionError(f"unexpected request to {self.config['server']}")
+
+            def close(self):
+                self.closed = True
+
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+
+        with patch.object(ib, "InfobloxClient", side_effect=FakeClient):
+            with patch.object(ib, "print_gcm_read_only_api_disabled_warning") as disabled_warning:
+                with patch.object(ib, "print_warning") as print_warning:
+                    read_servers = ib.usable_gcm_read_servers_for_config(config)
+
+        self.assertEqual(read_servers, [])
+        self.assertEqual([client.config["server"] for client in clients], ["https://gm.example.com"])
+        self.assertEqual(
+            clients[0].requests,
+            [("GET", ib.GCM_MEMBER_OBJECT, ib.gcm_member_query_params(), None)],
+        )
+        self.assertTrue(all(client.closed for client in clients))
+        disabled_warning.assert_called_once_with("disabled.example.com")
+        print_warning.assert_not_called()
+
+    def test_gcm_read_only_api_disabled_warning_is_boxed_with_enablement_hint(self):
+        with patch.object(ib.err_console, "print") as err_print:
+            ib.print_gcm_read_only_api_disabled_warning("disabled.example.com")
+
+        self.assertEqual(err_print.call_count, 2)
+        self.assertEqual(err_print.call_args_list[0].args, ())
+        panel = err_print.call_args_list[1].args[0]
+        self.assertIsInstance(panel, ib.Panel)
+        self.assertEqual(panel.title, "GCM Read-Only API Disabled")
+        self.assertEqual(panel.style, "on #713f12")
+        self.assertEqual(panel.border_style, "#facc15")
+        self.assertFalse(panel.expand)
+        warning_text = panel.renderable.plain
+        self.assertIn("WARNING: Grid Master Candidate disabled.example.com\n", warning_text)
+        self.assertIn("does not allow Read-Only API access", warning_text)
+        self.assertIn("\nEnable Read-Only API access", warning_text)
+        self.assertIn("enable_ro_api_access=true", warning_text)
+
+    def test_prompt_gcm_read_server_skips_use_prompt_for_disabled_candidate(self):
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+        records = [
+            {
+                "host_name": "gcm-a.example.com",
+                "master_candidate": True,
+                "enable_ro_api_access": True,
+            },
+            {
+                "host_name": "disabled.example.com",
+                "master_candidate": True,
+                "enable_ro_api_access": False,
+            }
+        ]
+
+        with patch.object(ib, "query_gcm_member_records_for_config", return_value=records):
+            with patch.object(ib, "test_gcm_zone_list_for_config") as zone_test:
+                with patch.object(ib, "print_gcm_read_only_api_disabled_warning") as disabled_warning:
+                    with patch.object(ib, "print_note"):
+                        with patch.object(ib.Confirm, "ask") as confirm_ask:
+                            read_server = ib.prompt_gcm_read_server_for_config(config)
+
+        self.assertEqual(read_server, "")
+        disabled_warning.assert_called_once_with("disabled.example.com")
+        zone_test.assert_not_called()
+        confirm_ask.assert_not_called()
+
+    def test_render_found_gcm_read_servers_prints_blank_line_and_green_name_table(self):
+        with patch.object(ib.console, "print") as console_print:
+            ib.render_found_gcm_read_servers(
+                ["https://gcm-a.example.com", "https://gcm-b.example.com:8443"]
+            )
+
+        self.assertEqual(console_print.call_count, 2)
+        self.assertEqual(console_print.call_args_list[0].args, ())
+        table = console_print.call_args_list[1].args[0]
+        self.assertIsInstance(table, ib.Table)
+        self.assertEqual(table.title, "Found Grid Master Candidates")
+        self.assertEqual(table.header_style, ib.LIGHT_GREEN_TEXT_STYLE)
+        self.assertEqual(table.title_style, ib.LIGHT_GREEN_TEXT_STYLE)
+        self.assertEqual(table.border_style, ib.LIGHT_GREEN_TEXT)
+        self.assertEqual(table.columns[0].header, "GCM Name")
+        self.assertEqual(table.columns[0].style, ib.LIGHT_GREEN_TEXT_STYLE)
+        self.assertEqual(table.columns[0]._cells, ["gcm-a.example.com", "gcm-b.example.com"])
+
+    def test_prompt_gcm_read_server_prints_found_table_after_spinner(self):
+        events = []
+
+        class FakeSpinner:
+            def __enter__(self):
+                events.append("spinner_enter")
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                events.append("spinner_exit")
+                return False
+
+        def discover_gcms(config_values):
+            events.append("discover")
+            return ["https://gcm-a.example.com"]
+
+        def render_found(read_servers):
+            events.append(("render", list(read_servers)))
+
+        def choose_gcm(read_servers, current_read_server):
+            events.append(("choose", list(read_servers), current_read_server))
+            return "https://gcm-a.example.com"
+
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+
+        with patch.object(ib, "print_note"):
+            with patch.object(ib, "infoblox_wait_spinner", return_value=FakeSpinner()):
+                with patch.object(ib, "usable_gcm_read_servers_for_config", side_effect=discover_gcms):
+                    with patch.object(ib, "render_found_gcm_read_servers", side_effect=render_found):
+                        with patch.object(ib, "prompt_gcm_read_server_choice", side_effect=choose_gcm):
+                            selected = ib.prompt_gcm_read_server_for_config(
+                                config,
+                                current_read_server="https://old-gcm.example.com",
+                            )
+
+        self.assertEqual(selected, "https://gcm-a.example.com")
+        self.assertEqual(
+            events,
+            [
+                "spinner_enter",
+                "discover",
+                "spinner_exit",
+                ("render", ["https://gcm-a.example.com"]),
+                ("choose", ["https://gcm-a.example.com"], "https://old-gcm.example.com"),
+            ],
+        )
+
+    def test_prompt_gcm_read_server_choice_lists_multiple_candidates(self):
+        read_servers = ["https://gcm-a.example.com", "https://gcm-b.example.com"]
+
+        with patch.object(ib, "render_gcm_read_server_choices") as render_choices:
+            with patch.object(ib.Prompt, "ask", return_value="2") as prompt_ask:
+                selected = ib.prompt_gcm_read_server_choice(
+                    read_servers,
+                    current_read_server="https://gcm-b.example.com",
+                )
+
+        self.assertEqual(selected, "https://gcm-b.example.com")
+        render_choices.assert_called_once_with(read_servers)
+        prompt_ask.assert_called_once()
+        self.assertEqual(prompt_ask.call_args.kwargs["choices"], ["0", "1", "2"])
+        self.assertEqual(prompt_ask.call_args.kwargs["default"], "2")
+
     def test_configure_edit_updates_existing_profile_and_keeps_blank_password(self):
         runner = CliRunner()
         zones = [
@@ -2054,12 +2552,18 @@ class DefaultZoneTests(unittest.TestCase):
                         side_effect=["", "v2.13", "new-view", "new", "1"],
                     ):
                         with patch.object(ib.Confirm, "ask", side_effect=[False, True]):
-                            with patch.object(
-                                ib,
-                                "query_default_zone_candidates_for_config",
-                                return_value=ib.selectable_zone_records(zones),
-                            ) as query_zones:
-                                result = runner.invoke(ib.cli, ["config", "edit", "prod"])
+                            with patch.object(ib, "require_infoblox_connection_for_config"):
+                                with patch.object(
+                                    ib,
+                                    "prompt_gcm_read_server_for_config",
+                                    return_value="",
+                                ):
+                                    with patch.object(
+                                        ib,
+                                        "query_default_zone_candidates_for_config",
+                                        return_value=ib.selectable_zone_records(zones),
+                                    ) as query_zones:
+                                        result = runner.invoke(ib.cli, ["config", "edit", "prod"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -2075,6 +2579,45 @@ class DefaultZoneTests(unittest.TestCase):
         query_config = query_zones.call_args.args[0]
         self.assertEqual(query_config["dns_view"], "new-view")
         self.assertEqual(query_config["verify_ssl"], "false")
+
+    def test_configure_edit_saves_gcm_read_server_after_acceptance(self):
+        runner = CliRunner()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.config_path_patch(tmpdir):
+                ib.write_config_profiles(
+                    "prod",
+                    {
+                        "prod": {
+                            "server": "https://gm.example.com",
+                            "read_server": "gcm-old.example.com",
+                            "username": "prod-user",
+                            "password": "prod-secret",
+                            "wapi_version": "v2.12.3",
+                            "dns_view": "old-view",
+                            "default_zone": "old.example.com",
+                            "verify_ssl": "true",
+                        }
+                    },
+                )
+
+                with patch.object(ib, "prompt_text", side_effect=["https://gm.example.com", "prod-user"]):
+                    with patch.object(ib, "prompt_password", return_value=""):
+                        with patch.object(ib.Prompt, "ask", side_effect=["v2.13", "corp"]):
+                            with patch.object(ib.Confirm, "ask", side_effect=[True, False]):
+                                with patch.object(ib, "require_infoblox_connection_for_config"):
+                                    with patch.object(
+                                        ib,
+                                        "prompt_gcm_read_server_for_config",
+                                        return_value="https://gcm-edit.example.com",
+                                    ) as gcm_prompt:
+                                        result = runner.invoke(ib.cli, ["config", "edit", "prod"])
+
+                _default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(profiles["prod"]["read_server"], "https://gcm-edit.example.com")
+        self.assertEqual(gcm_prompt.call_args.args[0]["dns_view"], "old-view")
+        self.assertEqual(gcm_prompt.call_args.args[1], "https://gcm-old.example.com")
 
     def test_configure_edit_default_profile_uses_zone_search_picker(self):
         runner = CliRunner()
@@ -2106,12 +2649,18 @@ class DefaultZoneTests(unittest.TestCase):
                         side_effect=["", "v2.13", "corp", "app", "1"],
                     ):
                         with patch.object(ib.Confirm, "ask", side_effect=[True, True]):
-                            with patch.object(
-                                ib,
-                                "query_default_zone_candidates_for_config",
-                                return_value=ib.selectable_zone_records(zones),
-                            ) as query_zones:
-                                result = runner.invoke(ib.cli, ["config", "edit"])
+                            with patch.object(ib, "require_infoblox_connection_for_config"):
+                                with patch.object(
+                                    ib,
+                                    "prompt_gcm_read_server_for_config",
+                                    return_value="",
+                                ):
+                                    with patch.object(
+                                        ib,
+                                        "query_default_zone_candidates_for_config",
+                                        return_value=ib.selectable_zone_records(zones),
+                                    ) as query_zones:
+                                        result = runner.invoke(ib.cli, ["config", "edit"])
 
                 default_profile, profiles, _legacy = ib.read_config_profiles(decrypt_passwords=True)
 
@@ -2145,7 +2694,10 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(
             result.output.splitlines(),
-            ["profile,default,server,dns_view,default_zone", "prod,True,https://prod.example.com,corp,example.com"],
+            [
+                "profile,default,server,read_server,dns_view,default_zone",
+                "prod,True,https://prod.example.com,,corp,example.com",
+            ],
         )
         self.assertNotIn("secret", result.output)
 
@@ -2174,6 +2726,7 @@ class DefaultZoneTests(unittest.TestCase):
                         },
                         "lab": {
                             "server": "https://lab.example.com",
+                            "read_server": "https://gcm.lab.example.com",
                             "username": "lab-user",
                             "password": "lab-secret",
                             "dns_view": "lab-view",
@@ -2193,6 +2746,7 @@ class DefaultZoneTests(unittest.TestCase):
                     "profile": "lab",
                     "default": True,
                     "server": "https://lab.example.com",
+                    "read_server": "https://gcm.lab.example.com",
                     "dns_view": "lab-view",
                     "default_zone": "lab.example.com",
                 },
@@ -2200,6 +2754,7 @@ class DefaultZoneTests(unittest.TestCase):
                     "profile": "prod",
                     "default": False,
                     "server": "https://prod.example.com",
+                    "read_server": "",
                     "dns_view": "prod-view",
                     "default_zone": "prod.example.com",
                 },
@@ -2429,6 +2984,106 @@ class DefaultZoneTests(unittest.TestCase):
         self.assertEqual(clone.view, client.view)
         self.assertEqual(clone.timeout, client.timeout)
         self.assertEqual(clone.verify_ssl, client.verify_ssl)
+
+    def test_infoblox_client_routes_get_to_read_server_and_writes_to_primary(self):
+        class FakeResponse:
+            status = 200
+            will_close = False
+
+            def __init__(self, body):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def getheader(self, name, default=None):
+                return default
+
+        class FakeHTTPSConnection:
+            instances = []
+
+            def __init__(self, host, port=None, timeout=None, context=None):
+                self.host = host
+                self.requests = []
+                FakeHTTPSConnection.instances.append(self)
+
+            def request(self, method, path, body=None, headers=None):
+                self.requests.append(
+                    {
+                        "method": method,
+                        "path": path,
+                        "body": body,
+                        "headers": headers,
+                    }
+                )
+
+            def getresponse(self):
+                last_request = self.requests[-1]
+                return FakeResponse(
+                    json.dumps(
+                        {
+                            "host": self.host,
+                            "method": last_request["method"],
+                            "path": last_request["path"],
+                        }
+                    ).encode("utf-8")
+                )
+
+            def close(self):
+                pass
+
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "https://gcm.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "true",
+            "timeout": "17",
+        }
+        with patch.object(ib.http.client, "HTTPSConnection", FakeHTTPSConnection):
+            client = ib.InfobloxClient(config)
+            get_result = client.request("GET", "record:a", params={"view": "corp"})
+            post_result = client.request("POST", "record:a", payload={"name": "app"})
+            put_result = client.request(" put ", "record:a/app", payload={"ttl": 300})
+            delete_result = client.request("DELETE", "record:a/app")
+
+        self.assertEqual(get_result["host"], "gcm.example.com")
+        self.assertEqual(get_result["path"], "/wapi/v2.12.3/record:a?view=corp")
+        self.assertEqual(post_result["host"], "gm.example.com")
+        self.assertEqual(post_result["path"], "/wapi/v2.12.3/record:a")
+        self.assertEqual(put_result["host"], "gm.example.com")
+        self.assertEqual(put_result["method"], "PUT")
+        self.assertEqual(put_result["path"], "/wapi/v2.12.3/record:a/app")
+        self.assertEqual(delete_result["host"], "gm.example.com")
+        self.assertEqual(delete_result["path"], "/wapi/v2.12.3/record:a/app")
+        self.assertEqual(len(FakeHTTPSConnection.instances), 2)
+        by_host = {connection.host: connection for connection in FakeHTTPSConnection.instances}
+        self.assertEqual(by_host["gcm.example.com"].requests[0]["method"], "GET")
+        self.assertEqual(
+            [request["method"] for request in by_host["gm.example.com"].requests],
+            ["POST", "PUT", "DELETE"],
+        )
+
+    def test_cloned_infoblox_client_preserves_read_server_pool(self):
+        config = {
+            "server": "https://gm.example.com",
+            "read_server": "https://gcm.example.com",
+            "username": "admin",
+            "password": "secret",
+            "wapi_version": "v2.12.3",
+            "dns_view": "corp",
+            "verify_ssl": "false",
+            "timeout": "17",
+        }
+        client = ib.InfobloxClient(config)
+
+        clone = ib.clone_infoblox_client(client)
+
+        self.assertEqual(clone.read_server, "https://gcm.example.com")
+        self.assertIs(clone._connection_pool, client._connection_pool)
+        self.assertIs(clone._read_connection_pool, client._read_connection_pool)
 
     def test_cloned_infoblox_client_reuses_pooled_connection(self):
         class FakeResponse:

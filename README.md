@@ -67,17 +67,26 @@ then asks for:
 - Infoblox server
 - Username and password
 - WAPI version
-- SSL verification preference
+- Optional Grid Master Candidate read endpoint
 - DNS view
+- SSL verification preference
 - Default DNS zone
 
-When a new profile is created, `ib config new` shows a connection-test indicator
-and connects to Infoblox with the entered credentials immediately after the SSL
-verification prompt. If the connection test fails, the command prints the WAPI
-status code when Infoblox returns one and exits without saving the profile.
-After a successful connection test, it lists available DNS views so you can
-select one. If the DNS view lookup fails, the command falls back to manual DNS
-view entry and still saves the profile.
+After the WAPI version prompt, `ib config new` and `ib config edit` look for
+Grid Master Candidates with Read-Only API access enabled. Each usable candidate
+is verified by reading a small zone list before it can be saved as the profile's
+GET endpoint. Candidates without Read-Only API access are skipped and never used
+for WAPI GET routing; enable Read-Only API access on the Grid Master Candidate
+member (`enable_ro_api_access=true`) and rerun `ib config edit` to use it.
+Writes still go to the primary Grid Master.
+
+After optional GCM selection, `ib config new` lists available DNS views so you
+can select one. If the DNS view lookup fails, the command falls back to manual
+DNS view entry and still saves the profile. The SSL verification prompt and
+final connection test run after DNS view selection, so the test uses the same
+read endpoint, DNS view, and SSL preference that will be saved. If the
+connection test fails, the command prints the WAPI status code when Infoblox
+returns one and exits without saving the profile.
 
 Profile setup also asks whether to configure a default DNS zone, with yes as the
 default answer. If you choose yes, it loads forward zones from the selected DNS

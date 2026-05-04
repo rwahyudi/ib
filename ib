@@ -153,6 +153,9 @@ DNS_VIEW_OBJECT = "view"
 DNS_VIEW_RETURN_FIELDS = "name"
 CONFIG_CONNECTION_TEST_OBJECT = "grid"
 CONFIG_CONNECTION_TEST_RETURN_FIELDS = "name"
+GCM_MEMBER_OBJECT = "member"
+GCM_MEMBER_RETURN_FIELDS = "host_name,master_candidate,enable_ro_api_access"
+GCM_ZONE_TEST_RETURN_FIELDS = "fqdn"
 BASE_ZONE_DETAIL_RETURN_FIELDS = (
     f"{ZONE_RETURN_FIELDS},member_soa_mnames,soa_email,soa_expire,soa_negative_ttl,"
     "soa_refresh,soa_retry,soa_serial_number"
@@ -396,6 +399,28 @@ def print_success(message: str) -> None:
 def print_warning(message: str) -> None:
     """Print warnings to stderr with shared styling so scripts can still consume stdout."""
     err_console.print(Text(message, style="bold yellow"))
+
+
+def print_gcm_read_only_api_disabled_warning(host_name: str) -> None:
+    """Show a boxed warning for GCM members that cannot serve read-only WAPI queries."""
+    warning_text = Text(style="bold #fef3c7 on #713f12")
+    warning_text.append(f"WARNING: Grid Master Candidate {host_name}\n")
+    warning_text.append("does not allow Read-Only API access.\n")
+    warning_text.append("This GCM will not be used for WAPI GET queries.\n")
+    warning_text.append(
+        "Enable Read-Only API access on that Grid Master Candidate member\n"
+        "(WAPI field enable_ro_api_access=true), then rerun ib config edit."
+    )
+    err_console.print()
+    err_console.print(
+        Panel.fit(
+            warning_text,
+            title="GCM Read-Only API Disabled",
+            border_style="#facc15",
+            style="on #713f12",
+            padding=(1, 2),
+        )
+    )
 
 
 def print_error(message: str) -> None:
@@ -696,6 +721,7 @@ def profile_config_values(config_values: dict[str, str]) -> dict[str, str]:
     """Return a complete profile config dict with defaults for optional fields."""
     return {
         "server": config_values.get("server", ""),
+        "read_server": config_values.get("read_server", ""),
         "username": config_values.get("username", ""),
         "password": config_values.get("password", ""),
         "wapi_version": config_values.get("wapi_version", DEFAULT_WAPI_VERSION),
@@ -753,6 +779,8 @@ def load_config_for_prompt(profile_name: str | None = None) -> dict[str, str]:
     cfg["profile"] = selected_profile
     if cfg.get("server"):
         cfg["server"] = normalize_server(cfg["server"])
+    if cfg.get("read_server"):
+        cfg["read_server"] = normalize_server(cfg["read_server"])
     if cfg.get("password"):
         try:
             cfg["password"] = decrypt_password(cfg["password"])
@@ -848,6 +876,213 @@ def require_infoblox_connection_for_config(config_values: dict[str, str]) -> Non
         print_success("SUCCESS: Infoblox connection test successful.")
     except (CliError, OSError, ValueError) as exc:
         raise CliError(config_connection_failure_message(exc)) from exc
+
+
+def gcm_member_query_params() -> dict[str, Any]:
+    """Build the WAPI query used to discover Grid Master Candidates."""
+    return {
+        "master_candidate": "true",
+        "_return_fields": GCM_MEMBER_RETURN_FIELDS,
+    }
+
+
+def gcm_zone_test_params(view_name: str) -> dict[str, Any]:
+    """Build a lightweight zone list query used to verify GCM read-only API access."""
+    return {
+        "view": view_name,
+        "_return_fields": GCM_ZONE_TEST_RETURN_FIELDS,
+        "_max_results": 1,
+    }
+
+
+def wapi_bool(value: Any) -> bool:
+    """Parse Infoblox boolean response values from native bools or strings."""
+    if isinstance(value, bool):
+        return value
+    try:
+        return parse_bool(str(value), default=False)
+    except CliError:
+        return False
+
+
+def query_gcm_member_records_for_config(config_values: dict[str, str]) -> list[dict[str, Any]]:
+    """Query Grid Master Candidate member records through the configured Grid Master."""
+    query_config = dict(config_values)
+    query_config["read_server"] = ""
+    client = InfobloxClient(query_config)
+    try:
+        result = client.request("GET", GCM_MEMBER_OBJECT, params=gcm_member_query_params())
+    finally:
+        client.close()
+    if not isinstance(result, list):
+        raise CliError(f"ERROR: unexpected WAPI result shape for {GCM_MEMBER_OBJECT}.")
+    return [item for item in result if isinstance(item, dict)]
+
+
+def gcm_candidate_host_name(record: dict[str, Any]) -> str | None:
+    """Return the host name for a Grid Master Candidate member record."""
+    if not wapi_bool(record.get("master_candidate")):
+        return None
+    host_name = str(record.get("host_name", "")).strip()
+    if not host_name:
+        return None
+    return host_name
+
+
+def gcm_read_only_api_disabled_host_name(record: dict[str, Any]) -> str | None:
+    """Return the GCM host name when read-only WAPI access is disabled."""
+    host_name = gcm_candidate_host_name(record)
+    if not host_name or wapi_bool(record.get("enable_ro_api_access")):
+        return None
+    return host_name
+
+
+def gcm_candidate_read_server(record: dict[str, Any]) -> str | None:
+    """Return the normalized read server URL for an enabled GCM member record."""
+    host_name = gcm_candidate_host_name(record)
+    if not host_name:
+        return None
+    disabled_host_name = gcm_read_only_api_disabled_host_name(record)
+    if disabled_host_name:
+        print_gcm_read_only_api_disabled_warning(disabled_host_name)
+        return None
+    try:
+        return normalize_server(host_name)
+    except CliError as exc:
+        print_warning(f"WARNING: cannot use Grid Master Candidate {host_name}: {exc}")
+        return None
+
+
+def test_gcm_zone_list_for_config(config_values: dict[str, str], read_server: str) -> None:
+    """Verify a candidate GCM can read zones before it is saved for future GET requests."""
+    gcm_config = dict(config_values)
+    gcm_config["server"] = read_server
+    gcm_config["read_server"] = ""
+    client = InfobloxClient(gcm_config)
+    try:
+        result = client.request(
+            "GET",
+            ZONE_OBJECT,
+            params=gcm_zone_test_params(str(gcm_config.get("dns_view", "default"))),
+        )
+    finally:
+        client.close()
+    if not isinstance(result, list):
+        raise CliError(f"ERROR: unexpected WAPI result shape for {ZONE_OBJECT}.")
+
+
+def usable_gcm_read_servers_for_config(config_values: dict[str, str]) -> list[str]:
+    """Return read-only GCM endpoints that pass a zone-list GET test."""
+    records = query_gcm_member_records_for_config(config_values)
+    disabled_host_names = sorted(
+        {
+            host_name
+            for record in records
+            for host_name in [gcm_read_only_api_disabled_host_name(record)]
+            if host_name
+        },
+        key=str.lower,
+    )
+    if disabled_host_names:
+        for host_name in disabled_host_names:
+            print_gcm_read_only_api_disabled_warning(host_name)
+        return []
+    discovered = sorted(
+        {
+            read_server
+            for record in records
+            for read_server in [gcm_candidate_read_server(record)]
+            if read_server
+        },
+        key=str.lower,
+    )
+    usable: list[str] = []
+    for read_server in discovered:
+        try:
+            test_gcm_zone_list_for_config(config_values, read_server)
+        except (CliError, OSError, ValueError) as exc:
+            print_warning(f"WARNING: Grid Master Candidate {read_server} failed zone-list test: {exc}")
+            continue
+        usable.append(read_server)
+    return usable
+
+
+def render_gcm_read_server_choices(read_servers: list[str]) -> None:
+    """Show multiple usable GCM read endpoints so the operator can choose one."""
+    table = Table(title="Usable Grid Master Candidates", show_header=True)
+    table.add_column("#", justify="right")
+    table.add_column("Read Server", overflow="fold")
+    for index, read_server in enumerate(read_servers, start=1):
+        table.add_row(str(index), read_server)
+    console.print(table)
+
+
+def gcm_read_server_display_name(read_server: str) -> str:
+    """Return the host name operators recognize for a normalized GCM read server URL."""
+    try:
+        parsed = urllib.parse.urlsplit(read_server)
+    except ValueError:
+        return read_server
+    return parsed.hostname or read_server
+
+
+def render_found_gcm_read_servers(read_servers: list[str]) -> None:
+    """Show usable discovered GCMs after the discovery spinner completes."""
+    if not read_servers:
+        return
+    console.print()
+    table = Table(
+        title="Found Grid Master Candidates",
+        header_style=LIGHT_GREEN_TEXT_STYLE,
+        border_style=LIGHT_GREEN_TEXT,
+        title_style=LIGHT_GREEN_TEXT_STYLE,
+    )
+    table.add_column("GCM Name", style=LIGHT_GREEN_TEXT_STYLE, overflow="fold")
+    for read_server in read_servers:
+        table.add_row(gcm_read_server_display_name(read_server))
+    console.print(table)
+
+
+def prompt_gcm_read_server_choice(read_servers: list[str], current_read_server: str = "") -> str:
+    """Prompt the operator to select a read-only GCM endpoint, or skip read routing."""
+    if not read_servers:
+        return ""
+    if len(read_servers) == 1:
+        read_server = read_servers[0]
+        print_note(f"Read-only Grid Master Candidate found: {read_server}")
+        if Confirm.ask("Use this GCM for all WAPI GET queries", default=True):
+            return read_server
+        return ""
+
+    render_gcm_read_server_choices(read_servers)
+    choices = ["0", *[str(index) for index in range(1, len(read_servers) + 1)]]
+    default_choice = "1"
+    if current_read_server in read_servers:
+        default_choice = str(read_servers.index(current_read_server) + 1)
+    selected = Prompt.ask(
+        "Select GCM for WAPI GET queries (0 to skip)",
+        choices=choices,
+        default=default_choice,
+    )
+    if selected == "0":
+        return ""
+    return read_servers[int(selected) - 1]
+
+
+def prompt_gcm_read_server_for_config(
+    config_values: dict[str, str],
+    current_read_server: str = "",
+) -> str:
+    """Discover, validate, and optionally save a GCM endpoint for future GET requests."""
+    try:
+        print_note("Discovering Grid Master Candidates for read-only API access...")
+        with infoblox_wait_spinner("Discovering Grid Master Candidates"):
+            read_servers = usable_gcm_read_servers_for_config(config_values)
+    except (CliError, OSError, ValueError) as exc:
+        print_warning(f"WARNING: could not discover Grid Master Candidates: {exc}")
+        return ""
+    render_found_gcm_read_servers(read_servers)
+    return prompt_gcm_read_server_choice(read_servers, current_read_server)
 
 
 def render_dns_view_choices(view_names: list[str]) -> None:
@@ -1231,28 +1466,38 @@ def save_config_interactive(
     wapi_version = Prompt.ask(
         "WAPI version", default=current.get("wapi_version", DEFAULT_WAPI_VERSION)
     )
-    verify_ssl = Confirm.ask(
-        "Verify SSL certificates",
-        default=parse_bool(current.get("verify_ssl", "true")),
-    )
     probe_config = {
         "server": server,
+        "read_server": "",
         "username": username,
         "password": password,
         "wapi_version": wapi_version,
         "dns_view": current.get("dns_view", "default"),
-        "verify_ssl": "true" if verify_ssl else "false",
+        "verify_ssl": current.get("verify_ssl", "true"),
         "timeout": str(current.get("timeout", DEFAULT_TIMEOUT)),
     }
+    current_read_server = current.get("read_server", "")
+    if current_read_server:
+        try:
+            current_read_server = normalize_server(current_read_server)
+        except CliError:
+            current_read_server = ""
+    read_server = prompt_gcm_read_server_for_config(dict(probe_config), current_read_server)
+    probe_config["read_server"] = read_server
     if is_new_profile:
-        require_infoblox_connection_for_config(probe_config)
         dns_view = prompt_dns_view_from_infoblox(
-            probe_config,
+            dict(probe_config),
             current.get("dns_view", "default"),
         )
     else:
         dns_view = Prompt.ask("DNS view", default=current.get("dns_view", "default"))
     probe_config["dns_view"] = dns_view
+    verify_ssl = Confirm.ask(
+        "Verify SSL certificates",
+        default=parse_bool(current.get("verify_ssl", "true")),
+    )
+    probe_config["verify_ssl"] = "true" if verify_ssl else "false"
+    require_infoblox_connection_for_config(probe_config)
     default_zone = prompt_default_zone_from_infoblox(
         probe_config,
         current.get("default_zone", ""),
@@ -1260,6 +1505,7 @@ def save_config_interactive(
 
     default_config = {
         "server": server,
+        "read_server": read_server,
         "username": username,
         "password": password,
         "wapi_version": wapi_version,
@@ -1337,6 +1583,7 @@ def profile_table(default_profile: str, profiles: dict[str, dict[str, str]]) -> 
     table.add_column("Profile", style="bold")
     table.add_column("Default", no_wrap=True)
     table.add_column("Server", overflow="fold")
+    table.add_column("Read Server", overflow="fold")
     table.add_column("DNS View", overflow="fold")
     table.add_column("Default Zone", overflow="fold")
     for profile_name in sorted(profiles):
@@ -1345,6 +1592,7 @@ def profile_table(default_profile: str, profiles: dict[str, dict[str, str]]) -> 
             profile_name,
             "yes" if profile_name == default_profile else "",
             str(values.get("server", "")),
+            str(values.get("read_server", "")),
             str(values.get("dns_view", "default")),
             str(values.get("default_zone", "")),
         )
@@ -1361,12 +1609,13 @@ def emit_profile_list(default_profile: str, profiles: dict[str, dict[str, str]])
             "profile": profile_name,
             "default": profile_name == default_profile,
             "server": str(values.get("server", "")),
+            "read_server": str(values.get("read_server", "")),
             "dns_view": str(values.get("dns_view", "default")),
             "default_zone": str(values.get("default_zone", "")),
         }
         for profile_name, values in sorted(profiles.items())
     ]
-    emit_structured(rows, ["profile", "default", "server", "dns_view", "default_zone"])
+    emit_structured(rows, ["profile", "default", "server", "read_server", "dns_view", "default_zone"])
 
 
 def print_config_usage() -> None:
@@ -1425,6 +1674,7 @@ def load_config(required: bool = True) -> dict[str, str] | None:
     raw_password = cfg["password"]
     cfg["password"] = decrypt_password(raw_password)
     cfg["server"] = normalize_server(cfg["server"])
+    cfg["read_server"] = normalize_server(cfg["read_server"]) if cfg.get("read_server") else ""
     cfg.setdefault("wapi_version", DEFAULT_WAPI_VERSION)
     cfg.setdefault("dns_view", "default")
     cfg.setdefault("default_zone", "")
@@ -1444,6 +1694,18 @@ class PooledWapiConnection(NamedTuple):
 
     connection: http.client.HTTPConnection
     reused: bool
+
+
+def split_infoblox_server_url(server: str) -> tuple[urllib.parse.SplitResult, int | None, str]:
+    """Validate a normalized Infoblox server URL and return connection pieces."""
+    server_url = urllib.parse.urlsplit(server)
+    if server_url.scheme not in {"http", "https"} or not server_url.hostname:
+        raise CliError(f"ERROR: invalid Infoblox server URL: {server}")
+    try:
+        server_port = server_url.port
+    except ValueError as exc:
+        raise CliError(f"ERROR: invalid Infoblox server URL: {server}") from exc
+    return server_url, server_port, server_url.path.rstrip("/")
 
 
 class WapiConnectionPool:
@@ -1549,39 +1811,69 @@ class InfobloxClient:
         self,
         config: dict[str, str],
         connection_pool: WapiConnectionPool | None = None,
+        read_connection_pool: WapiConnectionPool | None = None,
     ) -> None:
         """Initialize the instance with state used by the surrounding class methods."""
         self.server = normalize_server(config["server"])
+        self.read_server = (
+            normalize_server(config["read_server"]) if config.get("read_server") else self.server
+        )
         self.wapi_version = config.get("wapi_version", DEFAULT_WAPI_VERSION).strip().lstrip("/")
         self.username = config["username"]
         self.password = config["password"]
         self.view = config.get("dns_view", "default")
         self.timeout = int(config.get("timeout", DEFAULT_TIMEOUT))
         self.verify_ssl = parse_bool(config.get("verify_ssl", "true"))
-        self._server_url = urllib.parse.urlsplit(self.server)
-        if self._server_url.scheme not in {"http", "https"} or not self._server_url.hostname:
-            raise CliError(f"ERROR: invalid Infoblox server URL: {self.server}")
-        try:
-            self._server_port = self._server_url.port
-        except ValueError as exc:
-            raise CliError(f"ERROR: invalid Infoblox server URL: {self.server}") from exc
-        self._server_path = self._server_url.path.rstrip("/")
+        self._server_url, self._server_port, self._server_path = split_infoblox_server_url(
+            self.server
+        )
+        (
+            self._read_server_url,
+            self._read_server_port,
+            self._read_server_path,
+        ) = split_infoblox_server_url(self.read_server)
         self._connection_pool = connection_pool or WapiConnectionPool(
             self._server_url,
             self._server_port,
             self.timeout,
             self.verify_ssl,
         )
+        if self.read_server == self.server:
+            self._read_connection_pool = self._connection_pool
+        else:
+            self._read_connection_pool = read_connection_pool or WapiConnectionPool(
+                self._read_server_url,
+                self._read_server_port,
+                self.timeout,
+                self.verify_ssl,
+            )
 
     def close(self) -> None:
         """Close idle pooled HTTPS connections so callers can release network resources explicitly."""
         self._connection_pool.close_idle()
+        if self._read_connection_pool is not self._connection_pool:
+            self._read_connection_pool.close_idle()
 
-    def request_path(self, path: str, params: dict[str, Any] | None = None) -> str:
+    def request_path_for_base(
+        self,
+        server_path: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> str:
         """Build the WAPI request path with query parameters encoded once for consistent requests."""
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         quoted_path = urllib.parse.quote(path.lstrip("/"), safe="/:")
-        return f"{self._server_path}/wapi/{self.wapi_version}/{quoted_path}{query}"
+        return f"{server_path}/wapi/{self.wapi_version}/{quoted_path}{query}"
+
+    def request_path(self, path: str, params: dict[str, Any] | None = None) -> str:
+        """Build a WAPI request path against the primary Grid Master."""
+        return self.request_path_for_base(self._server_path, path, params)
+
+    def request_pool_and_path(self, method: str) -> tuple[WapiConnectionPool, str]:
+        """Choose the connection pool and URL path base for this WAPI request method."""
+        if method.strip().upper() == "GET" and self.read_server != self.server:
+            return self._read_connection_pool, self._read_server_path
+        return self._connection_pool, self._server_path
 
     def connection_error(self, exc: BaseException) -> WapiError:
         """Convert low-level connection failures into CLI errors with operator-facing context."""
@@ -1596,10 +1888,11 @@ class InfobloxClient:
         payload: dict[str, Any] | None = None,
     ) -> Any:
         """Execute one WAPI request and retry once after a pooled GET socket goes stale."""
+        method = method.strip().upper()
         try:
             return self.request_once(method, path, params, payload)
         except (OSError, http.client.HTTPException) as exc:
-            if method.upper() != "GET" or not getattr(exc, "_ib_reused_connection", False):
+            if method != "GET" or not getattr(exc, "_ib_reused_connection", False):
                 raise self.connection_error(exc) from exc
             try:
                 return self.request_once(method, path, params, payload)
@@ -1625,11 +1918,17 @@ class InfobloxClient:
             body = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
 
-        pooled = self._connection_pool.acquire()
+        connection_pool, server_path = self.request_pool_and_path(method)
+        pooled = connection_pool.acquire()
         conn = pooled.connection
         keep_connection = False
         try:
-            conn.request(method, self.request_path(path, params), body=body, headers=headers)
+            conn.request(
+                method,
+                self.request_path_for_base(server_path, path, params),
+                body=body,
+                headers=headers,
+            )
             response = conn.getresponse()
             raw_bytes = response.read()
             keep_connection = response_allows_keepalive(response)
@@ -1644,19 +1943,19 @@ class InfobloxClient:
             result = None if not raw else json.loads(raw)
         except (OSError, http.client.HTTPException) as exc:
             setattr(exc, "_ib_reused_connection", pooled.reused)
-            self._connection_pool.discard(conn)
+            connection_pool.discard(conn)
             raise
         except Exception:
             if keep_connection:
-                self._connection_pool.release(conn)
+                connection_pool.release(conn)
             else:
-                self._connection_pool.discard(conn)
+                connection_pool.discard(conn)
             raise
 
         if keep_connection:
-            self._connection_pool.release(conn)
+            connection_pool.release(conn)
         else:
-            self._connection_pool.discard(conn)
+            connection_pool.discard(conn)
         return result
 
 
@@ -5070,6 +5369,7 @@ def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
     return InfobloxClient(
         {
             "server": client.server,
+            "read_server": getattr(client, "read_server", client.server),
             "wapi_version": client.wapi_version,
             "username": client.username,
             "password": client.password,
@@ -5078,6 +5378,7 @@ def clone_infoblox_client(client: InfobloxClient) -> InfobloxClient:
             "verify_ssl": "true" if client.verify_ssl else "false",
         },
         connection_pool=getattr(client, "_connection_pool", None),
+        read_connection_pool=getattr(client, "_read_connection_pool", None),
     )
 
 

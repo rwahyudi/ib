@@ -55,10 +55,13 @@ min(DNS_SEARCH_WORKERS, number_of_zones)
 assigns it another zone until the zone list is complete.
 
 Each worker gets its own cloned Infoblox client. Clones share the same
-thread-safe WAPI connection pool, but each request borrows a single checked-out
-HTTP(S) connection while it is in flight. That avoids sharing one connection
+thread-safe WAPI connection pools, but each request borrows a single checked-out
+HTTP(S) connection while it is in flight. When a profile has a validated
+read-only Grid Master Candidate, GET requests use that read endpoint and writes
+continue to use the primary Grid Master. That avoids sharing one connection
 object across threads while still allowing workers to reuse idle keep-alive
-sockets for the same server, WAPI version, DNS view, timeout, and SSL settings.
+sockets for the same server, read server, WAPI version, DNS view, timeout, and
+SSL settings.
 
 Threads help here because the expensive parts are I/O-bound: waiting for WAPI,
 reading SQLite, and writing refreshed cache rows. While one worker is waiting on
