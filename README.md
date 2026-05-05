@@ -1,5 +1,7 @@
 # ib
 
+![ib record workflow](docs/assets/record.gif)
+
 `ib` is a small command-line client for day-to-day Infoblox DNS work.
 
 It talks to Infoblox WAPI over HTTPS, stores configuration in `~/.ib/config`,
